@@ -217,10 +217,17 @@ func cmdServe(args []string) error {
 	go func() { errc <- srv.Serve(ln) }()
 	select {
 	case <-ctx.Done():
+		logger.Info("shutting down; draining in-flight requests (up to 30s)")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		logger.Info("shutting down; draining in-flight requests")
-		return srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			// Long streams outlived the drain window: cut them, then give their
+			// handlers a moment to record ledger rows before the ledger closes.
+			logger.Warn("drain timeout; closing remaining connections", "err", err)
+			_ = srv.Close()
+			time.Sleep(2 * time.Second)
+		}
+		return nil
 	case err := <-errc:
 		if errors.Is(err, http.ErrServerClosed) {
 			return nil

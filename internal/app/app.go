@@ -141,7 +141,11 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/", px.Handler())
 	mux.Handle("/", ctl.Handler())
-	return &App{Handler: mux, Quota: qm, Policy: pol, Ledger: led, Auth: creds}, nil
+	var h http.Handler = mux
+	if !cfg.AllowNonLoopback {
+		h = LocalHostGuard(mux)
+	}
+	return &App{Handler: h, Quota: qm, Policy: pol, Ledger: led, Auth: creds}, nil
 }
 
 // Start begins background quota polling until ctx is cancelled.
