@@ -8,9 +8,11 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/hpst3r/localrouter/internal/core"
 )
@@ -23,6 +25,11 @@ const (
 	defaultMaxBodyBytes = 32 << 20
 	defaultMaxFailovers = 2
 	maxAttrLen          = 128
+
+	defaultResponseHeaderTimeout = 180 * time.Second
+	defaultStreamIdleTimeout     = 300 * time.Second
+	dialTimeout                  = 15 * time.Second
+	tlsHandshakeTimeout          = 15 * time.Second
 )
 
 // Deps are the collaborators the proxy needs. All interface fields are required
@@ -46,10 +53,17 @@ type Options struct {
 	MaxFailovers int
 	// HTTPClient performs upstream requests. It must not set an overall
 	// Timeout (responses stream). Nil uses a client that does not follow
-	// redirects.
+	// redirects, with 15s dial and TLS handshake timeouts and
+	// ResponseHeaderTimeout.
 	HTTPClient *http.Client
 	// MaxBodyBytes limits the client request body. 0 means 32 MiB.
 	MaxBodyBytes int64
+	// ResponseHeaderTimeout bounds the wait for upstream response headers
+	// when HTTPClient is nil. 0 means 180s; negative disables.
+	ResponseHeaderTimeout time.Duration
+	// StreamIdleTimeout aborts a response body relay when no upstream bytes
+	// arrive for this long. 0 means 300s; negative disables.
+	StreamIdleTimeout time.Duration
 }
 
 // Proxy is the inference HTTP surface. Create it with New.
@@ -72,10 +86,18 @@ func New(deps Deps, opts Options) *Proxy {
 	if opts.MaxBodyBytes <= 0 {
 		opts.MaxBodyBytes = defaultMaxBodyBytes
 	}
+	if opts.ResponseHeaderTimeout == 0 {
+		opts.ResponseHeaderTimeout = defaultResponseHeaderTimeout
+	} else if opts.ResponseHeaderTimeout < 0 {
+		opts.ResponseHeaderTimeout = 0
+	}
+	if opts.StreamIdleTimeout == 0 {
+		opts.StreamIdleTimeout = defaultStreamIdleTimeout
+	} else if opts.StreamIdleTimeout < 0 {
+		opts.StreamIdleTimeout = 0
+	}
 	if opts.HTTPClient == nil {
-		opts.HTTPClient = &http.Client{
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		}
+		opts.HTTPClient = defaultHTTPClient(opts.ResponseHeaderTimeout)
 	}
 	p := &Proxy{deps: deps, opts: opts, routes: map[string]core.Route{}, log: deps.Logger, clock: deps.Clock}
 	if p.log == nil {
@@ -94,6 +116,19 @@ func New(deps Deps, opts Options) *Proxy {
 	}
 	sort.Strings(p.models)
 	return p
+}
+
+// defaultHTTPClient clones http.DefaultTransport with bounded dial, TLS and
+// response-header waits. It has no overall Timeout because responses stream.
+func defaultHTTPClient(responseHeaderTimeout time.Duration) *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = (&net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}).DialContext
+	tr.TLSHandshakeTimeout = tlsHandshakeTimeout
+	tr.ResponseHeaderTimeout = responseHeaderTimeout
+	return &http.Client{
+		Transport:     tr,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 // Handler returns the HTTP handler for /v1/responses, /v1/chat/completions

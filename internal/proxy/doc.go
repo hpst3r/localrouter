@@ -19,7 +19,7 @@
 //		Authenticate: authFn,       // func(bearer string) (core.Client, bool)
 //		Clock:        core.SystemClock{},
 //		Logger:       logger,
-//	}, proxy.Options{MaxFailovers: 2})
+//	}, proxy.Options{MaxFailovers: 2}) // timeouts default to 180s headers / 300s stream idle
 //	mux.Handle("/v1/", p.Handler())
 //
 // Handler serves POST /v1/responses, POST /v1/chat/completions and

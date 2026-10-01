@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/core"
@@ -54,9 +56,22 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 		pending   *failure
 		lastErr   string
 		failovers int
+		cur       *onceLease
 	)
+	// Release the current lease if a panic unwinds past it; the panic keeps
+	// propagating so net/http still logs it.
+	defer func() {
+		if cur != nil {
+			cur.Release(core.Outcome{})
+		}
+	}()
 	for {
-		lease, dec := p.deps.Policy.Acquire(req.class, req.candidates, exclude)
+		l, dec := p.deps.Policy.Acquire(req.class, req.candidates, exclude)
+		var lease core.Lease
+		if l != nil {
+			cur = &onceLease{Lease: l}
+			lease = cur
+		}
 		if lease == nil || !dec.Allow {
 			if lease != nil {
 				lease.Release(core.Outcome{})
@@ -88,6 +103,17 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 	}
 }
 
+// onceLease makes Release idempotent so a deferred safety release never
+// double-counts.
+type onceLease struct {
+	core.Lease
+	once sync.Once
+}
+
+func (l *onceLease) Release(o core.Outcome) {
+	l.once.Do(func() { l.Lease.Release(o) })
+}
+
 // attempt sends the request to the leased account, retrying the same account
 // once after a 401/403 with a refreshed credential. It always releases the
 // lease, and records one ledger row per upstream try.
@@ -100,6 +126,9 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		lease.Release(core.Outcome{})
 		return p.noResponse(w, canFailover, "account misconfigured")
 	}
+	// upCtx lets stream abort an idle upstream without touching the client.
+	upCtx, cancelUp := context.WithCancel(ctx)
+	defer cancelUp()
 	authRetried := false
 	for {
 		rec := p.newRecord(req, account, *prevID)
@@ -115,7 +144,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		}
 		rec.UpstreamIdentity = cred.Identity
 
-		resp, err := p.send(ctx, req, account, cred)
+		resp, err := p.send(upCtx, req, account, cred)
 		if err != nil {
 			if ctx.Err() != nil {
 				lease.Release(core.Outcome{})
@@ -153,7 +182,6 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 				out.ResetAt = resetHint(resp.Header, p.clock.Now())
 			}
 			lease.Release(out)
-			p.deps.Quota.RequestRefresh(acctID, status == http.StatusTooManyRequests)
 			rec.Status = status
 			rec.Error = "upstream " + strconv.Itoa(status) + "; failing over"
 			p.log.Info("upstream failure; failing over", "account", acctID, "class", req.class, "model", req.model, "status", status)
@@ -161,7 +189,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			return attemptResult{failure: f}
 		}
 
-		p.stream(w, r, req, resp, lease, rec)
+		p.stream(w, r, req, resp, lease, rec, cancelUp)
 		return attemptResult{done: true}
 	}
 }
@@ -203,11 +231,22 @@ func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cr
 }
 
 // stream relays the upstream response to the client, capturing usage, then
-// releases the lease and records the ledger row.
-func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, resp *http.Response, lease core.Lease, rec core.RequestRecord) {
+// releases the lease and records the ledger row. If no upstream bytes arrive
+// for StreamIdleTimeout, cancelUp aborts the upstream request.
+func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, resp *http.Response, lease core.Lease, rec core.RequestRecord, cancelUp context.CancelFunc) {
 	defer resp.Body.Close()
 	ctx := r.Context()
 	rc := http.NewResponseController(w)
+
+	// The idle timer only runs while waiting on an upstream Read, so a slow
+	// client write does not count as upstream idleness.
+	var idle atomic.Bool
+	var timer *time.Timer
+	if d := p.opts.StreamIdleTimeout; d > 0 {
+		timer = time.AfterFunc(d, func() { idle.Store(true); cancelUp() })
+		timer.Stop()
+		defer timer.Stop()
+	}
 
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
@@ -216,12 +255,19 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	capture := newUsageCapture(resp.Header.Get("Content-Type"))
 	buf := make([]byte, streamChunkSize)
 	var (
-		written int64
-		aborted bool
-		readErr error
+		written  int64
+		aborted  bool
+		idledOut bool
+		readErr  error
 	)
 	for {
+		if timer != nil {
+			timer.Reset(p.opts.StreamIdleTimeout)
+		}
 		n, err := resp.Body.Read(buf)
+		if timer != nil {
+			timer.Stop()
+		}
 		if n > 0 {
 			_, _ = capture.Write(buf[:n])
 			wn, werr := w.Write(buf[:n])
@@ -236,9 +282,12 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 			break
 		}
 		if err != nil {
-			if ctx.Err() != nil {
+			switch {
+			case ctx.Err() != nil:
 				aborted = true
-			} else {
+			case idle.Load():
+				idledOut = true
+			default:
 				readErr = err
 			}
 			break
@@ -246,7 +295,7 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	}
 
 	usage, known := capture.Result()
-	if aborted || readErr != nil {
+	if aborted || idledOut || readErr != nil {
 		known = false
 	}
 	out := core.Outcome{Status: resp.StatusCode, UsageKnown: known, BytesToClient: written}
@@ -254,7 +303,6 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 		out.ResetAt = resetHint(resp.Header, p.clock.Now())
 	}
 	lease.Release(out)
-	p.deps.Quota.RequestRefresh(lease.AccountID(), resp.StatusCode == http.StatusTooManyRequests)
 
 	rec.Status = resp.StatusCode
 	rec.BytesOut = written
@@ -265,6 +313,9 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	switch {
 	case aborted:
 		rec.Error = "client disconnected"
+	case idledOut:
+		p.log.Warn("upstream stream idle timeout", "account", rec.AccountID, "model", req.model)
+		rec.Error = "stream idle timeout"
 	case readErr != nil:
 		rec.Error = "upstream stream error: " + sanitizeErr(readErr)
 	case resp.StatusCode >= 400:
