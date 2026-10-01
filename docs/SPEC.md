@@ -88,7 +88,9 @@ reset time: `ResetAt` zero, `WindowSeconds` 18000 / 604800.
 Poller: refresh each account every `quota.poll_interval` (default 5m),
 plus debounced (≥ 20s apart) refresh after each completed request on that
 account, plus immediately on a 429. Failures keep last-good snapshot and set
-`Snapshot.Err`; never fabricate.
+`Snapshot.Err`; never fabricate. If the very first fetch fails, `Latest`
+returns ok=true with no windows, zero `FetchedAt`, and `Err` set (policy
+treats zero `FetchedAt` as stale; control shows the error).
 
 ## Admission / policy (the core value)
 
@@ -98,8 +100,10 @@ snapshot:
 - Effective used: if `W.ResetAt` non-zero and `now >= W.ResetAt`, treat
   `UsedFrac = 0` (window rolled; do not wait for a new sample).
 - `floor(W) = reserve[A][W.Kind]` if C == background else 0.
-- Admit iff `used + inflight(A) * policy.inflight_estimate + margin <= 1 - floor`
-  where `margin = policy.safety_margin` for background, 0 for interactive.
+- Admit iff `used + (inflight(A) + k) * policy.inflight_estimate + margin <= 1 - floor`
+  where `k = 1` for background (the request being admitted counts as in
+  flight) and `k = 0` for interactive; `margin = policy.safety_margin` for
+  background, 0 for interactive.
 - If `Snapshot.Allowed == false` and no window rolled past reset: deny all classes.
 
 Staleness: snapshot older than `policy.stale_after` (default 10m) or absent:
@@ -194,7 +198,9 @@ key.
   provider, healthy, cooldown_until, inflight, reserve:{"5h":0.1,...},
   windows:[{kind, used_frac, remaining_frac, reset_at, window_seconds}],
   background_admissible, interactive_admissible, snapshot_age_s, stale,
-  error}]}`
+  error, reason}]}` — `healthy` = no active cooldown and no fetch error;
+  `reason` = policy explanation when a class is not admissible; each window
+  also carries `rolled` (reset passed, used reported as 0).
 - `GET /control/v1/usage?since=24h&group=account|model|class|client` →
   rows `{key, requests, input_tokens, cached_input_tokens, output_tokens,
   reasoning_tokens, cost_usd, unknown_usage_requests}`.

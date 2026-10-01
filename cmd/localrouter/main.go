@@ -17,14 +17,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hpst3r/localrouter/internal/app"
 	"github.com/hpst3r/localrouter/internal/auth"
 	"github.com/hpst3r/localrouter/internal/config"
-	"github.com/hpst3r/localrouter/internal/control"
 	"github.com/hpst3r/localrouter/internal/core"
 	"github.com/hpst3r/localrouter/internal/ledger"
-	"github.com/hpst3r/localrouter/internal/policy"
-	"github.com/hpst3r/localrouter/internal/proxy"
-	"github.com/hpst3r/localrouter/internal/quota"
 )
 
 const usage = `localrouter — quota-aware local LLM gateway
@@ -83,24 +80,6 @@ func loadConfig(fs *flag.FlagSet, args []string) (*config.Config, error) {
 		return nil, err
 	}
 	return config.Load(*path)
-}
-
-func staticKeys(cfg *config.Config) map[string]auth.StaticKey {
-	keys := map[string]auth.StaticKey{}
-	for _, a := range cfg.Accounts {
-		if a.Provider != core.ProviderCodex {
-			keys[a.ID] = auth.StaticKey{File: a.APIKeyFile, Env: a.APIKeyEnv}
-		}
-	}
-	return keys
-}
-
-func newAuth(cfg *config.Config, logger *slog.Logger) (*auth.Manager, error) {
-	store, err := auth.NewStore(filepath.Join(cfg.DataDir, "tokens"))
-	if err != nil {
-		return nil, err
-	}
-	return auth.New(cfg.CoreAccounts(), staticKeys(cfg), store, auth.Options{Logger: logger}), nil
 }
 
 func cmdCheck(args []string) error {
@@ -174,7 +153,7 @@ func cmdLogin(args []string) error {
 	if !found {
 		return fmt.Errorf("unknown account %q", id)
 	}
-	m, err := newAuth(cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	m, err := app.NewAuth(cfg, slog.New(slog.NewTextHandler(os.Stderr, nil)), app.Overrides{})
 	if err != nil {
 		return err
 	}
@@ -218,87 +197,22 @@ func cmdServe(args []string) error {
 		return err
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
-		return err
-	}
-
-	keyFiles := map[string]string{}
-	classes := map[string]core.Class{}
-	for _, c := range cfg.Clients {
-		keyFiles[c.Name] = c.KeyFile
-		classes[c.Name] = core.Class(c.Class)
-	}
-	clientKeys, err := auth.LoadClientKeys(keyFiles)
-	if err != nil {
-		return fmt.Errorf("client keys: %w", err)
-	}
-	authenticate := func(bearer string) (core.Client, bool) {
-		name, ok := clientKeys.Lookup(bearer)
-		if !ok {
-			return core.Client{}, false
-		}
-		return core.Client{Name: name, Class: classes[name]}, true
-	}
-
-	accounts := cfg.CoreAccounts()
-	acctMap := map[string]core.Account{}
-	for _, a := range accounts {
-		acctMap[a.ID] = a
-	}
-	routes := cfg.CoreRoutes()
-	clock := core.SystemClock{}
-
-	creds, err := newAuth(cfg, logger)
+	a, err := app.Build(cfg, logger, app.Overrides{})
 	if err != nil {
 		return err
 	}
-
-	pricing, err := ledger.LoadPricing(cfg.PricingFile)
-	if err != nil {
-		return fmt.Errorf("pricing: %w", err)
-	}
-	led, err := ledger.Open(filepath.Join(cfg.DataDir, "localrouter.db"), pricing,
-		func(id string) string { return acctMap[id].CostBasis })
-	if err != nil {
-		return fmt.Errorf("ledger: %w", err)
-	}
-	defer led.Close()
-
-	qm := quota.New(accounts, creds, quota.Options{
-		PollInterval: cfg.Quota.PollInterval.D(),
-		Clock:        clock,
-		Logger:       logger,
-	})
-	pol := policy.New(accounts, qm, policy.Options{
-		StaleAfter:       cfg.Policy.StaleAfter.D(),
-		SafetyMargin:     cfg.Policy.SafetyMargin,
-		InflightEstimate: cfg.Policy.InflightEstimate,
-		Clock:            clock,
-		Logger:           logger,
-	})
-	px := proxy.New(proxy.Deps{
-		Accounts: acctMap, Routes: routes, Creds: creds, Quota: qm, Policy: pol,
-		Ledger: led, Authenticate: authenticate, Clock: clock, Logger: logger,
-	}, proxy.Options{MaxFailovers: cfg.Policy.MaxFailovers})
-	ctl := control.New(control.Deps{
-		Accounts: accounts, Quota: qm, Policy: pol, Ledger: led, Routes: routes,
-		Authenticate: authenticate, Clock: clock,
-	}, control.Options{RequireAuth: cfg.Control.RequireAuth, StaleAfter: cfg.Policy.StaleAfter.D()})
-
-	mux := http.NewServeMux()
-	mux.Handle("/v1/", px.Handler())
-	mux.Handle("/", ctl.Handler())
+	defer a.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	qm.Start(ctx)
+	a.Start(ctx)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err
 	}
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	logger.Info("localrouter listening", "addr", ln.Addr().String(), "accounts", len(accounts), "routes", len(routes))
+	srv := &http.Server{Handler: a.Handler, ReadHeaderTimeout: 10 * time.Second}
+	logger.Info("localrouter listening", "addr", ln.Addr().String(), "accounts", len(cfg.Accounts), "routes", len(cfg.Routes))
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	select {

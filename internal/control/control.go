@@ -147,6 +147,8 @@ type accountStatus struct {
 	SnapshotAgeS          *int64             `json:"snapshot_age_s"`
 	Stale                 bool               `json:"stale"`
 	Error                 *string            `json:"error"`
+	// Reason explains why a class is not admissible (policy wording; no secrets).
+	Reason string `json:"reason,omitempty"`
 }
 
 type windowStatus struct {
@@ -186,6 +188,7 @@ func (s *Server) accountStatus(a core.Account, now time.Time) accountStatus {
 	st.Inflight = ps.Inflight
 	st.BackgroundAdmissible = ps.BackgroundAdmissible
 	st.InteractiveAdmissible = ps.InteractiveAdmissible
+	st.Reason = ps.Reason
 	st.Stale = ps.Stale
 	coolingDown := !ps.CooldownUntil.IsZero() && now.Before(ps.CooldownUntil)
 	if coolingDown {
