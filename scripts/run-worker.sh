@@ -19,7 +19,7 @@ export GOFLAGS=-p=4 GOMAXPROCS=4
 exec nice -n 10 claude -p "$prompt" \
   --model opus \
   --permission-mode acceptEdits \
-  --allowedTools "Read Edit Write Glob Grep Bash(go:*) Bash(gofmt:*) Bash(git add:*) Bash(git commit:*) Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(ls:*) Bash(mkdir:*)" \
+  --allowedTools "Read Edit Write Glob Grep Bash(go:*) Bash(env:*) Bash(gofmt:*) Bash(git add:*) Bash(git commit:*) Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(ls:*) Bash(mkdir:*)" \
   --output-format json \
   --json-schema "$schema" \
   > "$out/result.json" 2> "$out/stderr.log"
