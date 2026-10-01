@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "required": ["package", "status", "commits", "public_api", "tests_run", "acceptance_tests_covered", "contract_issues", "assumptions", "unresolved"],
+  "properties": {
+    "package": {"type": "string"},
+    "status": {"type": "string", "enum": ["complete", "partial", "blocked"]},
+    "commits": {"type": "array", "items": {"type": "string"}},
+    "files": {"type": "array", "items": {"type": "string"}},
+    "public_api": {"type": "string", "description": "Constructors/types/functions the architect wires, with signatures"},
+    "tests_run": {"type": "array", "items": {"type": "object", "required": ["command", "result"], "properties": {"command": {"type": "string"}, "result": {"type": "string"}}}},
+    "acceptance_tests_covered": {"type": "array", "items": {"type": "string"}},
+    "contract_issues": {"type": "array", "items": {"type": "string"}},
+    "assumptions": {"type": "array", "items": {"type": "string"}},
+    "unresolved": {"type": "array", "items": {"type": "string"}}
+  }
+}
