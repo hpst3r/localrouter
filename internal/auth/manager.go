@@ -153,6 +153,10 @@ func (m *Manager) Credential(ctx context.Context, accountID string) (core.Creden
 	if a.Provider == core.ProviderCodex {
 		return m.codexCredential(ctx, accountID)
 	}
+	if a.Provider == core.ProviderClaude {
+		// Quota-only: LocalRouter never holds or attaches Claude credentials.
+		return core.Credential{}, fmt.Errorf("auth: account %q is quota-only (claude); it cannot serve inference", accountID)
+	}
 	return m.staticCredential(accountID)
 }
 
