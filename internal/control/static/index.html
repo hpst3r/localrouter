@@ -185,6 +185,7 @@ button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; b
       top.appendChild(el("span", "dot " + dotCls));
       top.appendChild(el("span", "grow", a.id));
       top.appendChild(el("span", "badge", a.provider));
+      if (a.provider === "claude") top.appendChild(el("span", "badge", "quota only"));
       top.appendChild(el("span", "pill " + (a.interactive_admissible ? "on" : "off"), "interactive"));
       top.appendChild(el("span", "pill " + (a.background_admissible ? "on" : "off"), "background"));
       card.appendChild(top);
@@ -198,6 +199,10 @@ button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; b
 
       card.appendChild(windowBlock(a, findWindow(a, "5h"), "5h", nowMs));
       card.appendChild(windowBlock(a, findWindow(a, "weekly"), "weekly", nowMs));
+      // Extra window kinds (e.g. weekly_fable) as additional bars, in order.
+      (a.windows || []).forEach(function (w) {
+        if (w.kind !== "5h" && w.kind !== "weekly") card.appendChild(windowBlock(a, w, String(w.kind), nowMs));
+      });
 
       if (cooling) card.appendChild(el("div", "warnline", "cooling down for " + duration((Date.parse(a.cooldown_until) - nowMs) / 1000)));
       if (a.stale) card.appendChild(el("div", "warnline", "quota data stale"));
@@ -207,11 +212,12 @@ button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; b
   }
 
   function total(rows) {
-    var t = { requests: 0, input: 0, cached: 0, output: 0, cost: 0, priced: false, unpriced: 0, unknown: 0 };
+    var t = { requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, cost: 0, priced: false, unpriced: 0, unknown: 0 };
     (rows || []).forEach(function (r) {
       t.requests += Number(r.requests) || 0;
       t.input += Number(r.input_tokens) || 0;
       t.cached += Number(r.cached_input_tokens) || 0;
+      t.cacheWrite += Number(r.cache_creation_input_tokens) || 0;
       t.output += Number(r.output_tokens) || 0;
       t.unpriced += Number(r.unpriced_requests) || 0;
       t.unknown += Number(r.unknown_usage_requests) || 0;
@@ -242,11 +248,12 @@ button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; b
   function renderTotals(day, week) {
     var table = document.getElementById("totals");
     clear(table);
-    headerRow(table, ["", "req", "in", "cached", "out", "cost"]);
+    headerRow(table, ["", "req", "in", "cached", "cache write", "out", "cost"]);
     [["24h", day], ["7d", week]].forEach(function (p) {
-      if (!p[1]) { dataRow(table, [p[0], "—", "—", "—", "—", "—"]); return; }
+      if (!p[1]) { dataRow(table, [p[0], "—", "—", "—", "—", "—", "—"]); return; }
       var t = total(p[1].rows);
-      dataRow(table, [p[0], t.requests, humanTokens(t.input), humanTokens(t.cached), humanTokens(t.output), costText(t)]);
+      dataRow(table, [p[0], t.requests, humanTokens(t.input), humanTokens(t.cached), humanTokens(t.cacheWrite),
+        humanTokens(t.output), costText(t)]);
     });
   }
 

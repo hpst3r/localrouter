@@ -19,7 +19,8 @@
 //	GET  /healthz            -> "ok"
 //	GET  /control/v1/status  -> per-account quota/admission state
 //	GET  /control/v1/usage   -> ledger summary (?since=24h|7d&group=account|model|class|client)
-//	POST /control/v1/admit   -> dry-run admission {class, model}; never creates a lease
+//	POST /control/v1/admit   -> dry-run admission {class, model} or {class, account}
+//	                            (exactly one of model/account); never creates a lease
 //	GET  /                   -> embedded HTML status widget
 //
 // When Options.RequireAuth is set, /control/v1/* require a client bearer key;

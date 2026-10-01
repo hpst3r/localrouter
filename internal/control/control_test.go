@@ -375,6 +375,73 @@ func TestAdmitUsesDryRun(t *testing.T) {
 	}
 }
 
+func TestAdmitAccount(t *testing.T) {
+	f := newFixture(false)
+	f.policy.decision = core.Decision{Allow: false, Reason: "background reserve on weekly"}
+	rec := f.do(t, "POST", "/control/v1/admit", `{"class":"background","account":"stale"}`, "")
+	if rec.Code != 200 {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body)
+	}
+	m := decode(t, rec)
+	if m["decision"] != "deny" || m["account_id"] != "stale" || m["reason"] != "background reserve on weekly" {
+		t.Errorf("admit account = %v", m)
+	}
+	if len(f.policy.dryRuns) != 1 || f.policy.dryRuns[0].class != core.ClassBackground ||
+		strings.Join(f.policy.dryRuns[0].candidates, ",") != "stale" {
+		t.Fatalf("dry runs = %+v", f.policy.dryRuns)
+	}
+
+	f.policy.decision = core.Decision{Allow: true, AccountID: "stale", Reason: "admitted"}
+	if m := decode(t, f.do(t, "POST", "/control/v1/admit", `{"class":"interactive","account":"stale"}`, "")); m["decision"] != "allow" {
+		t.Errorf("allow = %v", m)
+	}
+
+	cases := map[string]int{
+		`{"class":"background","account":"ghost"}`:                 404,
+		`{"class":"background","account":"stale","model":"gpt-5"}`: 400,
+		`{"class":"background"}`:                                   400,
+		`{"class":"bulk","account":"stale"}`:                       400,
+	}
+	for body, want := range cases {
+		if rec := f.do(t, "POST", "/control/v1/admit", body, ""); rec.Code != want {
+			t.Errorf("%s: code %d want %d", body, rec.Code, want)
+		}
+	}
+	if len(f.policy.dryRuns) != 2 || f.policy.acquires != 0 {
+		t.Fatalf("invalid requests reached policy: dryRuns=%d acquires=%d", len(f.policy.dryRuns), f.policy.acquires)
+	}
+}
+
+func TestStatusExtraWindowKinds(t *testing.T) {
+	q := &fakeQuota{snaps: map[string]core.Snapshot{"claude-max": {
+		AccountID: "claude-max", FetchedAt: t0,
+		Windows: []core.Window{
+			{Kind: core.Window5h, UsedFrac: 0.2, WindowSeconds: 18000},
+			{Kind: core.WindowWeekly, UsedFrac: 0.4, WindowSeconds: 604800},
+			{Kind: "weekly_fable", UsedFrac: 0.7, ResetAt: t0.Add(time.Hour), WindowSeconds: 604800},
+		},
+	}}}
+	srv := New(Deps{
+		Accounts: []core.Account{{ID: "claude-max", Provider: core.ProviderClaude}},
+		Quota:    q, Policy: &fakePolicy{}, Clock: fakeClock{t0},
+	}, Options{})
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/control/v1/status", nil))
+	doc := decode(t, rec)
+	a := doc["accounts"].([]any)[0].(map[string]any)
+	if a["provider"] != "claude" {
+		t.Errorf("provider = %v", a["provider"])
+	}
+	wins := a["windows"].([]any)
+	if len(wins) != 3 {
+		t.Fatalf("windows = %v", wins)
+	}
+	w := wins[2].(map[string]any)
+	if w["kind"] != "weekly_fable" || w["used_frac"] != 0.7 || w["reset_at"] != "2026-10-01T13:00:00Z" {
+		t.Errorf("extra window = %v", w)
+	}
+}
+
 func TestRequireAuth(t *testing.T) {
 	f := newFixture(true)
 	paths := []struct{ method, path, body string }{
@@ -432,7 +499,8 @@ func TestWidget(t *testing.T) {
 	if strings.Contains(body, "innerHTML") {
 		t.Errorf("widget must not use innerHTML")
 	}
-	for _, want := range []string{"/control/v1/status", "/control/v1/usage?since=24h&group=account", "15000", "localStorage", "prefers-color-scheme"} {
+	for _, want := range []string{"/control/v1/status", "/control/v1/usage?since=24h&group=account", "15000", "localStorage", "prefers-color-scheme",
+		"quota only", "cache write", "cache_creation_input_tokens"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("widget missing %q", want)
 		}

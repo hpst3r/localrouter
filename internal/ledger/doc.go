@@ -7,7 +7,7 @@
 //	l, err := ledger.Open(filepath.Join(cfg.DataDir, "localrouter.db"), pricing,
 //	        func(accountID string) string { return basisByAccount[accountID] })
 //	defer l.Close()
-//	l.Record(ctx, rec)                                           // computes cost_usd/cost_basis
+//	l.Record(ctx, rec)                                           // computes cost_usd/cost_basis; no-op on existing rec.ID
 //	rows, err := l.Summary(ctx, since, "account")                // account|model|class|client|route|day
 //
 // Pricing import (`localrouter pricing import <litellm json>`):
