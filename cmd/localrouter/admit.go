@@ -50,6 +50,7 @@ func runAdmit(args []string, stdout, stderr io.Writer) error {
 	base := fs.String("url", "http://127.0.0.1:8787", "LocalRouter base URL")
 	asJSON := fs.Bool("json", false, "print the decision as JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "request timeout")
+	keyFile := fs.String("key-file", "", "client key file (needed only when control.require_auth is on)")
 	if err := fs.Parse(args); err != nil {
 		return exitError{2, "admit: " + err.Error()}
 	}
@@ -69,7 +70,19 @@ func runAdmit(args []string, stdout, stderr io.Writer) error {
 	body, _ := json.Marshal(req)
 	endpoint := strings.TrimRight(*base, "/") + "/control/v1/admit"
 	client := &http.Client{Timeout: *timeout}
-	resp, err := client.Post(endpoint, "application/json", bytes.NewReader(body))
+	hreq, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return exitError{2, "admit: " + err.Error()}
+	}
+	hreq.Header.Set("Content-Type", "application/json")
+	if *keyFile != "" {
+		k, err := os.ReadFile(*keyFile)
+		if err != nil {
+			return exitError{2, "admit: reading key file: " + err.Error()}
+		}
+		hreq.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(k)))
+	}
+	resp, err := client.Do(hreq)
 	if err != nil {
 		var ue *url.Error
 		if errors.As(err, &ue) {

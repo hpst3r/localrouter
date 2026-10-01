@@ -32,6 +32,8 @@ Usage:
   localrouter keygen  <output-file>
   localrouter pricing import [-config PATH] <litellm-prices.json>
   localrouter check   [-config PATH]
+  localrouter admit   [--class background] (--account ID | --model NAME) [--url URL] [--json]
+                      exit 0 = allow, 1 = deny, 2 = error
 
 Default config: ~/.config/localrouter/config.yaml
 `
@@ -53,6 +55,8 @@ func main() {
 		err = cmdPricing(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
+	case "admit":
+		err = cmdAdmit(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
@@ -61,6 +65,13 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
+		var coded interface{ Code() int }
+		if errors.As(err, &coded) {
+			if coded.Code() != 1 {
+				fmt.Fprintln(os.Stderr, "localrouter:", err)
+			}
+			os.Exit(coded.Code())
+		}
 		fmt.Fprintln(os.Stderr, "localrouter:", err)
 		os.Exit(1)
 	}

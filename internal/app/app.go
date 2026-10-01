@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 
 	"github.com/hpst3r/localrouter/internal/auth"
+	"github.com/hpst3r/localrouter/internal/claudelog"
 	"github.com/hpst3r/localrouter/internal/config"
 	"github.com/hpst3r/localrouter/internal/control"
 	"github.com/hpst3r/localrouter/internal/core"
@@ -26,6 +27,7 @@ type Overrides struct {
 	Issuer         string
 	CodexUsageURL  string
 	OllamaUsageURL string
+	ClaudeUsageURL string
 	HTTPClient     *http.Client
 	Clock          core.Clock
 }
@@ -37,6 +39,8 @@ type App struct {
 	Policy  *policy.Policy
 	Ledger  *ledger.Ledger
 	Auth    *auth.Manager
+	// ClaudeLog is nil unless claude_logs.enabled.
+	ClaudeLog *claudelog.Collector
 }
 
 // StaticKeys maps non-codex accounts to their key sources.
@@ -114,13 +118,21 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		return nil, fmt.Errorf("ledger: %w", err)
 	}
 
+	claudeCreds := map[string]string{}
+	for _, a := range cfg.Accounts {
+		if a.Provider == core.ProviderClaude {
+			claudeCreds[a.ID] = a.CredentialsFile
+		}
+	}
 	qm := quota.New(accounts, creds, quota.Options{
-		PollInterval:   cfg.Quota.PollInterval.D(),
-		HTTPClient:     ov.HTTPClient,
-		Clock:          clock,
-		Logger:         logger,
-		CodexUsageURL:  ov.CodexUsageURL,
-		OllamaUsageURL: ov.OllamaUsageURL,
+		PollInterval:          cfg.Quota.PollInterval.D(),
+		HTTPClient:            ov.HTTPClient,
+		Clock:                 clock,
+		Logger:                logger,
+		CodexUsageURL:         ov.CodexUsageURL,
+		OllamaUsageURL:        ov.OllamaUsageURL,
+		ClaudeUsageURL:        ov.ClaudeUsageURL,
+		ClaudeCredentialsFile: func(id string) string { return claudeCreds[id] },
 	})
 	pol := policy.New(accounts, qm, policy.Options{
 		StaleAfter:       cfg.Policy.StaleAfter.D(),
@@ -145,11 +157,27 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 	if !cfg.AllowNonLoopback {
 		h = LocalHostGuard(mux)
 	}
-	return &App{Handler: h, Quota: qm, Policy: pol, Ledger: led, Auth: creds}, nil
+	a := &App{Handler: h, Quota: qm, Policy: pol, Ledger: led, Auth: creds}
+	if cfg.ClaudeLogs.Enabled {
+		a.ClaudeLog = claudelog.New(led, claudelog.Options{
+			Dir:          cfg.ClaudeLogs.Dir,
+			AccountID:    cfg.ClaudeLogs.Account,
+			StatePath:    filepath.Join(cfg.DataDir, "claudelog-state.json"),
+			ScanInterval: cfg.ClaudeLogs.ScanInterval.D(),
+			Clock:        clock,
+			Logger:       logger,
+		})
+	}
+	return a, nil
 }
 
 // Start begins background quota polling until ctx is cancelled.
-func (a *App) Start(ctx context.Context) { a.Quota.Start(ctx) }
+func (a *App) Start(ctx context.Context) {
+	a.Quota.Start(ctx)
+	if a.ClaudeLog != nil {
+		a.ClaudeLog.Start(ctx)
+	}
+}
 
 // Close releases the ledger.
 func (a *App) Close() error { return a.Ledger.Close() }
