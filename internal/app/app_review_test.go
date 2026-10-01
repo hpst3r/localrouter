@@ -41,7 +41,6 @@ func (reviewCreds) Invalidate(string) {}
 // x-codex header sample at 95% (reserve 10%) must deny background. The merge
 // keeps a past ResetAt, so the policy treats the window as rolled and admits.
 func TestReviewBackgroundAdmittedBelowReserveAfterHeaderMerge(t *testing.T) {
-	t.Skip("BUG: quota ObserveHeaders keeps past ResetAt; policy treats fresh 95% window as rolled and admits background below 10% reserve")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"rate_limit":{"allowed":true,"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":3600},
 			"secondary_window":{"used_percent":10,"limit_window_seconds":604800,"reset_after_seconds":500000}}}`))

@@ -423,7 +423,8 @@ func TestObserveHeadersMerge(t *testing.T) {
 	if !approx(sec.UsedFrac, 0.3) || !sec.ResetAt.Equal(t0.Add(5000*time.Second)) {
 		t.Errorf("secondary should be kept: %+v", sec)
 	}
-	if s.Source != SourceHeaders || !s.FetchedAt.Equal(now) || s.Plan != "plus" {
+	// Weekly was not observed, so the snapshot must not look freshly fetched.
+	if s.Source != SourceUsageAPI || !s.FetchedAt.Equal(t0) || s.Plan != "plus" {
 		t.Errorf("snap = %+v", s)
 	}
 	if s.Allowed == nil || !*s.Allowed {
@@ -440,6 +441,48 @@ func TestObserveHeadersMerge(t *testing.T) {
 	}
 	if w := findWindow(t, s, core.WindowWeekly); w.UsedFrac != 1 || !w.ResetAt.Equal(t0.Add(5000*time.Second)) {
 		t.Errorf("weekly = %+v", w)
+	}
+
+	// Observing every window kind present advances FetchedAt.
+	hdr = http.Header{}
+	hdr.Set("x-codex-primary-used-percent", "20")
+	hdr.Set("x-codex-secondary-used-percent", "40")
+	h.m.ObserveHeaders("cx", hdr)
+	if s, _ = h.m.Latest("cx"); s.Source != SourceHeaders || !s.FetchedAt.Equal(now) {
+		t.Errorf("full header set should freshen snapshot: %+v", s)
+	}
+}
+
+func TestObserveHeadersKeepsFutureResetAt(t *testing.T) {
+	h := newHarness(t, codexAcct(), func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":3600}}}`))
+	})
+	h.m.refresh(context.Background(), "cx", true)
+	h.clock.Advance(time.Minute)
+	h.m.ObserveHeaders("cx", http.Header{"X-Codex-Primary-Used-Percent": {"50"}})
+	s, _ := h.m.Latest("cx")
+	if w := findWindow(t, s, core.Window5h); !approx(w.UsedFrac, 0.5) || !w.ResetAt.Equal(t0.Add(time.Hour)) {
+		t.Errorf("window = %+v", w)
+	}
+}
+
+// A fetch that started after a header observation replaces that window.
+func TestFetchAfterHeadersReplacesWindow(t *testing.T) {
+	h := newHarness(t, codexAcct(), func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":30,"limit_window_seconds":18000,"reset_after_seconds":3600}}}`))
+	})
+	hdr := http.Header{}
+	hdr.Set("x-codex-primary-used-percent", "90")
+	hdr.Set("x-codex-secondary-used-percent", "20")
+	h.m.ObserveHeaders("cx", hdr)
+	h.clock.Advance(time.Second)
+	h.m.refresh(context.Background(), "cx", true)
+	s, _ := h.m.Latest("cx")
+	if w := findWindow(t, s, core.Window5h); !approx(w.UsedFrac, 0.3) {
+		t.Errorf("5h = %+v, want fetched 0.3", w)
+	}
+	if s.Source != SourceUsageAPI || !s.FetchedAt.Equal(h.clock.Now()) {
+		t.Errorf("snap = %+v", s)
 	}
 }
 
