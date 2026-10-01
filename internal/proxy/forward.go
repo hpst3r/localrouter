@@ -178,7 +178,11 @@ func (p *Proxy) noResponse(w http.ResponseWriter, canFailover bool, msg string) 
 // send builds and performs the upstream request.
 func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cred core.Credential) (*http.Response, error) {
 	u := strings.TrimRight(account.BaseURL, "/") + req.endpoint
-	up, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(req.body))
+	body := req.body
+	if account.Provider == core.ProviderCodex {
+		body = codexBody(body)
+	}
+	up, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
