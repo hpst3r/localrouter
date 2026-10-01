@@ -86,6 +86,27 @@ func (s *Store) Load(account string) (Token, error) {
 	return t, nil
 }
 
+// fileStamp identifies one version of a token file on disk.
+type fileStamp struct {
+	exists bool
+	mtime  time.Time
+	size   int64
+}
+
+// stamp returns the current fileStamp of account's token file. A stat error
+// other than not-exist yields a zero stamp.
+func (s *Store) stamp(account string) fileStamp {
+	p, err := s.path(account)
+	if err != nil {
+		return fileStamp{}
+	}
+	fi, err := os.Stat(p)
+	if err != nil {
+		return fileStamp{}
+	}
+	return fileStamp{exists: true, mtime: fi.ModTime(), size: fi.Size()}
+}
+
 // Save atomically writes the token for account: temp file in the same dir
 // (0600), fsync, rename, fsync dir.
 func (s *Store) Save(account string, t Token) error {

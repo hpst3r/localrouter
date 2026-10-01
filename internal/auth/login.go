@@ -143,6 +143,8 @@ func (m *Manager) LoginWithOptions(ctx context.Context, accountID string, out io
 	}
 	st.tok = &t
 	st.invalidated = false
+	st.refreshedAt = now
+	m.clearFailureLocked(st)
 	m.opts.Logger.Info("codex login complete", "account", accountID, "chatgpt_account_id", acct)
 	fmt.Fprintf(out, "Logged in account %s (ChatGPT account %s).\n", accountID, acct)
 	return nil
