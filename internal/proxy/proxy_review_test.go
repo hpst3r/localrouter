@@ -15,7 +15,6 @@ import (
 // accepts the request but never answers holds the lease (and the client)
 // until the client gives up. internal/app does not pass an HTTPClient.
 func TestReviewDefaultClientHasResponseHeaderTimeout(t *testing.T) {
-	t.Skip("BUG: default proxy HTTP client uses DefaultTransport with ResponseHeaderTimeout=0; dead upstream hangs forever with lease held")
 	p := New(Deps{}, Options{})
 	tr, ok := p.opts.HTTPClient.Transport.(*http.Transport)
 	if !ok || tr == nil {
@@ -35,7 +34,6 @@ func (panicCreds) Invalidate(string)                                           {
 // quota observer, usage parser) is recovered by net/http, but the lease is
 // never released, permanently inflating inflight(A).
 func TestReviewLeaseReleasedOnPanic(t *testing.T) {
-	t.Skip("BUG: forward/attempt have no deferred lease release; a panic leaks the lease and inflight never decreases")
 	pol := newFakePolicy()
 	p := New(Deps{
 		Accounts: map[string]core.Account{"a": {ID: "a", Provider: core.ProviderOllama, BaseURL: "http://127.0.0.1:1"}},
