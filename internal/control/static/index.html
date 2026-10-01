@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>LocalRouter</title>
+<style>
+:root {
+  --bg: #f7f7f8; --card: #ffffff; --fg: #1d1d1f; --muted: #6b6b73; --line: #e2e2e6;
+  --track: #e9e9ee; --ok: #2f9e5b; --warn: #c98a12; --bad: #d1453b; --bar: #3b82f6;
+  --marker: #1d1d1f;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141417; --card: #1e1e22; --fg: #ececf0; --muted: #9a9aa5; --line: #2e2e35;
+    --track: #2c2c33; --ok: #4cc17d; --warn: #e0a83a; --bad: #ef6b61; --bar: #5b9bff;
+    --marker: #ececf0;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; padding: 10px; background: var(--bg); color: var(--fg);
+  font: 13px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 520px; }
+header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 8px; }
+h1 { font-size: 15px; margin: 0; }
+h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 14px 0 6px; }
+.muted { color: var(--muted); }
+.small { font-size: 11px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
+.row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.badge { font-size: 10px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); }
+.pill { font-size: 10px; padding: 1px 6px; border-radius: 10px; color: #fff; }
+.pill.on { background: var(--ok); } .pill.off { background: var(--bad); }
+.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+.win { margin-top: 6px; }
+.winhead { display: flex; justify-content: space-between; font-size: 11px; }
+.track { position: relative; height: 8px; background: var(--track); border-radius: 4px; overflow: visible; margin-top: 2px; }
+.fill { height: 100%; border-radius: 4px; background: var(--bar); }
+.fill.low { background: var(--warn); } .fill.empty { background: var(--bad); }
+.marker { position: absolute; top: -3px; width: 2px; height: 14px; background: var(--marker); opacity: .75; }
+.warnline { color: var(--warn); font-size: 11px; margin-top: 4px; word-break: break-word; }
+.errline { color: var(--bad); font-size: 11px; margin-top: 4px; word-break: break-word; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th, td { text-align: right; padding: 2px 4px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
+th { color: var(--muted); font-weight: 500; }
+#keybox { display: none; }
+#keybox input { width: 100%; padding: 4px 6px; margin: 6px 0; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; }
+button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
+#banner { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LocalRouter</h1>
+  <span class="small muted" id="updated">loading…</span>
+</header>
+
+<div class="card" id="keybox">
+  <div>This server requires a client key to read status.</div>
+  <form id="keyform">
+    <input id="keyinput" type="password" autocomplete="off" placeholder="client key">
+    <button type="submit">Save key</button>
+  </form>
+</div>
+<div class="card errline" id="banner"></div>
+
+<div id="accounts"></div>
+
+<h2>Usage</h2>
+<div class="card"><table id="totals"></table></div>
+
+<h2>Models (24h)</h2>
+<div class="card"><table id="models"></table></div>
+
+<div class="small muted" style="margin-top:8px">
+  <button id="forget" type="button" style="display:none">Forget key</button>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var KEY = "localrouter.controlKey";
+  var POLL_MS = 15000;
+  var lastStatus = null;
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    return e;
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  function getKey() { try { return localStorage.getItem(KEY) || ""; } catch (e) { return ""; } }
+  function setKey(k) { try { if (k) localStorage.setItem(KEY, k); else localStorage.removeItem(KEY); } catch (e) {} }
+
+  function api(path) {
+    var headers = { "Accept": "application/json" };
+    var k = getKey();
+    if (k) headers["Authorization"] = "Bearer " + k;
+    return fetch(path, { headers: headers, cache: "no-store", credentials: "omit" }).then(function (r) {
+      if (r.status === 401) { var e = new Error("unauthorized"); e.unauthorized = true; throw e; }
+      if (!r.ok) throw new Error(path.split("?")[0] + ": HTTP " + r.status);
+      return r.json();
+    });
+  }
+
+  function humanTokens(n) {
+    n = Number(n) || 0;
+    var units = [[1e12, "T"], [1e9, "B"], [1e6, "M"], [1e3, "k"]];
+    for (var i = 0; i < units.length; i++) {
+      if (Math.abs(n) >= units[i][0]) {
+        var v = n / units[i][0];
+        return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + units[i][1];
+      }
+    }
+    return String(n);
+  }
+  function money(v) { return "$" + (v >= 100 ? v.toFixed(0) : v.toFixed(2)); }
+  function pct(f) { return Math.round((Number(f) || 0) * 100) + "%"; }
+  function duration(sec) {
+    sec = Math.max(0, Math.floor(sec));
+    var d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+    if (d > 0) return d + "d " + h + "h";
+    if (h > 0) return h + "h " + m + "m";
+    if (m > 0) return m + "m";
+    return sec + "s";
+  }
+
+  function windowBlock(acct, w, label, nowMs) {
+    var box = el("div", "win");
+    var head = el("div", "winhead");
+    var left = el("span", null, label);
+    var right = el("span", "muted");
+    if (!w) {
+      right.textContent = "no data";
+      head.appendChild(left); head.appendChild(right); box.appendChild(head);
+      box.appendChild(el("div", "track"));
+      return box;
+    }
+    var remaining = Math.max(0, Math.min(1, Number(w.remaining_frac) || 0));
+    var reset;
+    if (w.rolled) reset = "reset passed";
+    else if (w.reset_at) reset = "resets in " + duration((Date.parse(w.reset_at) - nowMs) / 1000);
+    else reset = "reset unknown";
+    left.textContent = label + " · " + pct(remaining) + " left";
+    right.textContent = reset;
+    head.appendChild(left); head.appendChild(right); box.appendChild(head);
+
+    var track = el("div", "track");
+    var reserve = Number((acct.reserve || {})[w.kind]) || 0;
+    var fill = el("div", "fill" + (remaining <= 0.02 ? " empty" : remaining <= reserve ? " low" : ""));
+    fill.style.width = (remaining * 100).toFixed(1) + "%";
+    track.appendChild(fill);
+    if (reserve > 0) {
+      var mk = el("div", "marker");
+      mk.style.left = "calc(" + (Math.min(1, reserve) * 100).toFixed(1) + "% - 1px)";
+      mk.title = "reserve " + pct(reserve);
+      track.appendChild(mk);
+    }
+    box.appendChild(track);
+    return box;
+  }
+
+  function findWindow(acct, kind) {
+    var ws = acct.windows || [];
+    for (var i = 0; i < ws.length; i++) if (ws[i].kind === kind) return ws[i];
+    return null;
+  }
+
+  function renderAccounts(status) {
+    var root = document.getElementById("accounts");
+    clear(root);
+    var nowMs = Date.now();
+    var accts = (status && status.accounts) || [];
+    if (!accts.length) { root.appendChild(el("div", "card muted", "No accounts configured.")); return; }
+    accts.forEach(function (a) {
+      var card = el("div", "card");
+      var top = el("div", "row");
+      var cooling = a.cooldown_until && Date.parse(a.cooldown_until) > nowMs;
+      var dotCls = !a.healthy || cooling ? "bad" : a.stale ? "warn" : "ok";
+      top.appendChild(el("span", "dot " + dotCls));
+      top.appendChild(el("span", "grow", a.id));
+      top.appendChild(el("span", "badge", a.provider));
+      top.appendChild(el("span", "pill " + (a.interactive_admissible ? "on" : "off"), "interactive"));
+      top.appendChild(el("span", "pill " + (a.background_admissible ? "on" : "off"), "background"));
+      card.appendChild(top);
+
+      var meta = el("div", "small muted");
+      var bits = ["inflight " + (Number(a.inflight) || 0)];
+      if (a.snapshot_age_s === null || a.snapshot_age_s === undefined) bits.push("no snapshot");
+      else bits.push("sampled " + duration(a.snapshot_age_s) + " ago");
+      meta.textContent = bits.join(" · ");
+      card.appendChild(meta);
+
+      card.appendChild(windowBlock(a, findWindow(a, "5h"), "5h", nowMs));
+      card.appendChild(windowBlock(a, findWindow(a, "weekly"), "weekly", nowMs));
+
+      if (cooling) card.appendChild(el("div", "warnline", "cooling down for " + duration((Date.parse(a.cooldown_until) - nowMs) / 1000)));
+      if (a.stale) card.appendChild(el("div", "warnline", "quota data stale"));
+      if (a.error) card.appendChild(el("div", "errline", "fetch error: " + a.error));
+      root.appendChild(card);
+    });
+  }
+
+  function total(rows) {
+    var t = { requests: 0, input: 0, cached: 0, output: 0, cost: 0, priced: false, unpriced: 0, unknown: 0 };
+    (rows || []).forEach(function (r) {
+      t.requests += Number(r.requests) || 0;
+      t.input += Number(r.input_tokens) || 0;
+      t.cached += Number(r.cached_input_tokens) || 0;
+      t.output += Number(r.output_tokens) || 0;
+      t.unpriced += Number(r.unpriced_requests) || 0;
+      t.unknown += Number(r.unknown_usage_requests) || 0;
+      if (r.cost_usd !== null && r.cost_usd !== undefined) { t.cost += Number(r.cost_usd) || 0; t.priced = true; }
+    });
+    return t;
+  }
+  function costText(t) {
+    if (!t.priced) return t.requests ? "unpriced" : "—";
+    return money(t.cost) + (t.unpriced ? "+" : "");
+  }
+
+  function headerRow(table, cols) {
+    var tr = el("tr");
+    cols.forEach(function (c) { tr.appendChild(el("th", null, c)); });
+    table.appendChild(tr);
+  }
+  function dataRow(table, cells, title) {
+    var tr = el("tr");
+    cells.forEach(function (c, i) {
+      var td = el("td", null, c);
+      if (i === 0 && title) td.title = title;
+      tr.appendChild(td);
+    });
+    table.appendChild(tr);
+  }
+
+  function renderTotals(day, week) {
+    var table = document.getElementById("totals");
+    clear(table);
+    headerRow(table, ["", "req", "in", "cached", "out", "cost"]);
+    [["24h", day], ["7d", week]].forEach(function (p) {
+      if (!p[1]) { dataRow(table, [p[0], "—", "—", "—", "—", "—"]); return; }
+      var t = total(p[1].rows);
+      dataRow(table, [p[0], t.requests, humanTokens(t.input), humanTokens(t.cached), humanTokens(t.output), costText(t)]);
+    });
+  }
+
+  function renderModels(doc) {
+    var table = document.getElementById("models");
+    clear(table);
+    headerRow(table, ["model", "req", "in", "out", "cost"]);
+    var rows = (doc && doc.rows) || [];
+    if (!doc) { dataRow(table, ["unavailable", "", "", "", ""]); return; }
+    if (!rows.length) { dataRow(table, ["no requests", "", "", "", ""]); return; }
+    rows.slice().sort(function (a, b) { return (b.requests || 0) - (a.requests || 0); }).forEach(function (r) {
+      var t = total([r]);
+      dataRow(table, [r.key || "(none)", t.requests, humanTokens(t.input), humanTokens(t.output), costText(t)], r.key);
+    });
+  }
+
+  function showKeyPrompt(show) {
+    document.getElementById("keybox").style.display = show ? "block" : "none";
+  }
+  function showBanner(msg) {
+    var b = document.getElementById("banner");
+    b.textContent = msg || "";
+    b.style.display = msg ? "block" : "none";
+  }
+
+  function settle(p) {
+    return p.then(function (v) { return { ok: true, v: v }; }, function (e) { return { ok: false, e: e }; });
+  }
+
+  function refresh() {
+    Promise.all([
+      settle(api("/control/v1/status")),
+      settle(api("/control/v1/usage?since=24h&group=account")),
+      settle(api("/control/v1/usage?since=7d&group=account")),
+      settle(api("/control/v1/usage?since=24h&group=model"))
+    ]).then(function (res) {
+      var unauthorized = res.some(function (r) { return !r.ok && r.e && r.e.unauthorized; });
+      showKeyPrompt(unauthorized);
+      var errs = res.filter(function (r) { return !r.ok && !(r.e && r.e.unauthorized); })
+        .map(function (r) { return (r.e && r.e.message) || "request failed"; });
+      showBanner(errs.length ? errs.join("; ") : "");
+      if (res[0].ok) { lastStatus = res[0].v; renderAccounts(lastStatus); }
+      else if (lastStatus) renderAccounts(lastStatus);
+      renderTotals(res[1].ok ? res[1].v : null, res[2].ok ? res[2].v : null);
+      renderModels(res[3].ok ? res[3].v : null);
+      document.getElementById("updated").textContent = res[0].ok
+        ? "updated " + new Date().toLocaleTimeString()
+        : (unauthorized ? "key required" : "update failed " + new Date().toLocaleTimeString());
+      document.getElementById("forget").style.display = getKey() ? "inline-block" : "none";
+    }).catch(function (e) {
+      showBanner("render error: " + (e && e.message ? e.message : e));
+    });
+  }
+
+  document.getElementById("keyform").addEventListener("submit", function (ev) {
+    ev.preventDefault();
+    var input = document.getElementById("keyinput");
+    setKey(input.value.trim());
+    input.value = "";
+    refresh();
+  });
+  document.getElementById("forget").addEventListener("click", function () { setKey(""); refresh(); });
+
+  refresh();
+  setInterval(refresh, POLL_MS);
+  // Keep countdowns moving between polls.
+  setInterval(function () { if (lastStatus) renderAccounts(lastStatus); }, 30000);
+})();
+</script>
+</body>
+</html>
