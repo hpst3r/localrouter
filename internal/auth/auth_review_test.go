@@ -10,7 +10,6 @@ import (
 // dead refresh token to the issuer: there is no negative caching/backoff, so
 // each proxied request and each quota poll hammers auth.openai.com.
 func TestReviewRejectedRefreshIsRetriedEveryCall(t *testing.T) {
-	t.Skip("BUG: no backoff/negative cache after ErrLoginRequired; each Credential call re-hits /oauth/token")
 	h := newHarness(t)
 	h.seed(t, "a1", t0.Add(time.Minute), "chatgpt-1", "old")
 	h.iss.refreshStatus = 400
@@ -31,7 +30,6 @@ func TestReviewRejectedRefreshIsRetriedEveryCall(t *testing.T) {
 // request sent with the previous access token, arriving after another
 // request already refreshed, forces a second (rotating) refresh.
 func TestReviewStale401TriggersRedundantRefresh(t *testing.T) {
-	t.Skip("BUG/contract: Invalidate(accountID) lacks the rejected token; late 401s from old-token requests cause redundant refresh-token rotations")
 	h := newHarness(t)
 	h.seed(t, "a1", t0.Add(time.Hour), "chatgpt-1", "old")
 	h.iss.newAccess = makeJWT(t0.Add(2*time.Hour), "chatgpt-1", "access-new")

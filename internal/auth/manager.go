@@ -31,6 +31,15 @@ const (
 // any single caller's context because its result is shared by all waiters.
 const refreshTimeout = 30 * time.Second
 
+// refreshBackoff is how long a transient refresh failure (network, 5xx,
+// persist error) suppresses new refresh attempts for an account.
+const refreshBackoff = 30 * time.Second
+
+// staleInvalidateWindow: Invalidate is ignored this soon after a successful
+// refresh or login, since the 401 almost certainly came from a request that
+// was sent with the previous access token.
+const staleInvalidateWindow = 30 * time.Second
+
 // ErrLoginRequired is wrapped by errors returned when the stored refresh
 // token is rejected or missing and the user must log in again.
 var ErrLoginRequired = errors.New("login required")
@@ -72,6 +81,15 @@ type codexState struct {
 	mu          sync.Mutex
 	tok         *Token
 	invalidated bool
+	refreshedAt time.Time // last successful refresh or login (in-process)
+
+	// Cached refresh failure. A login-required failure (failLogin) holds
+	// until the token file changes (failStamp) or Login succeeds; any other
+	// failure holds until failUntil.
+	failErr   error
+	failLogin bool
+	failStamp fileStamp
+	failUntil time.Time
 }
 
 type staticState struct {
@@ -121,6 +139,12 @@ func New(accounts []core.Account, keys map[string]StaticKey, store *Store, opts 
 
 // Credential returns a valid credential for accountID, refreshing Codex
 // tokens if they expire within RefreshSkew or were invalidated.
+//
+// Codex refresh failures are cached per account so callers do not hammer the
+// issuer: after ErrLoginRequired the same error is returned without network
+// calls until the token file changes on disk or Login succeeds; after any
+// other refresh failure no new attempt is made for 30s and the last error is
+// returned wrapped.
 func (m *Manager) Credential(ctx context.Context, accountID string) (core.Credential, error) {
 	a, ok := m.accounts[accountID]
 	if !ok {
@@ -134,6 +158,12 @@ func (m *Manager) Credential(ctx context.Context, accountID string) (core.Creden
 
 // Invalidate forces the next Credential call for accountID to refresh (Codex)
 // or re-read the key (static).
+//
+// For Codex accounts, Invalidate is ignored if a refresh or login completed
+// within the last 30s: the 401 that triggered it was almost certainly for a
+// request sent with the previous access token, and refreshing again would
+// needlessly rotate the refresh token. Invalidate also does not bypass a
+// cached refresh failure (see Credential).
 func (m *Manager) Invalidate(accountID string) {
 	a, ok := m.accounts[accountID]
 	if !ok {
@@ -142,7 +172,11 @@ func (m *Manager) Invalidate(accountID string) {
 	if a.Provider == core.ProviderCodex {
 		st := m.codexState(accountID)
 		st.mu.Lock()
-		st.invalidated = true
+		if !st.refreshedAt.IsZero() && m.opts.Clock.Now().Sub(st.refreshedAt) < staleInvalidateWindow {
+			m.opts.Logger.Debug("codex invalidate ignored: token refreshed recently", "account", accountID)
+		} else {
+			st.invalidated = true
+		}
 		st.mu.Unlock()
 		return
 	}
@@ -220,6 +254,10 @@ func (m *Manager) needsRefreshLocked(st *codexState) bool {
 func (m *Manager) codexCredential(ctx context.Context, id string) (core.Credential, error) {
 	st := m.codexState(id)
 	st.mu.Lock()
+	if err := m.cachedFailureLocked(id, st); err != nil {
+		st.mu.Unlock()
+		return core.Credential{}, err
+	}
 	if err := m.loadLocked(id, st); err != nil {
 		st.mu.Unlock()
 		return core.Credential{}, err
@@ -249,6 +287,9 @@ func (m *Manager) codexCredential(ctx context.Context, id string) (core.Credenti
 func (m *Manager) refresh(id string, st *codexState) (core.Credential, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if err := m.cachedFailureLocked(id, st); err != nil {
+		return core.Credential{}, err
+	}
 	if err := m.loadLocked(id, st); err != nil {
 		return core.Credential{}, err
 	}
@@ -257,6 +298,51 @@ func (m *Manager) refresh(id string, st *codexState) (core.Credential, error) {
 	if !m.needsRefreshLocked(st) {
 		return codexCred(st.tok), nil
 	}
+	c, err := m.refreshLocked(id, st)
+	if err != nil {
+		m.recordFailureLocked(id, st, err)
+		return core.Credential{}, err
+	}
+	return c, nil
+}
+
+// cachedFailureLocked returns the cached refresh failure for id if it still
+// applies, clearing it otherwise. A login-required failure is cleared (and
+// the token reloaded) once the token file changes on disk. st.mu must be held.
+func (m *Manager) cachedFailureLocked(id string, st *codexState) error {
+	if st.failErr == nil {
+		return nil
+	}
+	if st.failLogin {
+		if m.store == nil || m.store.stamp(id) == st.failStamp {
+			return st.failErr
+		}
+		st.tok = nil
+	} else if m.opts.Clock.Now().Before(st.failUntil) {
+		return fmt.Errorf("auth: codex account %s: refresh backing off until %s: %w",
+			id, st.failUntil.UTC().Format(time.RFC3339), st.failErr)
+	}
+	m.clearFailureLocked(st)
+	return nil
+}
+
+func (m *Manager) recordFailureLocked(id string, st *codexState, err error) {
+	st.failErr = err
+	st.failLogin = errors.Is(err, ErrLoginRequired)
+	if st.failLogin {
+		st.failStamp = m.store.stamp(id)
+	} else {
+		st.failUntil = m.opts.Clock.Now().Add(refreshBackoff)
+	}
+}
+
+func (m *Manager) clearFailureLocked(st *codexState) {
+	st.failErr, st.failLogin, st.failStamp, st.failUntil = nil, false, fileStamp{}, time.Time{}
+}
+
+// refreshLocked performs the refresh request and persists the result. st.mu
+// must be held and st.tok loaded.
+func (m *Manager) refreshLocked(id string, st *codexState) (core.Credential, error) {
 	if st.tok.RefreshToken == "" {
 		return core.Credential{}, fmt.Errorf("auth: codex account %s: no refresh token: %w; run: localrouter login %s", id, ErrLoginRequired, id)
 	}
@@ -308,6 +394,7 @@ func (m *Manager) refresh(id string, st *codexState) (core.Credential, error) {
 	}
 	st.tok = &next
 	st.invalidated = false
+	st.refreshedAt = now
 	m.opts.Logger.Info("codex token refreshed", "account", id, "expires_at", next.ExpiresAt)
 	return codexCred(st.tok), nil
 }

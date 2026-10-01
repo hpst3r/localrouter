@@ -23,9 +23,23 @@ import (
 
 var t0 = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 
-type fixedClock struct{ t time.Time }
+// fixedClock returns t until advanced.
+type fixedClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
 
-func (c fixedClock) Now() time.Time { return c.t }
+func (c *fixedClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fixedClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
 
 // makeJWT builds an unsigned JWT; tag makes the token string unique.
 func makeJWT(exp time.Time, acct, tag string) string {
@@ -157,6 +171,7 @@ type harness struct {
 	store *Store
 	iss   *fakeIssuer
 	logs  *lockedBuf
+	clock *fixedClock
 }
 
 func newHarness(t *testing.T, accounts ...core.Account) *harness {
@@ -170,13 +185,14 @@ func newHarness(t *testing.T, accounts ...core.Account) *harness {
 	}
 	iss := newFakeIssuer(t)
 	logs := &lockedBuf{}
+	clock := &fixedClock{t: t0}
 	m := New(accounts, nil, store, Options{
 		Issuer:     iss.srv.URL,
 		HTTPClient: iss.srv.Client(),
-		Clock:      fixedClock{t0},
+		Clock:      clock,
 		Logger:     slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	})
-	return &harness{m: m, store: store, iss: iss, logs: logs}
+	return &harness{m: m, store: store, iss: iss, logs: logs, clock: clock}
 }
 
 func (h *harness) seed(t *testing.T, id string, exp time.Time, acct, tag string) Token {
@@ -669,13 +685,17 @@ func TestNoSecretsInLogsOrErrors(t *testing.T) {
 
 	// Successful refresh.
 	collect(h.m.Credential(context.Background(), "a1"))
-	// Failed refresh with token echoed in the error body.
+	// Failed refreshes with tokens echoed in the error body. Advance the
+	// clock past the stale-401 window and the transient backoff so each
+	// attempt reaches the issuer.
+	h.clock.advance(time.Minute)
 	h.m.Invalidate("a1")
-	h.iss.refreshStatus = 400
-	h.iss.refreshBody = fmt.Sprintf(`{"error":"invalid_grant","error_description":"%s %s"}`, h.iss.newRefresh, old.RefreshToken)
-	collect(h.m.Credential(context.Background(), "a1"))
 	h.iss.refreshStatus = 500
 	h.iss.refreshBody = h.iss.newRefresh
+	collect(h.m.Credential(context.Background(), "a1"))
+	h.clock.advance(time.Minute)
+	h.iss.refreshStatus = 400
+	h.iss.refreshBody = fmt.Sprintf(`{"error":"invalid_grant","error_description":"%s %s"}`, h.iss.newRefresh, old.RefreshToken)
 	collect(h.m.Credential(context.Background(), "a1"))
 	// Login (success, then refused overwrite).
 	var out bytes.Buffer
