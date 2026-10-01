@@ -41,6 +41,10 @@ type accountState struct {
 	snap      *core.Snapshot
 	lastFetch time.Time     // completion time of the last usage API fetch
 	inflight  chan struct{} // non-nil while a fetch is running; closed when done
+
+	// observedAt records, per window kind, when the window's current values
+	// were sampled (fetch start for the usage API, receipt for headers).
+	observedAt map[string]time.Time
 }
 
 // Manager implements core.QuotaSource for codex and ollama accounts.
@@ -89,7 +93,7 @@ func New(accounts []core.Account, creds core.CredentialSource, opts Options) *Ma
 	}
 	for _, a := range accounts {
 		if a.Provider == core.ProviderCodex || a.Provider == core.ProviderOllama {
-			m.state[a.ID] = &accountState{acct: a}
+			m.state[a.ID] = &accountState{acct: a, observedAt: make(map[string]time.Time)}
 		}
 	}
 	return m
@@ -195,7 +199,42 @@ func (m *Manager) refresh(ctx context.Context, id string, urgent bool) {
 		st.snap.Err = err.Error()
 		return
 	}
-	st.snap = &snap
+	st.snap = mergeFetched(st, snap)
+}
+
+// mergeFetched combines a usage API snapshot with the current one. The fetch
+// counts as observed at its start time (snap.FetchedAt); a window observed
+// from headers after that start is newer and is kept instead of the fetched
+// value. Caller holds m.mu.
+func mergeFetched(st *accountState, snap core.Snapshot) *core.Snapshot {
+	started := snap.FetchedAt
+	if st.snap != nil {
+		for _, old := range st.snap.Windows {
+			if !st.observedAt[old.Kind].After(started) {
+				continue
+			}
+			replaced := false
+			for i := range snap.Windows {
+				if snap.Windows[i].Kind == old.Kind {
+					snap.Windows[i] = old
+					replaced = true
+				}
+			}
+			if !replaced {
+				snap.Windows = append(snap.Windows, old)
+			}
+			if old.UsedFrac >= 1 {
+				f := false
+				snap.Allowed = &f
+			}
+		}
+	}
+	for _, w := range snap.Windows {
+		if !st.observedAt[w.Kind].After(started) {
+			st.observedAt[w.Kind] = started
+		}
+	}
+	return &snap
 }
 
 func (m *Manager) fetch(ctx context.Context, acct core.Account) (core.Snapshot, error) {

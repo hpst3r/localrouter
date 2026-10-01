@@ -13,7 +13,6 @@ import (
 // keeps the window's old ResetAt. If that ResetAt is already in the past the
 // policy treats the window as rolled (used = 0), discarding the fresh sample.
 func TestReviewHeaderMergeKeepsPastResetAt(t *testing.T) {
-	t.Skip("BUG: ObserveHeaders keeps a past ResetAt when reset-after header is absent; policy then treats fresh 95% as rolled (0%)")
 	h := newHarness(t, codexAcct(), func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"rate_limit":{"primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_after_seconds":3600}}}`))
 	})
@@ -34,7 +33,6 @@ func TestReviewHeaderMergeKeepsPastResetAt(t *testing.T) {
 // A usage-API fetch that started before a header observation must not
 // overwrite the newer header data when it completes.
 func TestReviewSlowFetchOverwritesNewerHeaders(t *testing.T) {
-	t.Skip("BUG: refresh overwrites st.snap unconditionally; a fetch started before a newer header observation clobbers it with older, lower usage")
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	h := newHarness(t, codexAcct(), func(w http.ResponseWriter, r *http.Request) {
@@ -63,7 +61,6 @@ func TestReviewSlowFetchOverwritesNewerHeaders(t *testing.T) {
 // the snapshot look fresh even though the weekly window is entirely unknown,
 // so the policy stops treating the reserved account as stale.
 func TestReviewHeadersFreshenSnapshotWithUnknownWeekly(t *testing.T) {
-	t.Skip("BUG: primary-only headers after a failed first fetch produce a fresh snapshot with no weekly window; weekly reserve is unenforced")
 	h := newHarness(t, codexAcct(), func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})
