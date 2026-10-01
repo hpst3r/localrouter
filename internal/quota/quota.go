@@ -12,11 +12,13 @@ import (
 
 // Default endpoints and intervals.
 const (
-	DefaultCodexUsageURL  = "https://chatgpt.com/backend-api/wham/usage"
-	DefaultOllamaUsageURL = "https://ollama.com/api/usage"
-	DefaultPollInterval   = 5 * time.Minute
-	DefaultMinRefreshGap  = 20 * time.Second
-	defaultHTTPTimeout    = 30 * time.Second
+	DefaultCodexUsageURL   = "https://chatgpt.com/backend-api/wham/usage"
+	DefaultOllamaUsageURL  = "https://ollama.com/api/usage"
+	DefaultClaudeUsageURL  = "https://api.anthropic.com/api/oauth/usage"
+	DefaultClaudeUserAgent = "claude-code/2.1.0"
+	DefaultPollInterval    = 5 * time.Minute
+	DefaultMinRefreshGap   = 20 * time.Second
+	defaultHTTPTimeout     = 30 * time.Second
 )
 
 // Snapshot sources.
@@ -27,13 +29,20 @@ const (
 
 // Options configures a Manager. Zero values select defaults.
 type Options struct {
-	PollInterval   time.Duration // default 5m
-	MinRefreshGap  time.Duration // default 20s; debounce for non-urgent refreshes
-	HTTPClient     *http.Client  // default: 30s timeout client
-	Clock          core.Clock    // default core.SystemClock
-	Logger         *slog.Logger  // default slog.Default()
-	CodexUsageURL  string        // default DefaultCodexUsageURL
-	OllamaUsageURL string        // default DefaultOllamaUsageURL
+	PollInterval    time.Duration // default 5m
+	MinRefreshGap   time.Duration // default 20s; debounce for non-urgent refreshes
+	HTTPClient      *http.Client  // default: 30s timeout client
+	Clock           core.Clock    // default core.SystemClock
+	Logger          *slog.Logger  // default slog.Default()
+	CodexUsageURL   string        // default DefaultCodexUsageURL
+	OllamaUsageURL  string        // default DefaultOllamaUsageURL
+	ClaudeUsageURL  string        // default DefaultClaudeUsageURL
+	ClaudeUserAgent string        // default DefaultClaudeUserAgent
+
+	// ClaudeCredentialsFile returns the Claude Code credentials file path for
+	// a claude account. The file is only ever read, never written. Nil or an
+	// empty result makes fetches for that account fail with a sanitized Err.
+	ClaudeCredentialsFile func(accountID string) string
 }
 
 type accountState struct {
@@ -47,10 +56,13 @@ type accountState struct {
 	observedAt map[string]time.Time
 }
 
-// Manager implements core.QuotaSource for codex and ollama accounts.
+// Manager implements core.QuotaSource for codex, ollama and claude accounts.
 type Manager struct {
-	creds core.CredentialSource
+	creds core.CredentialSource // not used for claude accounts
 	opts  Options
+
+	claudeMu    sync.Mutex
+	claudeCache map[string]*claudeCredCache
 
 	mu      sync.Mutex
 	state   map[string]*accountState
@@ -85,14 +97,22 @@ func New(accounts []core.Account, creds core.CredentialSource, opts Options) *Ma
 	if opts.OllamaUsageURL == "" {
 		opts.OllamaUsageURL = DefaultOllamaUsageURL
 	}
+	if opts.ClaudeUsageURL == "" {
+		opts.ClaudeUsageURL = DefaultClaudeUsageURL
+	}
+	if opts.ClaudeUserAgent == "" {
+		opts.ClaudeUserAgent = DefaultClaudeUserAgent
+	}
 	m := &Manager{
-		creds:   creds,
-		opts:    opts,
-		state:   make(map[string]*accountState),
-		baseCtx: context.Background(),
+		creds:       creds,
+		opts:        opts,
+		claudeCache: make(map[string]*claudeCredCache),
+		state:       make(map[string]*accountState),
+		baseCtx:     context.Background(),
 	}
 	for _, a := range accounts {
-		if a.Provider == core.ProviderCodex || a.Provider == core.ProviderOllama {
+		switch a.Provider {
+		case core.ProviderCodex, core.ProviderOllama, core.ProviderClaude:
 			m.state[a.ID] = &accountState{acct: a, observedAt: make(map[string]time.Time)}
 		}
 	}
@@ -241,6 +261,8 @@ func (m *Manager) fetch(ctx context.Context, acct core.Account) (core.Snapshot, 
 	switch acct.Provider {
 	case core.ProviderCodex:
 		return m.fetchCodex(ctx, acct.ID)
+	case core.ProviderClaude:
+		return m.fetchClaude(ctx, acct.ID)
 	default:
 		return m.fetchOllama(ctx, acct.ID)
 	}
