@@ -204,10 +204,15 @@ func (s *Server) accountStatus(a core.Account, now time.Time) accountStatus {
 	if !have {
 		st.Stale = true
 	} else {
-		age := int64(max(now.Sub(snap.FetchedAt), 0) / time.Second)
-		st.SnapshotAgeS = &age
-		if now.Sub(snap.FetchedAt) > s.opts.StaleAfter {
+		if snap.FetchedAt.IsZero() {
+			// Never successfully fetched (first fetch failed): no age.
 			st.Stale = true
+		} else {
+			age := int64(max(now.Sub(snap.FetchedAt), 0) / time.Second)
+			st.SnapshotAgeS = &age
+			if now.Sub(snap.FetchedAt) > s.opts.StaleAfter {
+				st.Stale = true
+			}
 		}
 		if snap.Err != "" {
 			e := snap.Err
