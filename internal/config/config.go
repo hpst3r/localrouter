@@ -93,7 +93,7 @@ func Load(path string) (*Config, error) {
 	if err := dec.Decode(&c); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	c.applyDefaults(filepath.Dir(path))
+	c.applyDefaults(filepath.Dir(absOr(path)))
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
@@ -151,6 +151,13 @@ func (c *Config) applyDefaults(baseDir string) {
 			}
 		}
 	}
+}
+
+func absOr(p string) string {
+	if a, err := filepath.Abs(p); err == nil {
+		return a
+	}
+	return p
 }
 
 func expand(p, baseDir string) string {
