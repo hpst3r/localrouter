@@ -1,0 +1,377 @@
+package control
+
+import (
+	_ "embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math"
+	"net/http"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/hpst3r/localrouter/internal/core"
+)
+
+//go:embed static/index.html
+var indexHTML []byte
+
+// SchemaVersion is the version of the status/usage JSON documents.
+const SchemaVersion = 1
+
+const (
+	defaultStaleAfter = 10 * time.Minute
+	defaultSince      = 24 * time.Hour
+	maxSince          = 400 * 24 * time.Hour
+	maxAdmitBody      = 64 << 10
+)
+
+// widgetCSP forbids all external loads; the page only talks to its own origin.
+const widgetCSP = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+
+// Deps are the runtime collaborators of the control server.
+type Deps struct {
+	// Accounts in configured order; status lists them in this order.
+	Accounts []core.Account
+	Quota    core.QuotaSource
+	Policy   core.Policy
+	Ledger   core.Ledger
+	Routes   []core.Route
+	// Authenticate validates a client bearer key. Required when RequireAuth.
+	Authenticate func(bearer string) (core.Client, bool)
+	// Clock defaults to core.SystemClock.
+	Clock core.Clock
+}
+
+// Options tune the control server.
+type Options struct {
+	// RequireAuth makes /control/v1/* require a valid client bearer key.
+	RequireAuth bool
+	// StaleAfter marks snapshots older than this as stale (default 10m).
+	StaleAfter time.Duration
+}
+
+// Server implements the control API and widget.
+type Server struct {
+	deps Deps
+	opts Options
+}
+
+// New builds a control server. Nil Clock defaults to the system clock and a
+// zero StaleAfter defaults to 10 minutes.
+func New(deps Deps, opts Options) *Server {
+	if deps.Clock == nil {
+		deps.Clock = core.SystemClock{}
+	}
+	if opts.StaleAfter <= 0 {
+		opts.StaleAfter = defaultStaleAfter
+	}
+	return &Server{deps: deps, opts: opts}
+}
+
+// Handler returns the HTTP handler for all control routes.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.healthz)
+	mux.HandleFunc("GET /{$}", s.widget)
+	mux.Handle("GET /control/v1/status", s.auth(http.HandlerFunc(s.status)))
+	mux.Handle("GET /control/v1/usage", s.auth(http.HandlerFunc(s.usage)))
+	mux.Handle("POST /control/v1/admit", s.auth(http.HandlerFunc(s.admit)))
+	return mux
+}
+
+func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte("ok"))
+}
+
+func (s *Server) widget(w http.ResponseWriter, _ *http.Request) {
+	h := w.Header()
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	h.Set("Content-Security-Policy", widgetCSP)
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("Cache-Control", "no-store")
+	_, _ = w.Write(indexHTML)
+}
+
+// auth enforces a client bearer key on the wrapped handler when RequireAuth.
+func (s *Server) auth(next http.Handler) http.Handler {
+	if !s.opts.RequireAuth {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, ok := bearer(r.Header.Get("Authorization"))
+		if !ok || s.deps.Authenticate == nil {
+			writeError(w, http.StatusUnauthorized, "client key required")
+			return
+		}
+		if _, ok := s.deps.Authenticate(token); !ok {
+			writeError(w, http.StatusUnauthorized, "invalid client key")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func bearer(h string) (string, bool) {
+	const prefix = "bearer "
+	if len(h) < len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
+		return "", false
+	}
+	t := strings.TrimSpace(h[len(prefix):])
+	return t, t != ""
+}
+
+// statusDoc is the GET /control/v1/status response.
+type statusDoc struct {
+	SchemaVersion int             `json:"schema_version"`
+	Now           time.Time       `json:"now"`
+	Accounts      []accountStatus `json:"accounts"`
+}
+
+type accountStatus struct {
+	ID                    string             `json:"id"`
+	Provider              string             `json:"provider"`
+	Healthy               bool               `json:"healthy"`
+	CooldownUntil         *time.Time         `json:"cooldown_until"`
+	Inflight              int                `json:"inflight"`
+	Reserve               map[string]float64 `json:"reserve"`
+	Windows               []windowStatus     `json:"windows"`
+	BackgroundAdmissible  bool               `json:"background_admissible"`
+	InteractiveAdmissible bool               `json:"interactive_admissible"`
+	SnapshotAgeS          *int64             `json:"snapshot_age_s"`
+	Stale                 bool               `json:"stale"`
+	Error                 *string            `json:"error"`
+}
+
+type windowStatus struct {
+	Kind          string     `json:"kind"`
+	UsedFrac      float64    `json:"used_frac"`
+	RemainingFrac float64    `json:"remaining_frac"`
+	ResetAt       *time.Time `json:"reset_at"`
+	WindowSeconds int64      `json:"window_seconds"`
+	// Rolled is true when ResetAt has passed; UsedFrac is then reported as 0.
+	Rolled bool `json:"rolled"`
+}
+
+func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
+	now := s.deps.Clock.Now()
+	doc := statusDoc{SchemaVersion: SchemaVersion, Now: now.UTC(), Accounts: make([]accountStatus, 0, len(s.deps.Accounts))}
+	for _, a := range s.deps.Accounts {
+		doc.Accounts = append(doc.Accounts, s.accountStatus(a, now))
+	}
+	writeJSON(w, http.StatusOK, doc)
+}
+
+func (s *Server) accountStatus(a core.Account, now time.Time) accountStatus {
+	st := accountStatus{
+		ID:       a.ID,
+		Provider: a.Provider,
+		Reserve:  make(map[string]float64, len(a.Reserve)),
+		Windows:  []windowStatus{},
+	}
+	for k, v := range a.Reserve {
+		st.Reserve[k] = v
+	}
+
+	var ps core.AccountState
+	if s.deps.Policy != nil {
+		ps = s.deps.Policy.Status(a.ID)
+	}
+	st.Inflight = ps.Inflight
+	st.BackgroundAdmissible = ps.BackgroundAdmissible
+	st.InteractiveAdmissible = ps.InteractiveAdmissible
+	st.Stale = ps.Stale
+	coolingDown := !ps.CooldownUntil.IsZero() && now.Before(ps.CooldownUntil)
+	if coolingDown {
+		t := ps.CooldownUntil.UTC()
+		st.CooldownUntil = &t
+	}
+
+	var snap core.Snapshot
+	var have bool
+	if s.deps.Quota != nil {
+		snap, have = s.deps.Quota.Latest(a.ID)
+	}
+	if !have {
+		st.Stale = true
+	} else {
+		age := int64(max(now.Sub(snap.FetchedAt), 0) / time.Second)
+		st.SnapshotAgeS = &age
+		if now.Sub(snap.FetchedAt) > s.opts.StaleAfter {
+			st.Stale = true
+		}
+		if snap.Err != "" {
+			e := snap.Err
+			st.Error = &e
+		}
+		for _, win := range snap.Windows {
+			st.Windows = append(st.Windows, windowView(win, now))
+		}
+	}
+	st.Healthy = !coolingDown && st.Error == nil
+	return st
+}
+
+func windowView(win core.Window, now time.Time) windowStatus {
+	v := windowStatus{Kind: win.Kind, WindowSeconds: win.WindowSeconds}
+	used := clamp01(win.UsedFrac)
+	if !win.ResetAt.IsZero() {
+		t := win.ResetAt.UTC()
+		v.ResetAt = &t
+		if !now.Before(win.ResetAt) {
+			v.Rolled = true
+			used = 0
+		}
+	}
+	v.UsedFrac = used
+	v.RemainingFrac = clamp01(1 - used)
+	return v
+}
+
+func clamp01(f float64) float64 {
+	if math.IsNaN(f) || f < 0 {
+		return 0
+	}
+	return min(f, 1)
+}
+
+// usageDoc is the GET /control/v1/usage response.
+type usageDoc struct {
+	SchemaVersion int             `json:"schema_version"`
+	Since         time.Time       `json:"since"`
+	Group         string          `json:"group"`
+	Rows          []core.UsageRow `json:"rows"`
+}
+
+var usageGroups = []string{"account", "model", "class", "client"}
+
+func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	since := defaultSince
+	if v := q.Get("since"); v != "" {
+		d, err := parseSince(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		since = d
+	}
+	group := q.Get("group")
+	if group == "" {
+		group = "account"
+	}
+	if !slices.Contains(usageGroups, group) {
+		writeError(w, http.StatusBadRequest, "group must be one of account, model, class, client")
+		return
+	}
+	if s.deps.Ledger == nil {
+		writeError(w, http.StatusServiceUnavailable, "ledger unavailable")
+		return
+	}
+	from := s.deps.Clock.Now().Add(-since)
+	rows, err := s.deps.Ledger.Summary(r.Context(), from, group)
+	if err != nil {
+		slog.Warn("control: usage summary failed", "group", group, "err", err)
+		writeError(w, http.StatusInternalServerError, "usage summary failed")
+		return
+	}
+	if rows == nil {
+		rows = []core.UsageRow{}
+	}
+	writeJSON(w, http.StatusOK, usageDoc{SchemaVersion: SchemaVersion, Since: from.UTC(), Group: group, Rows: rows})
+}
+
+// parseSince accepts a Go duration ("24h", "168h") or whole days ("7d").
+// The result must be positive and at most 400 days.
+func parseSince(v string) (time.Duration, error) {
+	var d time.Duration
+	if n, ok := strings.CutSuffix(v, "d"); ok {
+		days, err := strconv.Atoi(n)
+		if err != nil || days <= 0 || days > 400 {
+			return 0, errors.New("since: days must be an integer between 1 and 400")
+		}
+		d = time.Duration(days) * 24 * time.Hour
+	} else {
+		var err error
+		d, err = time.ParseDuration(v)
+		if err != nil {
+			return 0, errors.New("since: expected a duration like 24h or 7d")
+		}
+	}
+	if d <= 0 || d > maxSince {
+		return 0, errors.New("since: must be positive and at most 400d")
+	}
+	return d, nil
+}
+
+type admitRequest struct {
+	Class string `json:"class"`
+	Model string `json:"model"`
+}
+
+type admitResponse struct {
+	Decision  string `json:"decision"`
+	AccountID string `json:"account_id"`
+	Reason    string `json:"reason"`
+}
+
+func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
+	var req admitRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAdmitBody)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "body must be JSON {class, model}")
+		return
+	}
+	class := core.Class(req.Class)
+	if class != core.ClassInteractive && class != core.ClassBackground {
+		writeError(w, http.StatusBadRequest, "class must be interactive or background")
+		return
+	}
+	route, ok := s.findRoute(req.Model)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("no route for model %q", req.Model))
+		return
+	}
+	if s.deps.Policy == nil {
+		writeError(w, http.StatusServiceUnavailable, "policy unavailable")
+		return
+	}
+	candidates := route.Interactive
+	if class == core.ClassBackground {
+		candidates = route.Background
+	}
+	d := s.deps.Policy.DryRun(class, slices.Clone(candidates))
+	resp := admitResponse{Decision: "deny", AccountID: d.AccountID, Reason: d.Reason}
+	if d.Allow {
+		resp.Decision = "allow"
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) findRoute(model string) (core.Route, bool) {
+	if model == "" {
+		return core.Route{}, false
+	}
+	for _, rt := range s.deps.Routes {
+		if slices.Contains(rt.Models, model) {
+			return rt, true
+		}
+	}
+	return core.Route{}, false
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]any{"error": map[string]string{"message": msg}})
+}
