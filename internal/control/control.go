@@ -318,9 +318,12 @@ func parseSince(v string) (time.Duration, error) {
 	return d, nil
 }
 
+// admitRequest names exactly one of Model (dry-run the route's candidates)
+// or Account (dry-run that single account, e.g. a quota-only claude account).
 type admitRequest struct {
-	Class string `json:"class"`
-	Model string `json:"model"`
+	Class   string `json:"class"`
+	Model   string `json:"model"`
+	Account string `json:"account"`
 }
 
 type admitResponse struct {
@@ -332,7 +335,7 @@ type admitResponse struct {
 func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 	var req admitRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxAdmitBody)).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "body must be JSON {class, model}")
+		writeError(w, http.StatusBadRequest, "body must be JSON {class, model} or {class, account}")
 		return
 	}
 	class := core.Class(req.Class)
@@ -340,21 +343,37 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "class must be interactive or background")
 		return
 	}
-	route, ok := s.findRoute(req.Model)
-	if !ok {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("no route for model %q", req.Model))
+	if (req.Model == "") == (req.Account == "") {
+		writeError(w, http.StatusBadRequest, "exactly one of model or account is required")
 		return
+	}
+	var candidates []string
+	if req.Account != "" {
+		if !slices.ContainsFunc(s.deps.Accounts, func(a core.Account) bool { return a.ID == req.Account }) {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("unknown account %q", req.Account))
+			return
+		}
+		candidates = []string{req.Account}
+	} else {
+		route, ok := s.findRoute(req.Model)
+		if !ok {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("no route for model %q", req.Model))
+			return
+		}
+		candidates = slices.Clone(route.Interactive)
+		if class == core.ClassBackground {
+			candidates = slices.Clone(route.Background)
+		}
 	}
 	if s.deps.Policy == nil {
 		writeError(w, http.StatusServiceUnavailable, "policy unavailable")
 		return
 	}
-	candidates := route.Interactive
-	if class == core.ClassBackground {
-		candidates = route.Background
-	}
-	d := s.deps.Policy.DryRun(class, slices.Clone(candidates))
+	d := s.deps.Policy.DryRun(class, candidates)
 	resp := admitResponse{Decision: "deny", AccountID: d.AccountID, Reason: d.Reason}
+	if resp.AccountID == "" {
+		resp.AccountID = req.Account
+	}
 	if d.Allow {
 		resp.Decision = "allow"
 	}

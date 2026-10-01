@@ -59,6 +59,7 @@ var migrations = []string{
 	);
 	CREATE INDEX requests_started_at ON requests(started_at);
 	CREATE INDEX requests_account_id ON requests(account_id);`,
+	`ALTER TABLE requests ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // Open opens (creating if needed) the ledger database at path. pricing may be
@@ -134,7 +135,8 @@ func (l *Ledger) migrate() error {
 func (l *Ledger) Close() error { return l.db.Close() }
 
 // Record inserts one request row, computing cost from pricing. An empty
-// r.ID is replaced with a random one.
+// r.ID is replaced with a random one. Record is idempotent on ID: if a row
+// with r.ID already exists it is left unchanged and nil is returned.
 func (l *Ledger) Record(ctx context.Context, r core.RequestRecord) error {
 	if r.ID == "" {
 		var b [16]byte
@@ -172,12 +174,15 @@ func (l *Ledger) Record(ctx context.Context, r core.RequestRecord) error {
 		id, started_at, finished_at, client, class, route, model, provider,
 		account_id, upstream_identity, status, failover_of, input_tokens,
 		cached_input_tokens, output_tokens, reasoning_tokens, usage_known,
-		cost_usd, cost_basis, latency_ms, bytes_out, session, task, agent, error
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		cost_usd, cost_basis, latency_ms, bytes_out, session, task, agent, error,
+		cache_creation_input_tokens
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	ON CONFLICT(id) DO NOTHING`,
 		r.ID, r.StartedAt.UnixMilli(), finished, r.Client, string(r.Class), r.Route, r.Model, r.Provider,
 		r.AccountID, r.UpstreamIdentity, r.Status, failoverOf, r.Usage.InputTokens,
 		r.Usage.CachedInputTokens, r.Usage.OutputTokens, r.Usage.ReasoningTokens, usageKnown,
-		cost, basis, r.LatencyMS, r.BytesOut, r.Session, r.Task, r.Agent, r.Error)
+		cost, basis, r.LatencyMS, r.BytesOut, r.Session, r.Task, r.Agent, r.Error,
+		r.Usage.CacheCreationInputTokens)
 	if err != nil {
 		return fmt.Errorf("ledger: record: %w", err)
 	}
@@ -195,7 +200,7 @@ var groupColumns = map[string]string{
 }
 
 const aggCols = `COUNT(*), SUM(input_tokens), SUM(cached_input_tokens),
-	SUM(output_tokens), SUM(reasoning_tokens), SUM(cost_usd),
+	SUM(cache_creation_input_tokens), SUM(output_tokens), SUM(reasoning_tokens), SUM(cost_usd),
 	SUM(CASE WHEN usage_known = 0 THEN 1 ELSE 0 END),
 	SUM(CASE WHEN usage_known = 1 AND cost_usd IS NULL THEN 1 ELSE 0 END)`
 
@@ -222,7 +227,7 @@ func (l *Ledger) Summary(ctx context.Context, since time.Time, group string) ([]
 		var u core.UsageRow
 		var cost sql.NullFloat64
 		if err := rows.Scan(&u.Key, &u.Requests, &u.InputTokens, &u.CachedInputTokens,
-			&u.OutputTokens, &u.ReasoningTokens, &cost, &u.UnknownUsageRequests, &u.UnpricedRequests); err != nil {
+			&u.CacheCreationInputTokens, &u.OutputTokens, &u.ReasoningTokens, &cost, &u.UnknownUsageRequests, &u.UnpricedRequests); err != nil {
 			return nil, fmt.Errorf("ledger: summary: %w", err)
 		}
 		if cost.Valid {
@@ -239,7 +244,7 @@ func (l *Ledger) Summary(ctx context.Context, since time.Time, group string) ([]
 
 func (l *Ledger) summaryByDay(ctx context.Context, since time.Time) ([]core.UsageRow, error) {
 	rows, err := l.db.QueryContext(ctx, `SELECT started_at, input_tokens, cached_input_tokens,
-		output_tokens, reasoning_tokens, cost_usd, usage_known
+		cache_creation_input_tokens, output_tokens, reasoning_tokens, cost_usd, usage_known
 		FROM requests WHERE started_at >= ?`, since.UnixMilli())
 	if err != nil {
 		return nil, fmt.Errorf("ledger: summary: %w", err)
@@ -248,10 +253,10 @@ func (l *Ledger) summaryByDay(ctx context.Context, since time.Time) ([]core.Usag
 	byDay := map[string]*core.UsageRow{}
 	for rows.Next() {
 		var started int64
-		var in, cached, outTok, reasoning int64
+		var in, cached, creation, outTok, reasoning int64
 		var cost sql.NullFloat64
 		var known bool
-		if err := rows.Scan(&started, &in, &cached, &outTok, &reasoning, &cost, &known); err != nil {
+		if err := rows.Scan(&started, &in, &cached, &creation, &outTok, &reasoning, &cost, &known); err != nil {
 			return nil, fmt.Errorf("ledger: summary: %w", err)
 		}
 		key := time.UnixMilli(started).Local().Format(time.DateOnly)
@@ -263,6 +268,7 @@ func (l *Ledger) summaryByDay(ctx context.Context, since time.Time) ([]core.Usag
 		u.Requests++
 		u.InputTokens += in
 		u.CachedInputTokens += cached
+		u.CacheCreationInputTokens += creation
 		u.OutputTokens += outTok
 		u.ReasoningTokens += reasoning
 		switch {

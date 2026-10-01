@@ -15,11 +15,13 @@ import (
 )
 
 // ModelPrice is the price of one model in USD per 1M tokens.
-// CachedInput nil means cached input is billed at the Input rate.
+// CachedInput (cache reads) and CacheCreationInput (cache writes) nil mean
+// those tokens are billed at the Input rate.
 type ModelPrice struct {
-	Input       float64  `yaml:"input"`
-	CachedInput *float64 `yaml:"cached_input,omitempty"`
-	Output      float64  `yaml:"output"`
+	Input              float64  `yaml:"input"`
+	CachedInput        *float64 `yaml:"cached_input,omitempty"`
+	CacheCreationInput *float64 `yaml:"cache_creation_input,omitempty"`
+	Output             float64  `yaml:"output"`
 }
 
 // Pricing is an immutable model price table. The zero value and nil are
@@ -63,7 +65,8 @@ func LoadPricing(path string) (*Pricing, error) {
 		return nil, fmt.Errorf("pricing: parse %s: %w", path, err)
 	}
 	for name, mp := range f.Models {
-		if mp.Input < 0 || mp.Output < 0 || (mp.CachedInput != nil && *mp.CachedInput < 0) {
+		if mp.Input < 0 || mp.Output < 0 || (mp.CachedInput != nil && *mp.CachedInput < 0) ||
+			(mp.CacheCreationInput != nil && *mp.CacheCreationInput < 0) {
 			return nil, fmt.Errorf("pricing: model %q: negative price", name)
 		}
 	}
@@ -84,6 +87,8 @@ func (p *Pricing) Lookup(model string) (ModelPrice, bool) {
 
 // Cost returns the USD cost of u for model, or ok=false if the model is not
 // priced. Reasoning tokens are part of output and not billed separately.
+// Cached and cache-creation tokens are subsets of InputTokens; they are
+// clamped so the uncached remainder is never negative.
 func (p *Pricing) Cost(model string, u core.Usage) (float64, bool) {
 	mp, ok := p.Lookup(model)
 	if !ok {
@@ -93,15 +98,23 @@ func (p *Pricing) Cost(model string, u core.Usage) (float64, bool) {
 	if mp.CachedInput != nil {
 		cachedRate = *mp.CachedInput
 	}
-	cached := min(max(u.CachedInputTokens, 0), max(u.InputTokens, 0))
-	uncached := max(u.InputTokens, 0) - cached
-	return (float64(uncached)*mp.Input + float64(cached)*cachedRate + float64(max(u.OutputTokens, 0))*mp.Output) / 1e6, true
+	creationRate := mp.Input
+	if mp.CacheCreationInput != nil {
+		creationRate = *mp.CacheCreationInput
+	}
+	input := max(u.InputTokens, 0)
+	cached := min(max(u.CachedInputTokens, 0), input)
+	creation := min(max(u.CacheCreationInputTokens, 0), input-cached)
+	uncached := input - cached - creation
+	return (float64(uncached)*mp.Input + float64(cached)*cachedRate +
+		float64(creation)*creationRate + float64(max(u.OutputTokens, 0))*mp.Output) / 1e6, true
 }
 
 type litellmEntry struct {
-	Input     *float64 `json:"input_cost_per_token"`
-	Output    *float64 `json:"output_cost_per_token"`
-	CacheRead *float64 `json:"cache_read_input_token_cost"`
+	Input      *float64 `json:"input_cost_per_token"`
+	Output     *float64 `json:"output_cost_per_token"`
+	CacheRead  *float64 `json:"cache_read_input_token_cost"`
+	CacheWrite *float64 `json:"cache_creation_input_token_cost"`
 }
 
 // ImportLiteLLM parses LiteLLM's model_prices_and_context_window.json and
@@ -130,6 +143,10 @@ func ImportLiteLLM(r io.Reader) (map[string]ModelPrice, error) {
 			c := *e.CacheRead * 1e6
 			mp.CachedInput = &c
 		}
+		if e.CacheWrite != nil {
+			c := *e.CacheWrite * 1e6
+			mp.CacheCreationInput = &c
+		}
 		out[key] = mp
 		if i := strings.Index(key, "/"); i > 0 && i < len(key)-1 {
 			alias := key[i+1:]
@@ -149,13 +166,16 @@ func ImportLiteLLM(r io.Reader) (map[string]ModelPrice, error) {
 }
 
 func samePrice(a, b ModelPrice) bool {
-	if a.Input != b.Input || a.Output != b.Output {
-		return false
+	return a.Input == b.Input && a.Output == b.Output &&
+		sameOptPrice(a.CachedInput, b.CachedInput) &&
+		sameOptPrice(a.CacheCreationInput, b.CacheCreationInput)
+}
+
+func sameOptPrice(a, b *float64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
 	}
-	if a.CachedInput == nil || b.CachedInput == nil {
-		return a.CachedInput == nil && b.CachedInput == nil
-	}
-	return *a.CachedInput == *b.CachedInput
+	return *a == *b
 }
 
 // WritePricing atomically writes models to path as pricing YAML (mode 0600,

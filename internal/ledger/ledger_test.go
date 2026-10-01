@@ -2,6 +2,7 @@ package ledger
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"math"
 	"os"
@@ -62,7 +63,8 @@ func TestSchemaHasNoContentColumns(t *testing.T) {
 	want := []string{"id", "started_at", "finished_at", "client", "class", "route", "model",
 		"provider", "account_id", "upstream_identity", "status", "failover_of", "input_tokens",
 		"cached_input_tokens", "output_tokens", "reasoning_tokens", "usage_known", "cost_usd",
-		"cost_basis", "latency_ms", "bytes_out", "session", "task", "agent", "error"}
+		"cost_basis", "latency_ms", "bytes_out", "session", "task", "agent", "error",
+		"cache_creation_input_tokens"}
 	if !reflect.DeepEqual(cols, want) {
 		t.Fatalf("columns = %v\nwant %v", cols, want)
 	}
@@ -116,6 +118,109 @@ func TestReopenIsIdempotent(t *testing.T) {
 	l2.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v)
 	if n != 1 || v != len(migrations) {
 		t.Fatalf("rows=%d version=%d", n, v)
+	}
+}
+
+// v1Schema is the original (schema version 1) requests table, frozen here so
+// the upgrade path stays tested even if migrations[0] is ever edited.
+const v1Schema = `CREATE TABLE requests (
+	id TEXT PRIMARY KEY, started_at INTEGER NOT NULL, finished_at INTEGER,
+	client TEXT NOT NULL, class TEXT NOT NULL, route TEXT NOT NULL,
+	model TEXT NOT NULL, provider TEXT NOT NULL, account_id TEXT NOT NULL,
+	upstream_identity TEXT NOT NULL, status INTEGER NOT NULL, failover_of TEXT,
+	input_tokens INTEGER NOT NULL, cached_input_tokens INTEGER NOT NULL,
+	output_tokens INTEGER NOT NULL, reasoning_tokens INTEGER NOT NULL,
+	usage_known INTEGER NOT NULL, cost_usd REAL, cost_basis TEXT,
+	latency_ms INTEGER NOT NULL, bytes_out INTEGER NOT NULL, session TEXT NOT NULL,
+	task TEXT NOT NULL, agent TEXT NOT NULL, error TEXT NOT NULL
+);
+CREATE INDEX requests_started_at ON requests(started_at);
+CREATE INDEX requests_account_id ON requests(account_id);
+CREATE TABLE schema_version (version INTEGER NOT NULL);
+INSERT INTO schema_version (version) VALUES (1);
+INSERT INTO requests VALUES ('old', 1, NULL, 'c', 'background', 'r', 'm', 'p',
+	'a', '', 200, NULL, 10, 2, 3, 0, 1, NULL, NULL, 5, 0, '', '', '', '');`
+
+func TestMigrateV1InPlace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "localrouter.db")
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(v1Schema); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	l, err := Open(path, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	var v int
+	l.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v)
+	if v != 2 || len(migrations) != 2 {
+		t.Fatalf("version = %d, migrations = %d", v, len(migrations))
+	}
+	var in, creation int64
+	if err := l.db.QueryRow(`SELECT input_tokens, cache_creation_input_tokens FROM requests WHERE id='old'`).Scan(&in, &creation); err != nil {
+		t.Fatal(err)
+	}
+	if in != 10 || creation != 0 {
+		t.Fatalf("old row: in=%d creation=%d", in, creation)
+	}
+	err = l.Record(context.Background(), core.RequestRecord{ID: "new", StartedAt: time.UnixMilli(2), AccountID: "b",
+		Usage: core.Usage{InputTokens: 100, CacheCreationInputTokens: 40}, UsageKnown: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := l.Summary(context.Background(), time.Time{}, "account")
+	if err != nil || len(rows) != 2 || rows[1].CacheCreationInputTokens != 40 || rows[0].CacheCreationInputTokens != 0 {
+		t.Fatalf("rows=%+v err=%v", rows, err)
+	}
+}
+
+func TestRecordIdempotent(t *testing.T) {
+	l, _ := openTest(t, testPricing())
+	ctx := context.Background()
+	r := core.RequestRecord{ID: "claude:abc", StartedAt: time.Now(), Model: "model-a", AccountID: "sub",
+		Usage: core.Usage{InputTokens: 100, OutputTokens: 10}, UsageKnown: true}
+	if err := l.Record(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	r2 := r
+	r2.Usage.OutputTokens = 999
+	if err := l.Record(ctx, r2); err != nil {
+		t.Fatalf("duplicate record: %v", err)
+	}
+	var n int
+	var out int64
+	l.db.QueryRow(`SELECT COUNT(*), MAX(output_tokens) FROM requests`).Scan(&n, &out)
+	if n != 1 || out != 10 {
+		t.Fatalf("rows=%d output=%d; want 1 row unchanged", n, out)
+	}
+}
+
+func TestCostCacheCreation(t *testing.T) {
+	half, write := 0.5, 3.0
+	p := NewPricing(map[string]ModelPrice{
+		"w": {Input: 2, CachedInput: &half, CacheCreationInput: &write, Output: 10},
+		"d": {Input: 2, CachedInput: &half, Output: 10},
+	})
+	u := core.Usage{InputTokens: 1_000_000, CachedInputTokens: 400_000, CacheCreationInputTokens: 100_000, OutputTokens: 200_000}
+	// 5e5*2 + 4e5*0.5 + 1e5*3 + 2e5*10, /1e6 = 1.0 + 0.2 + 0.3 + 2.0
+	if c, ok := p.Cost("w", u); !ok || !approx(c, 3.5) {
+		t.Fatalf("w = %v %v", c, ok)
+	}
+	// cache_creation_input defaults to input: 5e5*2 + 0.2 + 1e5*2 + 2.0
+	if c, ok := p.Cost("d", u); !ok || !approx(c, 3.4) {
+		t.Fatalf("d = %v %v", c, ok)
+	}
+	// Inconsistent counts clamp: creation limited to input-cached.
+	bad := core.Usage{InputTokens: 100, CachedInputTokens: 80, CacheCreationInputTokens: 50}
+	// 0*2 + 80*0.5 + 20*3 = 100 => 1e-4
+	if c, ok := p.Cost("w", bad); !ok || !approx(c, 100/1e6) {
+		t.Fatalf("clamped = %v %v", c, ok)
 	}
 }
 
@@ -191,7 +296,7 @@ func TestSummary(t *testing.T) {
 	now := time.Now()
 	day1 := time.Date(2026, 3, 1, 12, 0, 0, 0, time.Local)
 	day2 := day1.Add(24 * time.Hour)
-	u := core.Usage{InputTokens: 1000, CachedInputTokens: 100, OutputTokens: 50, ReasoningTokens: 10}
+	u := core.Usage{InputTokens: 1000, CachedInputTokens: 100, CacheCreationInputTokens: 30, OutputTokens: 50, ReasoningTokens: 10}
 	recs := []core.RequestRecord{
 		{ID: "1", StartedAt: day1, AccountID: "b", Model: "model-a", Class: core.ClassBackground, Client: "c1", Route: "r", Usage: u, UsageKnown: true},
 		{ID: "2", StartedAt: day1, AccountID: "b", Model: "mystery", Class: core.ClassBackground, Client: "c1", Route: "r", Usage: u, UsageKnown: true},
@@ -224,8 +329,8 @@ func TestSummary(t *testing.T) {
 	if b.Requests != 2 || b.UnknownUsageRequests != 0 || b.UnpricedRequests != 1 || b.CostUSD == nil || !approx(*b.CostUSD, costA) {
 		t.Errorf("b = %+v", b)
 	}
-	if b.InputTokens != 2000 {
-		t.Errorf("b input = %d", b.InputTokens)
+	if b.InputTokens != 2000 || b.CacheCreationInputTokens != 60 || a.CacheCreationInputTokens != 30 {
+		t.Errorf("b input = %d, cache creation a=%d b=%d", b.InputTokens, a.CacheCreationInputTokens, b.CacheCreationInputTokens)
 	}
 
 	for group, keys := range map[string][]string{
@@ -252,7 +357,7 @@ func TestSummary(t *testing.T) {
 
 	// Day and account aggregation agree on counts and cost.
 	days, _ := l.Summary(ctx, since, "day")
-	if d := days[0]; d.Requests != 2 || d.UnpricedRequests != 1 || d.CostUSD == nil || !approx(*d.CostUSD, costA) {
+	if d := days[0]; d.Requests != 2 || d.UnpricedRequests != 1 || d.CacheCreationInputTokens != 60 || d.CostUSD == nil || !approx(*d.CostUSD, costA) {
 		t.Errorf("day1 = %+v", d)
 	}
 	if d := days[1]; d.UnknownUsageRequests != 1 || d.UnpricedRequests != 1 || d.CostUSD != nil {
@@ -315,7 +420,7 @@ func TestRecordGeneratesID(t *testing.T) {
 
 const litellmFixture = `{
   "sample_spec": {"input_cost_per_token": "price per token", "max_tokens": "n"},
-  "model-x": {"input_cost_per_token": 0.000002, "output_cost_per_token": 0.00001, "cache_read_input_token_cost": 0.0000005},
+  "model-x": {"input_cost_per_token": 0.000002, "output_cost_per_token": 0.00001, "cache_read_input_token_cost": 0.0000005, "cache_creation_input_token_cost": 0.0000025},
   "prov/model-y": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000004},
   "other/model-x": {"input_cost_per_token": 0.000009, "output_cost_per_token": 0.000009},
   "p1/model-z": {"input_cost_per_token": 0.000001, "output_cost_per_token": 0.000002},
@@ -344,10 +449,11 @@ func TestImportLiteLLM(t *testing.T) {
 		}
 	}
 	x := m["model-x"]
-	if !approx(x.Input, 2) || !approx(x.Output, 10) || x.CachedInput == nil || !approx(*x.CachedInput, 0.5) {
+	if !approx(x.Input, 2) || !approx(x.Output, 10) || x.CachedInput == nil || !approx(*x.CachedInput, 0.5) ||
+		x.CacheCreationInput == nil || !approx(*x.CacheCreationInput, 2.5) {
 		t.Errorf("model-x = %+v", x)
 	}
-	if y := m["model-y"]; !approx(y.Input, 1) || !approx(y.Output, 4) || y.CachedInput != nil {
+	if y := m["model-y"]; !approx(y.Input, 1) || !approx(y.Output, 4) || y.CachedInput != nil || y.CacheCreationInput != nil {
 		t.Errorf("model-y = %+v", y)
 	}
 	if _, err := ImportLiteLLM(strings.NewReader("not json")); err == nil {
