@@ -1,0 +1,47 @@
+# LocalRouter example configuration. Copy to ~/.config/localrouter/config.yaml.
+# Secrets live in separate 0600 files, never in this file.
+
+listen: 127.0.0.1:8787
+data_dir: ~/.config/localrouter
+
+quota:
+  poll_interval: 5m
+
+policy:
+  stale_after: 10m        # older snapshots: deny background on reserved accounts
+  safety_margin: 0.02     # extra headroom background must leave above the reserve
+  inflight_estimate: 0.01 # assumed fraction consumed per in-flight request
+  max_failovers: 2
+
+clients:
+  - name: me
+    class: interactive
+    key_file: keys/me.key
+  - name: hermes
+    class: interactive        # Hermes may send X-LocalRouter-Class: background
+    key_file: keys/hermes.key
+  - name: hermes-bg
+    class: background
+    key_file: keys/hermes-bg.key
+
+accounts:
+  - id: codex-primary
+    provider: codex
+    reserve: { 5h: 0.10, weekly: 0.10 }
+  - id: codex-secondary
+    provider: codex
+    reserve: {}               # drain fully
+  - id: ollama-cloud
+    provider: ollama
+    api_key_file: keys/ollama.key
+    reserve: { 5h: 0.10, weekly: 0.10 }
+
+routes:
+  - name: gpt
+    models: [gpt-5.6-sol, gpt-5.6-luna]
+    interactive: [codex-primary, codex-secondary]
+    background:  [codex-secondary, codex-primary]
+  - name: ollama
+    models: [deepseek-v4.1-flash, kimi-k3]
+    interactive: [ollama-cloud]
+    background:  [ollama-cloud]

@@ -1,0 +1,242 @@
+# LocalRouter MVP — Specification (contract for all packages)
+
+LocalRouter is a single Go binary: a loopback OpenAI-compatible proxy that
+selects an upstream subscription account per request, enforces per-account
+quota reserves by workload class, records token usage + estimated cost in
+SQLite, and exposes a small read API + status widget.
+
+Non-goals for MVP: context composition, local tokenization/estimation,
+forecasting engine, Prometheus, trace explorer, multi-user auth, TLS,
+chat-completions→Responses translation for Codex.
+
+## Packages and ownership
+
+| Package | Owns | Depends on |
+|---|---|---|
+| `internal/core` | Shared types + interfaces (frozen; architect-owned) | stdlib |
+| `internal/config` | YAML config load/validate (architect-owned) | core |
+| `internal/quota` | Codex + Ollama quota fetchers, poller, passive header observation | core |
+| `internal/policy` | Admission gate, reserves, in-flight leases, cooldowns, account selection | core |
+| `internal/ledger` | SQLite request ledger, summaries, pricing table + cost | core |
+| `internal/auth` | Codex OAuth device login, token store, single-flight refresh; static API keys | core |
+| `internal/proxy` | HTTP inference surface, client auth, forwarding, SSE usage capture, failover | core |
+| `internal/control` | `/control/v1/*` JSON API + embedded HTML widget | core |
+| `cmd/localrouter` | Wiring + CLI (architect-owned) | all |
+
+Packages MUST import only `core` (and `config` where noted by architect) —
+never each other. Use fakes of `core` interfaces in tests.
+
+## Wire surfaces
+
+Listen default `127.0.0.1:8787`. Refuse non-loopback bind unless
+`allow_non_loopback: true`.
+
+Inference (client bearer required, `Authorization: Bearer <client key>`):
+
+- `POST /v1/responses` — Responses API. For `provider: codex` upstream is
+  `https://chatgpt.com/backend-api/codex/responses`. For `provider: ollama`
+  / `openai_compat` upstream is `<base_url>/responses`.
+- `POST /v1/chat/completions` — forwarded to `openai_compat`/`ollama`
+  accounts only. A route resolving to a codex account on this path returns
+  400 `{"error":{"message":"codex accounts only serve /v1/responses"}}`.
+- `GET /v1/models` — synthesized from config `routes[].models` (exact names).
+
+Body is forwarded verbatim except:
+- `chat/completions` with `"stream": true`: set
+  `stream_options.include_usage = true` (preserve other stream_options).
+- Codex `/responses`: no body changes.
+
+Request headers forwarded: `Content-Type`, `Accept`, `OpenAI-Beta`,
+`session_id`, `conversation_id`, `x-request-id`. Client `Authorization` is
+DROPPED; upstream credential headers come from `core.Credential`.
+Response streamed back unchanged (SSE flush per event). Hop-by-hop headers
+stripped.
+
+Optional attribution headers from clients (stored, never forwarded):
+`X-LocalRouter-Session`, `X-LocalRouter-Task`, `X-LocalRouter-Agent`.
+`X-LocalRouter-Class: background` lets an interactive-class key downgrade
+itself; a background key can never upgrade.
+
+## Workload classes
+
+`interactive` and `background`. Each client key maps to one class.
+Reserves protect capacity *from* `background`. `interactive` may consume an
+account down to 0% (until upstream refuses).
+
+## Quota model
+
+`core.Window{Kind, UsedFrac 0..1, ResetAt, WindowSeconds}`; kinds `5h`, `weekly`.
+
+Codex: `GET https://chatgpt.com/backend-api/wham/usage` with
+`Authorization: Bearer <access>`, `ChatGPT-Account-Id: <id>`,
+`User-Agent: codex-cli`. Map `rate_limit.primary_window` → `5h`,
+`secondary_window` → `weekly`; `used_percent/100`; `reset_at` (unix
+seconds) or `now + reset_after_seconds`; `limit_window_seconds`.
+`rate_limit.allowed`/`limit_reached` → `Snapshot.Allowed`.
+
+Codex passive observation: responses from `chatgpt.com` carry headers
+`x-codex-primary-used-percent`, `x-codex-secondary-used-percent`,
+`x-codex-primary-reset-after-seconds`, `x-codex-secondary-reset-after-seconds`,
+`x-codex-primary-window-minutes`, `x-codex-secondary-window-minutes`
+(any may be absent). The proxy hands headers to `QuotaSource.ObserveHeaders`.
+
+Ollama Cloud: `GET https://ollama.com/api/usage` with
+`Authorization: Bearer <api key>`. `limits.session.usage` → `5h`,
+`limits.weekly.usage` → `weekly`; values are ALREADY 0–1 fractions. No
+reset time: `ResetAt` zero, `WindowSeconds` 18000 / 604800.
+
+Poller: refresh each account every `quota.poll_interval` (default 5m),
+plus debounced (≥ 20s apart) refresh after each completed request on that
+account, plus immediately on a 429. Failures keep last-good snapshot and set
+`Snapshot.Err`; never fabricate.
+
+## Admission / policy (the core value)
+
+For candidate account A and class C, for every window W of A's latest
+snapshot:
+
+- Effective used: if `W.ResetAt` non-zero and `now >= W.ResetAt`, treat
+  `UsedFrac = 0` (window rolled; do not wait for a new sample).
+- `floor(W) = reserve[A][W.Kind]` if C == background else 0.
+- Admit iff `used + inflight(A) * policy.inflight_estimate + margin <= 1 - floor`
+  where `margin = policy.safety_margin` for background, 0 for interactive.
+- If `Snapshot.Allowed == false` and no window rolled past reset: deny all classes.
+
+Staleness: snapshot older than `policy.stale_after` (default 10m) or absent:
+- account has any reserve > 0 → deny `background`, allow `interactive`.
+- account has no reserve → allow both (upstream 429 is the backstop).
+
+Cooldown: after upstream 429 (or 401/403 after one refresh retry), the
+account is excluded until `max(reset_at of exhausted window, now+60s)`;
+cleared early if a fresh snapshot shows headroom.
+
+Selection: routes give an ordered account list per class. First admissible
+account wins. Admission is atomic with lease creation (mutex) to prevent the
+check-then-act race: N concurrent background requests near the floor must
+not all pass. `inflight(A)` counts open leases.
+
+Lease release reports outcome {HTTP status, usage known?, bytes streamed}.
+Failover: proxy may retry on the next admissible account ONLY if no response
+bytes were sent to the client and status was 429/401/403/5xx-before-body.
+Max 2 failovers. Each attempt is a separate ledger row.
+
+## Ledger
+
+SQLite (pure Go `modernc.org/sqlite`), WAL, file `<data_dir>/localrouter.db`.
+One table `requests` (no prompt/response content, ever):
+
+`id, started_at, finished_at, client, class, route, model, provider,
+account_id, upstream_identity, status, failover_of, input_tokens,
+cached_input_tokens, output_tokens, reasoning_tokens, usage_known,
+cost_usd, cost_basis, latency_ms, bytes_out, session, task, agent, error`.
+
+`cost_basis`: `api_equivalent` (subscription accounts: what it would cost at
+API list price), `metered` (API-key billing), or NULL if unpriced. Unknown
+price ⇒ `cost_usd` NULL, never 0.
+
+Pricing file `pricing.yaml`: per model, USD per 1M `input`, `cached_input`,
+`output` (reasoning billed as output). Shipped EMPTY of numbers; user or
+`localrouter pricing import <litellm json>` populates it. Never invent prices.
+Cost = (input−cached)·in + cached·cached_in + output·out, all /1e6.
+
+## Usage capture
+
+- Responses SSE: event `response.completed` (also `response.incomplete`,
+  `response.failed`) → `response.usage.{input_tokens,
+  input_tokens_details.cached_tokens, output_tokens,
+  output_tokens_details.reasoning_tokens}`. Non-stream: top-level `usage`.
+- Chat completions: `usage.{prompt_tokens, completion_tokens,
+  prompt_tokens_details.cached_tokens, completion_tokens_details.reasoning_tokens}`
+  from the final chunk / body.
+- Client disconnect or missing usage ⇒ `usage_known = false`; lease still
+  released.
+- Parser must handle multi-line `data:` fields and `\r\n`, and must not
+  buffer the entire stream (scan incrementally; keep ≤ 4 MiB per event).
+
+## Auth
+
+Codex accounts: LocalRouter owns its OWN tokens (separate login; it never
+reads or writes Hermes/Codex `auth.json`, avoiding rotating-refresh-token
+contention). `localrouter login <account-id>` runs the device flow:
+- `POST https://auth.openai.com/api/accounts/deviceauth/usercode` JSON
+  `{"client_id": "app_EMoamEEZ73f0CkXaXp7hrann"}` → `device_auth_id`,
+  `user_code`, `interval`. Show `https://auth.openai.com/codex/device`.
+- Poll `POST .../api/accounts/deviceauth/token` JSON
+  `{"device_auth_id","user_code"}`; 403/404 = pending. 200 →
+  `authorization_code`, `code_verifier`.
+- Exchange at `POST https://auth.openai.com/oauth/token` (form):
+  `grant_type=authorization_code, code, redirect_uri=https://auth.openai.com/deviceauth/callback,
+  client_id, code_verifier` → `access_token, refresh_token, id_token`.
+- `chatgpt_account_id` from id_token/access_token JWT claim
+  `https://api.openai.com/auth.chatgpt_account_id`.
+- Refresh: `POST https://auth.openai.com/oauth/token` form
+  `grant_type=refresh_token, refresh_token, client_id` when access expires
+  within 5 min (JWT `exp`) or after a 401. Single-flight per account;
+  persist rotated refresh token atomically (write temp + fsync + rename,
+  mode 0600) BEFORE returning the new access token.
+- Credential headers: `Authorization: Bearer <access>`,
+  `ChatGPT-Account-Id: <id>`, `originator: codex_cli_rs`.
+- Store: `<data_dir>/tokens/<account-id>.json`, dir 0700, file 0600.
+
+Ollama / openai_compat: static key from `api_key_file` (preferred) or
+`api_key_env`. Header `Authorization: Bearer <key>`.
+
+Client keys: `clients[].key_file` containing the raw key; compared in
+constant time. Keys never logged or returned.
+
+## Control API (`internal/control`)
+
+Read endpoints are unauthenticated on loopback (no secret material is ever
+returned); config `control.require_auth: true` makes them require any client
+key.
+
+- `GET /control/v1/status` → `{schema_version:1, now, accounts:[{id,
+  provider, healthy, cooldown_until, inflight, reserve:{"5h":0.1,...},
+  windows:[{kind, used_frac, remaining_frac, reset_at, window_seconds}],
+  background_admissible, interactive_admissible, snapshot_age_s, stale,
+  error}]}`
+- `GET /control/v1/usage?since=24h&group=account|model|class|client` →
+  rows `{key, requests, input_tokens, cached_input_tokens, output_tokens,
+  reasoning_tokens, cost_usd, unknown_usage_requests}`.
+- `POST /control/v1/admit` body `{class, model}` → dry-run
+  `{decision: allow|deny, account_id, reason}` (does NOT create a lease).
+- `GET /` → single embedded HTML page (no external assets/CDNs), polls
+  `/control/v1/status` and `/control/v1/usage?since=24h&group=account`
+  every 15s; per account: bars for 5h/weekly remaining with a reserve marker,
+  reset countdown, health; summary tokens + cost for 24h/7d.
+- `GET /healthz` → `ok`.
+
+## Logging
+
+`log/slog` text to stderr. Never log tokens, keys, prompt/response bodies,
+or full upstream URLs with query strings. Log: account chosen, class,
+model, status, latency, usage numbers, policy denials with reason.
+
+## Acceptance tests (must exist across packages)
+
+1. Reserve: background at used 0.91 with reserve 0.10 → deny, no upstream
+   call; at 0.85 with no in-flight → allow.
+2. In-flight: used 0.85, reserve 0.10, inflight_estimate 0.04, margin 0;
+   3 concurrent background admits → exactly 1 allowed.
+3. Per-account: primary 0.91 (reserve 0.1), secondary 0.54 (reserve 0) →
+   background routed to secondary; ledger records secondary identity.
+4. Failover: 429 from first account before body → retried on next; two
+   ledger rows; first account in cooldown.
+5. Streaming usage: Responses SSE `response.completed` usage captured;
+   client abort mid-stream → `usage_known=false`, lease released.
+6. Reset boundary: used 0.99 with `ResetAt` in the past → admissible.
+7. Refresh single-flight: 10 concurrent Credential() with expiring token →
+   exactly 1 refresh call, all 10 get the new token.
+8. Ollama fractions: `usage: 0.484` → `UsedFrac 0.484`.
+9. Secrets: no log line/response contains a token or client key.
+10. No content columns in SQLite.
+
+## Engineering constraints
+
+- Go 1.26, module `github.com/hpst3r/localrouter`.
+- Allowed deps: `gopkg.in/yaml.v3`, `modernc.org/sqlite`,
+  `golang.org/x/sync`. Nothing else without architect approval.
+- `go vet ./...` and `go test -race ./...` must pass.
+- Builds/tests: `GOFLAGS=-p=4`, run tests with `-p 4`. Never unbounded
+  parallel builds.
+- No network calls in tests (use `httptest`).
