@@ -1,0 +1,319 @@
+package proxy
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"sort"
+	"strings"
+
+	"github.com/hpst3r/localrouter/internal/core"
+)
+
+const (
+	pathResponses = "/v1/responses"
+	pathChat      = "/v1/chat/completions"
+	pathModels    = "/v1/models"
+
+	defaultMaxBodyBytes = 32 << 20
+	defaultMaxFailovers = 2
+	maxAttrLen          = 128
+)
+
+// Deps are the collaborators the proxy needs. All interface fields are required
+// except Clock and Logger, which default to core.SystemClock and slog.Default().
+type Deps struct {
+	Accounts     map[string]core.Account
+	Routes       []core.Route
+	Creds        core.CredentialSource
+	Quota        core.QuotaSource
+	Policy       core.Policy
+	Ledger       core.Ledger
+	Authenticate func(bearer string) (core.Client, bool)
+	Clock        core.Clock
+	Logger       *slog.Logger
+}
+
+// Options tune proxy behaviour.
+type Options struct {
+	// MaxFailovers is the number of additional accounts tried after a
+	// retryable upstream failure. 0 means the default (2); negative disables.
+	MaxFailovers int
+	// HTTPClient performs upstream requests. It must not set an overall
+	// Timeout (responses stream). Nil uses a client that does not follow
+	// redirects.
+	HTTPClient *http.Client
+	// MaxBodyBytes limits the client request body. 0 means 32 MiB.
+	MaxBodyBytes int64
+}
+
+// Proxy is the inference HTTP surface. Create it with New.
+type Proxy struct {
+	deps   Deps
+	opts   Options
+	routes map[string]core.Route // by client-facing model name
+	models []string              // sorted
+	log    *slog.Logger
+	clock  core.Clock
+}
+
+// New builds a Proxy from its dependencies and options.
+func New(deps Deps, opts Options) *Proxy {
+	if opts.MaxFailovers == 0 {
+		opts.MaxFailovers = defaultMaxFailovers
+	} else if opts.MaxFailovers < 0 {
+		opts.MaxFailovers = 0
+	}
+	if opts.MaxBodyBytes <= 0 {
+		opts.MaxBodyBytes = defaultMaxBodyBytes
+	}
+	if opts.HTTPClient == nil {
+		opts.HTTPClient = &http.Client{
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}
+	}
+	p := &Proxy{deps: deps, opts: opts, routes: map[string]core.Route{}, log: deps.Logger, clock: deps.Clock}
+	if p.log == nil {
+		p.log = slog.Default()
+	}
+	if p.clock == nil {
+		p.clock = core.SystemClock{}
+	}
+	for _, r := range deps.Routes {
+		for _, m := range r.Models {
+			if _, dup := p.routes[m]; !dup {
+				p.models = append(p.models, m)
+			}
+			p.routes[m] = r
+		}
+	}
+	sort.Strings(p.models)
+	return p
+}
+
+// Handler returns the HTTP handler for /v1/responses, /v1/chat/completions
+// and /v1/models. Other paths return 404.
+func (p *Proxy) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc(pathResponses, func(w http.ResponseWriter, r *http.Request) { p.serveInference(w, r, "/responses") })
+	mux.HandleFunc(pathChat, func(w http.ResponseWriter, r *http.Request) { p.serveInference(w, r, "/chat/completions") })
+	mux.HandleFunc(pathModels, p.serveModels)
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusNotFound, "localrouter: not found", "invalid_request_error")
+	})
+	return mux
+}
+
+func (p *Proxy) authenticate(r *http.Request) (core.Client, bool) {
+	h := r.Header.Get("Authorization")
+	const prefix = "bearer "
+	if len(h) <= len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) || p.deps.Authenticate == nil {
+		return core.Client{}, false
+	}
+	return p.deps.Authenticate(strings.TrimSpace(h[len(prefix):]))
+}
+
+func (p *Proxy) serveModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "localrouter: method not allowed", "invalid_request_error")
+		return
+	}
+	if _, ok := p.authenticate(r); !ok {
+		writeUnauthorized(w)
+		return
+	}
+	type model struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		OwnedBy string `json:"owned_by"`
+	}
+	out := struct {
+		Object string  `json:"object"`
+		Data   []model `json:"data"`
+	}{Object: "list", Data: []model{}}
+	for _, m := range p.models {
+		out.Data = append(out.Data, model{ID: m, Object: "model", OwnedBy: "localrouter"})
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// request is one parsed downstream inference request.
+type request struct {
+	endpoint   string // "/responses" or "/chat/completions"
+	client     core.Client
+	class      core.Class
+	model      string
+	route      core.Route
+	candidates []string
+	body       []byte
+	header     http.Header // original client headers
+	session    string
+	task       string
+	agent      string
+}
+
+func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint string) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "localrouter: method not allowed", "invalid_request_error")
+		return
+	}
+	client, ok := p.authenticate(r)
+	if !ok {
+		writeUnauthorized(w)
+		return
+	}
+	class := client.Class
+	if class == core.ClassInteractive && strings.EqualFold(strings.TrimSpace(r.Header.Get("X-LocalRouter-Class")), string(core.ClassBackground)) {
+		class = core.ClassBackground
+	}
+
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, p.opts.MaxBodyBytes))
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeError(w, http.StatusRequestEntityTooLarge, "localrouter: request body too large", "invalid_request_error")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "localrouter: could not read request body", "invalid_request_error")
+		return
+	}
+	var head struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&head); err != nil || head.Model == "" {
+		writeError(w, http.StatusBadRequest, "localrouter: request body must be a JSON object with a model", "invalid_request_error")
+		return
+	}
+	route, ok := p.routes[head.Model]
+	if !ok {
+		writeError(w, http.StatusNotFound, "localrouter: unknown model", "model_not_found")
+		return
+	}
+	candidates := route.Interactive
+	if class == core.ClassBackground {
+		candidates = route.Background
+	}
+	if endpoint == "/chat/completions" {
+		// Codex accounts only serve /responses; drop them before admission.
+		var keep []string
+		for _, id := range candidates {
+			if p.deps.Accounts[id].Provider != core.ProviderCodex {
+				keep = append(keep, id)
+			}
+		}
+		if len(keep) == 0 && len(candidates) > 0 {
+			writeError(w, http.StatusBadRequest, "codex accounts only serve /v1/responses", "invalid_request_error")
+			return
+		}
+		candidates = keep
+	}
+	body, err = rewriteBody(body, route.UpstreamModel, endpoint == "/chat/completions" && head.Stream)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "localrouter: request body must be a JSON object", "invalid_request_error")
+		return
+	}
+
+	p.forward(w, r, &request{
+		endpoint:   endpoint,
+		client:     client,
+		class:      class,
+		model:      head.Model,
+		route:      route,
+		candidates: candidates,
+		body:       body,
+		header:     r.Header,
+		session:    truncate(r.Header.Get("X-LocalRouter-Session")),
+		task:       truncate(r.Header.Get("X-LocalRouter-Task")),
+		agent:      truncate(r.Header.Get("X-LocalRouter-Agent")),
+	})
+}
+
+// rewriteBody applies the only permitted body edits: the upstream model name
+// and, for streaming chat completions, stream_options.include_usage=true.
+// When no edit is needed the body is returned unchanged.
+func rewriteBody(body []byte, upstreamModel string, forceUsage bool) ([]byte, error) {
+	if upstreamModel == "" && !forceUsage {
+		return body, nil
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, err
+	}
+	if upstreamModel != "" {
+		m, err := marshalNoEscape(upstreamModel)
+		if err != nil {
+			return nil, err
+		}
+		obj["model"] = m
+	}
+	if forceUsage {
+		opts := map[string]json.RawMessage{}
+		if raw, ok := obj["stream_options"]; ok {
+			// A non-object stream_options is replaced.
+			_ = json.Unmarshal(raw, &opts)
+			if opts == nil {
+				opts = map[string]json.RawMessage{}
+			}
+		}
+		opts["include_usage"] = json.RawMessage("true")
+		raw, err := marshalNoEscape(opts)
+		if err != nil {
+			return nil, err
+		}
+		obj["stream_options"] = raw
+	}
+	return marshalNoEscape(obj)
+}
+
+func marshalNoEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), nil
+}
+
+func truncate(s string) string {
+	if len(s) > maxAttrLen {
+		return s[:maxAttrLen]
+	}
+	return s
+}
+
+func newID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+type errorBody struct {
+	Error struct {
+		Message string `json:"message"`
+		Type    string `json:"type,omitempty"`
+	} `json:"error"`
+}
+
+func writeError(w http.ResponseWriter, status int, msg, typ string) {
+	var b errorBody
+	b.Error.Message, b.Error.Type = msg, typ
+	writeJSON(w, status, b)
+}
+
+func writeUnauthorized(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Bearer realm="localrouter"`)
+	writeError(w, http.StatusUnauthorized, "localrouter: invalid or missing client key", "invalid_request_error")
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
