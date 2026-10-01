@@ -192,6 +192,11 @@ func (p *Policy) admitLocked(acct core.Account, class core.Class, now time.Time)
 	load := float64(leases) * p.opts.InflightEstimate
 	for _, w := range snap.Windows {
 		used := effectiveUsed(w, now)
+		// A fully exhausted (unrolled) window refuses every class: the
+		// upstream will 429, so admitting only burns a failover attempt.
+		if used >= exhaustedFrac {
+			return false, fmt.Sprintf("%s window exhausted (used %.2f)", w.Kind, used)
+		}
 		floor := 0.0
 		if background {
 			floor = acct.Reserve[w.Kind]

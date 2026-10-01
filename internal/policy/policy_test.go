@@ -144,7 +144,7 @@ func TestAdmission(t *testing.T) {
 			inflight: 1,
 			class:    core.ClassInteractive,
 			allow:    false,
-			reason:   "interactive limit 5h",
+			reason:   "5h window exhausted",
 		},
 		{
 			name:    "safety margin applies to background",
