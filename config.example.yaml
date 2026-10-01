@@ -31,6 +31,9 @@ accounts:
   - id: codex-secondary
     provider: codex
     reserve: {}               # drain fully
+  - id: claude-max
+    provider: claude          # quota-only; reads ~/.claude/.credentials.json, never proxies
+    reserve: { 5h: 0.10, weekly: 0.10 }
   - id: ollama-cloud
     provider: ollama
     api_key_file: keys/ollama.key
@@ -45,3 +48,9 @@ routes:
     models: [deepseek-v4.1-flash, kimi-k3]
     interactive: [ollama-cloud]
     background:  [ollama-cloud]
+
+claude_logs:                  # ingest Claude Code token usage from local transcripts
+  enabled: true
+  account: claude-max
+  # dir: ~/.claude/projects
+  # scan_interval: 1m

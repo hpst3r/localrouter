@@ -237,6 +237,100 @@ model, status, latency, usage numbers, policy denials with reason.
 9. Secrets: no log line/response contains a token or client key.
 10. No content columns in SQLite.
 
+## Claude (quota-only account + transcript accounting)
+
+Provider `claude` accounts are QUOTA-ONLY. LocalRouter never proxies inference
+for them, never refreshes or writes Claude Code's credentials, and routes may
+not reference them (config validation rejects it). Claude inference keeps
+running through the official `claude` CLI.
+
+### Claude quota (internal/quota)
+
+- Token: read `accounts[].credentials_file` (default
+  `~/.claude/.credentials.json`, JSON `{"claudeAiOauth":{"accessToken",
+  "expiresAt" (unix ms), "subscriptionType", "rateLimitTier", ...}}`) at each
+  fetch (cache by mtime). NEVER write it; NEVER call any token endpoint. If
+  `expiresAt` has passed, skip the fetch and set `Err = "claude token expired;
+  run claude to refresh"` (keep last-good windows).
+- `GET https://api.anthropic.com/api/oauth/usage` with headers
+  `Authorization: Bearer <token>`, `anthropic-beta: oauth-2025-04-20`,
+  `Accept: application/json`, `User-Agent: claude-code/<ver>` (configurable,
+  default `claude-code/2.1.0`).
+- Mapping (utilization is a PERCENT 0–100): `five_hour` → `5h`,
+  `seven_day` → `weekly`, `resets_at` RFC3339 → ResetAt, WindowSeconds
+  18000 / 604800. Additional non-null `seven_day_<name>` objects (e.g.
+  `seven_day_opus`, `seven_day_sonnet`) → window kind `weekly_<name>` (reserve
+  for these is not configurable in MVP; they are display + they DO gate
+  admission at 100% via the exhausted rule). Also accept the `limits[]` array
+  when present: `kind:"weekly_scoped"` with `scope.model.display_name` X →
+  `weekly_<lowercase X>` if not already set. Ignore unknown/null keys.
+  `Plan` = credentials `subscriptionType`. Allowed: nil (no explicit gate).
+- 401 from the usage API: do NOT invalidate/refresh; set Err `"claude token
+  rejected; run claude to refresh"`.
+- No header observation for claude (proxy never talks to Anthropic).
+
+Window kinds beyond `5h`/`weekly` are allowed in `core.Window.Kind`; policy
+applies reserves only for configured kinds, but the exhausted rule (used ≥
+0.999 denies every class) applies to all windows.
+
+### Claude transcript accounting (internal/claudelog)
+
+Claude Code writes `<dir>/<project-slug>/<session-uuid>.jsonl` (also nested
+`subagents/` files may exist — scan recursively for `*.jsonl`). Each line is a
+JSON object; assistant entries carry `message.usage` and `message.model`,
+`message.id`, top-level `requestId`, `sessionId`, `timestamp` (RFC3339),
+`cwd`, `isSidechain`. The SAME API message is written multiple times
+(streaming / one line per content block) with identical or growing usage.
+
+- Dedupe key: `message.id` + ":" + `requestId` (fall back to whichever is
+  present; skip entries with neither). For a key, keep the entry with the
+  LARGEST output_tokens (final). Ledger row ID = "claude:" + sha256(key)[:32]
+  so re-ingestion is idempotent (ledger Record is a no-op on existing ID).
+- Usage mapping (Anthropic reports separately; core uses totals):
+  `InputTokens = input_tokens + cache_creation_input_tokens +
+  cache_read_input_tokens`, `CachedInputTokens = cache_read_input_tokens`,
+  `CacheCreationInputTokens = cache_creation_input_tokens`,
+  `OutputTokens = output_tokens`,
+  `ReasoningTokens = output_tokens_details.thinking_tokens` (0 if absent).
+  Skip `model == "<synthetic>"` and entries with all-zero usage.
+- Record fields: Client "claude-code", Class "interactive", Route "claude",
+  Provider "claude", AccountID = claude_logs.account, Model = message.model,
+  StartedAt = FinishedAt = timestamp, Status 200, UsageKnown true,
+  Session = sessionId, Task = project dir name, Agent = "subagent" if
+  isSidechain else "main". NEVER store message content, cwd paths beyond the
+  project dir slug, tool inputs, or anything else.
+- Incremental scanning: remember per-file (size, offset of last complete
+  line) in memory; on each scan read only new complete lines. Persist the
+  offsets in a small JSON state file `<data_dir>/claudelog-state.json` (0600,
+  atomic write) so restarts don't rescan everything (rescans are still safe
+  thanks to idempotent IDs). Truncated/rotated file (size < offset) → rescan
+  from 0. Lines > 8 MiB are skipped.
+- Because a message's final usage line may arrive in a later scan than an
+  earlier partial line, ingestion must not record a key until it is FINAL:
+  treat a key as final when a later line in the same file has a different key,
+  or the file has not been modified for ≥ 30s. (Keep pending keys in memory.)
+- Runs every `claude_logs.scan_interval` (default 1m) plus once at startup.
+
+### Ledger changes
+
+- `Record` is idempotent on non-empty ID (`INSERT ... ON CONFLICT(id) DO
+  NOTHING`), returns nil on duplicate.
+- New column `cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0` (schema
+  migration v2) and summary field `cache_creation_input_tokens`.
+- Cost: `(input − cached − cache_creation)·input + cached·cached_input +
+  cache_creation·cache_creation_input + output·output` per 1M; pricing YAML
+  gains optional `cache_creation_input` (default = input). LiteLLM import maps
+  `cache_creation_input_token_cost`.
+
+### Admit CLI + model-less admit
+
+- `POST /control/v1/admit` also accepts `{class, account}` (instead of
+  `model`): dry-run that single account. Exactly one of model/account.
+- `localrouter admit --class background --account claude-max [--url
+  http://127.0.0.1:8787] [--json]`: calls the control API; exit 0 = allow,
+  1 = deny (prints reason), 2 = error/unreachable. Clients use it as a gate,
+  e.g. before launching background Claude workers.
+
 ## Engineering constraints
 
 - Go 1.26, module `github.com/hpst3r/localrouter`.

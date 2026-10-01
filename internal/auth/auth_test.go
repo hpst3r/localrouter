@@ -368,6 +368,11 @@ func TestCredentialHonorsContext(t *testing.T) {
 	if _, err := h.m.Credential(ctx, "a1"); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v", err)
 	}
+	// The refresh is intentionally detached from the caller's context and keeps
+	// running; wait for it to persist so TempDir cleanup doesn't race its write.
+	if _, err := h.m.Credential(context.Background(), "a1"); err != nil {
+		t.Fatalf("background refresh: %v", err)
+	}
 }
 
 func TestDeviceLoginPendingThenSuccess(t *testing.T) {

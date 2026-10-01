@@ -26,3 +26,5 @@ Hard rules:
 Final answer: ONLY the JSON object required by the schema — no prose.
 Distinguish verified facts (commands you ran and their results) from
 assumptions.
+
+NOTE: If your brief explicitly names additional files/packages you may edit (e.g. a NEW cmd/localrouter/admit.go), those are allowed; everything else in this list still applies.

@@ -21,7 +21,7 @@ func TestExampleConfigLoads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("example config: %v", err)
 	}
-	if c.Listen != "127.0.0.1:8787" || len(c.Accounts) != 3 || len(c.Routes) != 2 {
+	if c.Listen != "127.0.0.1:8787" || len(c.Accounts) != 4 || len(c.Routes) != 2 {
 		t.Fatalf("unexpected: %+v", c)
 	}
 	if c.Accounts[0].BaseURL != "https://chatgpt.com/backend-api/codex" || c.Accounts[0].CostBasis != "api_equivalent" {

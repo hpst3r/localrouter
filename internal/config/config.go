@@ -16,16 +16,25 @@ import (
 )
 
 type Config struct {
-	Listen           string          `yaml:"listen"`
-	AllowNonLoopback bool            `yaml:"allow_non_loopback"`
-	DataDir          string          `yaml:"data_dir"`
-	PricingFile      string          `yaml:"pricing_file"`
-	Quota            QuotaConfig     `yaml:"quota"`
-	Policy           PolicyConfig    `yaml:"policy"`
-	Control          ControlConfig   `yaml:"control"`
-	Clients          []ClientConfig  `yaml:"clients"`
-	Accounts         []AccountConfig `yaml:"accounts"`
-	Routes           []RouteConfig   `yaml:"routes"`
+	Listen           string           `yaml:"listen"`
+	AllowNonLoopback bool             `yaml:"allow_non_loopback"`
+	DataDir          string           `yaml:"data_dir"`
+	PricingFile      string           `yaml:"pricing_file"`
+	Quota            QuotaConfig      `yaml:"quota"`
+	Policy           PolicyConfig     `yaml:"policy"`
+	Control          ControlConfig    `yaml:"control"`
+	Clients          []ClientConfig   `yaml:"clients"`
+	Accounts         []AccountConfig  `yaml:"accounts"`
+	Routes           []RouteConfig    `yaml:"routes"`
+	ClaudeLogs       ClaudeLogsConfig `yaml:"claude_logs"`
+}
+
+// ClaudeLogsConfig controls ingestion of Claude Code transcript token usage.
+type ClaudeLogsConfig struct {
+	Enabled      bool     `yaml:"enabled"`
+	Dir          string   `yaml:"dir"`           // default ~/.claude/projects
+	Account      string   `yaml:"account"`       // claude account id rows are attributed to
+	ScanInterval Duration `yaml:"scan_interval"` // default 1m
 }
 
 type QuotaConfig struct {
@@ -50,13 +59,16 @@ type ClientConfig struct {
 }
 
 type AccountConfig struct {
-	ID         string             `yaml:"id"`
-	Provider   string             `yaml:"provider"`
-	BaseURL    string             `yaml:"base_url"`
-	APIKeyFile string             `yaml:"api_key_file"`
-	APIKeyEnv  string             `yaml:"api_key_env"`
-	Reserve    map[string]float64 `yaml:"reserve"`
-	CostBasis  string             `yaml:"cost_basis"`
+	ID         string `yaml:"id"`
+	Provider   string `yaml:"provider"`
+	BaseURL    string `yaml:"base_url"`
+	APIKeyFile string `yaml:"api_key_file"`
+	APIKeyEnv  string `yaml:"api_key_env"`
+	// CredentialsFile is the Claude Code credentials file read (never
+	// written) for provider claude. Default ~/.claude/.credentials.json.
+	CredentialsFile string             `yaml:"credentials_file"`
+	Reserve         map[string]float64 `yaml:"reserve"`
+	CostBasis       string             `yaml:"cost_basis"`
 }
 
 type RouteConfig struct {
@@ -131,9 +143,25 @@ func (c *Config) applyDefaults(baseDir string) {
 	for i := range c.Clients {
 		c.Clients[i].KeyFile = expand(c.Clients[i].KeyFile, baseDir)
 	}
+	if c.ClaudeLogs.Dir == "" {
+		c.ClaudeLogs.Dir = "~/.claude/projects"
+	}
+	c.ClaudeLogs.Dir = expand(c.ClaudeLogs.Dir, baseDir)
+	if c.ClaudeLogs.ScanInterval == 0 {
+		c.ClaudeLogs.ScanInterval = Duration(time.Minute)
+	}
 	for i := range c.Accounts {
 		a := &c.Accounts[i]
 		a.APIKeyFile = expand(a.APIKeyFile, baseDir)
+		if a.Provider == core.ProviderClaude {
+			if a.CredentialsFile == "" {
+				a.CredentialsFile = "~/.claude/.credentials.json"
+			}
+			a.CredentialsFile = expand(a.CredentialsFile, baseDir)
+			if a.BaseURL == "" {
+				a.BaseURL = "https://api.anthropic.com"
+			}
+		}
 		if a.BaseURL == "" {
 			switch a.Provider {
 			case core.ProviderCodex:
@@ -144,7 +172,7 @@ func (c *Config) applyDefaults(baseDir string) {
 		}
 		a.BaseURL = strings.TrimRight(a.BaseURL, "/")
 		if a.CostBasis == "" {
-			if a.Provider == core.ProviderCodex || a.Provider == core.ProviderOllama {
+			if a.Provider == core.ProviderCodex || a.Provider == core.ProviderOllama || a.Provider == core.ProviderClaude {
 				a.CostBasis = "api_equivalent"
 			} else {
 				a.CostBasis = "metered"
@@ -210,13 +238,15 @@ func (c *Config) Validate() error {
 		}
 	}
 	accts := map[string]bool{}
+	provider := map[string]string{}
 	for _, a := range c.Accounts {
+		provider[a.ID] = a.Provider
 		if a.ID == "" || accts[a.ID] || strings.ContainsAny(a.ID, "/\\. ") {
 			errs = append(errs, fmt.Errorf("account id %q empty, duplicate, or contains / \\ . or space", a.ID))
 		}
 		accts[a.ID] = true
 		switch a.Provider {
-		case core.ProviderCodex:
+		case core.ProviderCodex, core.ProviderClaude:
 		case core.ProviderOllama, core.ProviderOpenAICompat:
 			if a.APIKeyFile == "" && a.APIKeyEnv == "" {
 				errs = append(errs, fmt.Errorf("account %s: api_key_file or api_key_env required", a.ID))
@@ -256,7 +286,16 @@ func (c *Config) Validate() error {
 		for _, id := range append(append([]string{}, r.Interactive...), r.Background...) {
 			if !accts[id] {
 				errs = append(errs, fmt.Errorf("route %s: unknown account %q", r.Name, id))
+			} else if provider[id] == core.ProviderClaude {
+				errs = append(errs, fmt.Errorf("route %s: account %q is a quota-only claude account and cannot serve inference", r.Name, id))
 			}
+		}
+	}
+	if c.ClaudeLogs.Enabled {
+		if c.ClaudeLogs.Account == "" {
+			errs = append(errs, errors.New("claude_logs.account is required when claude_logs.enabled"))
+		} else if provider[c.ClaudeLogs.Account] != core.ProviderClaude {
+			errs = append(errs, fmt.Errorf("claude_logs.account %q must be a configured claude account", c.ClaudeLogs.Account))
 		}
 	}
 	return errors.Join(errs...)

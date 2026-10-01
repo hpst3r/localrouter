@@ -14,6 +14,11 @@ const (
 	ProviderCodex        = "codex"
 	ProviderOllama       = "ollama"
 	ProviderOpenAICompat = "openai_compat"
+	// ProviderClaude is a quota-only account backed by the official Claude
+	// Code login. LocalRouter never proxies inference for it; it only reads
+	// quota (read-only, never refreshing the CLI's token) and ingests token
+	// usage from Claude Code's local transcripts.
+	ProviderClaude = "claude"
 )
 
 // Workload classes.
@@ -131,10 +136,16 @@ type AccountState struct {
 
 // Usage is authoritative provider-reported token usage.
 type Usage struct {
+	// InputTokens is the TOTAL prompt tokens, including CachedInputTokens and
+	// CacheCreationInputTokens (OpenAI convention). Producers whose provider
+	// reports these separately (Anthropic) must sum them into InputTokens.
 	InputTokens       int64
-	CachedInputTokens int64
-	OutputTokens      int64
-	ReasoningTokens   int64
+	CachedInputTokens int64 // cache reads
+	// CacheCreationInputTokens are prompt tokens written to the cache
+	// (Anthropic cache_creation_input_tokens); 0 for providers without it.
+	CacheCreationInputTokens int64
+	OutputTokens             int64
+	ReasoningTokens          int64
 }
 
 // RequestRecord is one ledger row. Never contains prompt/response content.
@@ -164,19 +175,22 @@ type RequestRecord struct {
 
 // UsageRow is one aggregate row.
 type UsageRow struct {
-	Key                  string   `json:"key"`
-	Requests             int64    `json:"requests"`
-	InputTokens          int64    `json:"input_tokens"`
-	CachedInputTokens    int64    `json:"cached_input_tokens"`
-	OutputTokens         int64    `json:"output_tokens"`
-	ReasoningTokens      int64    `json:"reasoning_tokens"`
-	CostUSD              *float64 `json:"cost_usd"` // nil if any priced component unknown and nothing priced
-	UnknownUsageRequests int64    `json:"unknown_usage_requests"`
-	UnpricedRequests     int64    `json:"unpriced_requests"`
+	Key                      string   `json:"key"`
+	Requests                 int64    `json:"requests"`
+	InputTokens              int64    `json:"input_tokens"`
+	CachedInputTokens        int64    `json:"cached_input_tokens"`
+	CacheCreationInputTokens int64    `json:"cache_creation_input_tokens"`
+	OutputTokens             int64    `json:"output_tokens"`
+	ReasoningTokens          int64    `json:"reasoning_tokens"`
+	CostUSD                  *float64 `json:"cost_usd"` // nil if any priced component unknown and nothing priced
+	UnknownUsageRequests     int64    `json:"unknown_usage_requests"`
+	UnpricedRequests         int64    `json:"unpriced_requests"`
 }
 
 // Ledger persists request records and answers summaries.
 type Ledger interface {
+	// Record inserts r. It is idempotent on a non-empty r.ID: re-recording an
+	// existing ID is a no-op returning nil (used by transcript ingestion).
 	Record(ctx context.Context, r RequestRecord) error
 	Summary(ctx context.Context, since time.Time, group string) ([]UsageRow, error)
 	Close() error
