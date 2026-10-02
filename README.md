@@ -34,6 +34,21 @@ bin/localrouter serve
 
 Widget: <http://127.0.0.1:8787/>. JSON: `/control/v1/status`, `/control/v1/usage?since=7d&group=model`.
 
+## Run as a service (systemd --user)
+
+```bash
+GOFLAGS=-p=4 go build -trimpath -o bin/localrouter ./cmd/localrouter
+install -Dm755 bin/localrouter ~/.local/bin/localrouter
+install -Dm644 deploy/localrouter.service ~/.config/systemd/user/localrouter.service
+systemctl --user daemon-reload && systemctl --user enable --now localrouter
+journalctl --user -u localrouter -f
+```
+
+The unit validates config before start, restarts on failure, and is sandboxed:
+the home directory is read-only except `~/.config/localrouter`. To upgrade,
+rebuild, re-run `install`, then `systemctl --user restart localrouter`. With
+lingering enabled (`loginctl enable-linger`), it runs without a login session.
+
 ## Pricing
 
 Costs are only computed for models present in `pricing.yaml` (USD per 1M tokens).

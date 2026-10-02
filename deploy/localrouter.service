@@ -1,0 +1,36 @@
+[Unit]
+Description=LocalRouter - quota-aware local LLM gateway (127.0.0.1:8787)
+Documentation=file://%h/projects/localrouter/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStartPre=%h/.local/bin/localrouter check -config %h/.config/localrouter/config.yaml
+ExecStart=%h/.local/bin/localrouter serve -config %h/.config/localrouter/config.yaml
+Restart=on-failure
+RestartSec=5
+# serve drains in-flight streams for up to 30s, then cuts them and closes the ledger.
+TimeoutStopSec=45
+KillSignal=SIGTERM
+Nice=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening. Writes: only the LocalRouter data dir. Reads: Claude transcripts
+# and credentials (read-only by design; ProtectHome=read-only enforces it).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/localrouter
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=default.target
