@@ -53,6 +53,17 @@ type Snapshot struct {
 	// Allowed is the provider's own gate (Codex rate_limit.allowed); nil if unknown.
 	Allowed *bool  `json:"allowed,omitempty"`
 	Err     string `json:"error,omitempty"` // last fetch error; snapshot keeps last-good windows
+	// ModelRequests are provider-reported per-model request counts per window
+	// kind (e.g. Ollama's limits.<window>.models[]). They cover ALL traffic on
+	// the account, including clients that bypass LocalRouter. nil if the
+	// provider does not report them.
+	ModelRequests map[string][]ModelCount `json:"model_requests,omitempty"`
+}
+
+// ModelCount is one provider-reported per-model request count.
+type ModelCount struct {
+	Model    string `json:"model"`
+	Requests int64  `json:"requests"`
 }
 
 // Account is the static configuration of one upstream account.

@@ -75,6 +75,10 @@ button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; b
 <h2>Models (24h)</h2>
 <div class="card"><table id="models"></table></div>
 
+<h2>Provider-reported requests (weekly)</h2>
+<div class="card"><table id="provmodels"></table>
+<div class="small muted">Counts from each provider's usage API — all clients and hosts, including traffic that bypassed LocalRouter. Tokens/cost only exist for routed traffic.</div></div>
+
 <div class="small muted" style="margin-top:8px">
   <button id="forget" type="button" style="display:none">Forget key</button>
 </div>
@@ -270,6 +274,31 @@ button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; b
     });
   }
 
+  function renderProviderModels(status, week) {
+    var table = document.getElementById("provmodels");
+    clear(table);
+    headerRow(table, ["account", "model", "provider req", "via router (7d)"]);
+    var routed = {};
+    ((week && week.rows) || []).forEach(function (r) { routed[r.key] = r.requests || 0; });
+    var any = false;
+    ((status && status.accounts) || []).forEach(function (a) {
+      var counts = (a.model_requests && a.model_requests.weekly) || [];
+      counts.forEach(function (c) {
+        any = true;
+        var via = routed[c.model] || 0;
+        var tr = el("tr");
+        tr.appendChild(el("td", null, a.id));
+        tr.appendChild(el("td", null, c.model));
+        tr.appendChild(el("td", null, String(c.requests)));
+        var td = el("td", null, String(via));
+        if (c.requests > via) td.title = (c.requests - via) + " requests did not pass through LocalRouter";
+        tr.appendChild(td);
+        table.appendChild(tr);
+      });
+    });
+    if (!any) dataRow(table, ["no provider-reported counts", "", "", ""]);
+  }
+
   function showKeyPrompt(show) {
     document.getElementById("keybox").style.display = show ? "block" : "none";
   }
@@ -288,7 +317,8 @@ button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; b
       settle(api("/control/v1/status")),
       settle(api("/control/v1/usage?since=24h&group=account")),
       settle(api("/control/v1/usage?since=7d&group=account")),
-      settle(api("/control/v1/usage?since=24h&group=model"))
+      settle(api("/control/v1/usage?since=24h&group=model")),
+      settle(api("/control/v1/usage?since=7d&group=model"))
     ]).then(function (res) {
       var unauthorized = res.some(function (r) { return !r.ok && r.e && r.e.unauthorized; });
       showKeyPrompt(unauthorized);
@@ -299,6 +329,7 @@ button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; b
       else if (lastStatus) renderAccounts(lastStatus);
       renderTotals(res[1].ok ? res[1].v : null, res[2].ok ? res[2].v : null);
       renderModels(res[3].ok ? res[3].v : null);
+      renderProviderModels(lastStatus, res[4].ok ? res[4].v : null);
       document.getElementById("updated").textContent = res[0].ok
         ? "updated " + new Date().toLocaleTimeString()
         : (unauthorized ? "key required" : "update failed " + new Date().toLocaleTimeString());

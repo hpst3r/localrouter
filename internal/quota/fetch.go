@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/core"
@@ -146,7 +147,33 @@ type ollamaUsage struct {
 }
 
 type ollamaLimit struct {
-	Usage *float64 `json:"usage"`
+	Usage  *float64 `json:"usage"`
+	Models []struct {
+		Name         string `json:"name"`
+		RequestCount int64  `json:"request_count"`
+	} `json:"models"`
+}
+
+// ollamaModelCounts converts a window's models[] into sorted counts
+// (descending by requests, then name); nil when the provider sent none.
+func ollamaModelCounts(l *ollamaLimit) []core.ModelCount {
+	if l == nil || len(l.Models) == 0 {
+		return nil
+	}
+	out := make([]core.ModelCount, 0, len(l.Models))
+	for _, m := range l.Models {
+		if m.Name == "" || m.RequestCount < 0 {
+			continue
+		}
+		out = append(out, core.ModelCount{Model: m.Name, Requests: m.RequestCount})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Requests != out[j].Requests {
+			return out[i].Requests > out[j].Requests
+		}
+		return out[i].Model < out[j].Model
+	})
+	return out
 }
 
 func (m *Manager) fetchOllama(ctx context.Context, id string) (core.Snapshot, error) {
@@ -166,6 +193,14 @@ func (m *Manager) fetchOllama(ctx context.Context, id string) (core.Snapshot, er
 	}
 	if l := u.Limits.Weekly; l != nil && l.Usage != nil {
 		snap.Windows = append(snap.Windows, core.Window{Kind: core.WindowWeekly, UsedFrac: clampFrac(*l.Usage), WindowSeconds: 604800})
+	}
+	for kind, l := range map[string]*ollamaLimit{core.Window5h: u.Limits.Session, core.WindowWeekly: u.Limits.Weekly} {
+		if mc := ollamaModelCounts(l); mc != nil {
+			if snap.ModelRequests == nil {
+				snap.ModelRequests = map[string][]core.ModelCount{}
+			}
+			snap.ModelRequests[kind] = mc
+		}
 	}
 	return snap, nil
 }

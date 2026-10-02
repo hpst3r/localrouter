@@ -279,6 +279,13 @@ func copySnapshot(s core.Snapshot) core.Snapshot {
 		v := *s.Allowed
 		s.Allowed = &v
 	}
+	if s.ModelRequests != nil {
+		mr := make(map[string][]core.ModelCount, len(s.ModelRequests))
+		for k, v := range s.ModelRequests {
+			mr[k] = append([]core.ModelCount(nil), v...)
+		}
+		s.ModelRequests = mr
+	}
 	return s
 }
 

@@ -149,6 +149,9 @@ type accountStatus struct {
 	Error                 *string            `json:"error"`
 	// Reason explains why a class is not admissible (policy wording; no secrets).
 	Reason string `json:"reason,omitempty"`
+	// ModelRequests are provider-reported per-model request counts per window
+	// kind; they include traffic that bypassed LocalRouter.
+	ModelRequests map[string][]core.ModelCount `json:"model_requests,omitempty"`
 }
 
 type windowStatus struct {
@@ -221,6 +224,7 @@ func (s *Server) accountStatus(a core.Account, now time.Time) accountStatus {
 		for _, win := range snap.Windows {
 			st.Windows = append(st.Windows, windowView(win, now))
 		}
+		st.ModelRequests = snap.ModelRequests
 	}
 	st.Healthy = !coolingDown && st.Error == nil
 	return st
