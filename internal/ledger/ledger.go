@@ -189,6 +189,70 @@ func (l *Ledger) Record(ctx context.Context, r core.RequestRecord) error {
 	return nil
 }
 
+// Reprice recomputes cost_usd and cost_basis for every row with known usage
+// using the ledger's current pricing (e.g. after importing prices). Rows for
+// unpriced models get NULL cost. It returns how many rows are now priced.
+func (l *Ledger) Reprice(ctx context.Context) (int, error) {
+	type row struct {
+		id, model, account string
+		u                  core.Usage
+	}
+	rs, err := l.db.QueryContext(ctx, `SELECT id, model, account_id, input_tokens,
+		cached_input_tokens, cache_creation_input_tokens, output_tokens, reasoning_tokens
+		FROM requests WHERE usage_known = 1`)
+	if err != nil {
+		return 0, fmt.Errorf("ledger: reprice: %w", err)
+	}
+	var rows []row
+	for rs.Next() {
+		var r row
+		if err := rs.Scan(&r.id, &r.model, &r.account, &r.u.InputTokens, &r.u.CachedInputTokens,
+			&r.u.CacheCreationInputTokens, &r.u.OutputTokens, &r.u.ReasoningTokens); err != nil {
+			rs.Close()
+			return 0, fmt.Errorf("ledger: reprice: %w", err)
+		}
+		rows = append(rows, r)
+	}
+	rs.Close()
+	if err := rs.Err(); err != nil {
+		return 0, fmt.Errorf("ledger: reprice: %w", err)
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("ledger: reprice: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx, `UPDATE requests SET cost_usd = ?, cost_basis = ? WHERE id = ?`)
+	if err != nil {
+		return 0, fmt.Errorf("ledger: reprice: %w", err)
+	}
+	defer stmt.Close()
+	priced := 0
+	for _, r := range rows {
+		var cost sql.NullFloat64
+		var basis sql.NullString
+		if c, ok := l.pricing.Cost(r.model, r.u); ok {
+			cost = sql.NullFloat64{Float64: c, Valid: true}
+			priced++
+			if l.basis != nil {
+				if b := l.basis(r.account); b != "" {
+					basis = sql.NullString{String: b, Valid: true}
+				}
+			}
+		}
+		if _, err := stmt.ExecContext(ctx, cost, basis, r.id); err != nil {
+			return 0, fmt.Errorf("ledger: reprice: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("ledger: reprice: %w", err)
+	}
+	return priced, nil
+}
+
 // groupColumns maps Summary group names to SQL columns. "day" is handled
 // in Go so the local time zone (including DST) is applied per row.
 var groupColumns = map[string]string{

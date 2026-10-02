@@ -31,6 +31,7 @@ Usage:
   localrouter login   [-config PATH] [-force] <account-id>
   localrouter keygen  <output-file>
   localrouter pricing import [-config PATH] <litellm-prices.json>
+  localrouter pricing reprice [-config PATH]
   localrouter check   [-config PATH]
   localrouter admit   [--class background] (--account ID | --model NAME) [--url URL] [--json]
                       exit 0 = allow, 1 = deny, 2 = error
@@ -174,31 +175,65 @@ func cmdLogin(args []string) error {
 }
 
 func cmdPricing(args []string) error {
-	if len(args) < 1 || args[0] != "import" {
-		return errors.New("usage: localrouter pricing import [-config PATH] <litellm-prices.json>")
+	const use = "usage: localrouter pricing import [-config PATH] <litellm-prices.json> | pricing reprice [-config PATH]"
+	if len(args) < 1 {
+		return errors.New(use)
 	}
-	fs := flag.NewFlagSet("pricing import", flag.ExitOnError)
-	cfg, err := loadConfig(fs, args[1:])
-	if err != nil {
-		return err
+	switch args[0] {
+	case "import":
+		fs := flag.NewFlagSet("pricing import", flag.ExitOnError)
+		cfg, err := loadConfig(fs, args[1:])
+		if err != nil {
+			return err
+		}
+		if fs.NArg() != 1 {
+			return errors.New(use)
+		}
+		f, err := os.Open(fs.Arg(0))
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		prices, err := ledger.ImportLiteLLM(f)
+		if err != nil {
+			return err
+		}
+		if err := ledger.WritePricing(cfg.PricingFile, prices); err != nil {
+			return err
+		}
+		fmt.Printf("imported %d model prices into %s\n", len(prices), cfg.PricingFile)
+		fmt.Printf("hand-maintained overrides/aliases: %s (never overwritten)\n", ledger.LocalPricingPath(cfg.PricingFile))
+		fmt.Println("run `localrouter pricing reprice` to apply prices to existing rows")
+		return nil
+	case "reprice":
+		fs := flag.NewFlagSet("pricing reprice", flag.ExitOnError)
+		cfg, err := loadConfig(fs, args[1:])
+		if err != nil {
+			return err
+		}
+		pricing, err := ledger.LoadPricing(cfg.PricingFile)
+		if err != nil {
+			return err
+		}
+		basis := map[string]string{}
+		for _, a := range cfg.CoreAccounts() {
+			basis[a.ID] = a.CostBasis
+		}
+		l, err := ledger.Open(filepath.Join(cfg.DataDir, "localrouter.db"), pricing,
+			func(id string) string { return basis[id] })
+		if err != nil {
+			return err
+		}
+		defer l.Close()
+		n, err := l.Reprice(context.Background())
+		if err != nil {
+			return err
+		}
+		fmt.Printf("repriced: %d rows now have a cost\n", n)
+		return nil
+	default:
+		return errors.New(use)
 	}
-	if fs.NArg() != 1 {
-		return errors.New("usage: localrouter pricing import [-config PATH] <litellm-prices.json>")
-	}
-	f, err := os.Open(fs.Arg(0))
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	prices, err := ledger.ImportLiteLLM(f)
-	if err != nil {
-		return err
-	}
-	if err := ledger.WritePricing(cfg.PricingFile, prices); err != nil {
-		return err
-	}
-	fmt.Printf("imported %d model prices into %s\n", len(prices), cfg.PricingFile)
-	return nil
 }
 
 func cmdServe(args []string) error {

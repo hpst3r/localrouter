@@ -45,6 +45,15 @@ curl -fsSLo /tmp/prices.json \
 bin/localrouter pricing import /tmp/prices.json
 ```
 
+Hand-maintained overrides and aliases live in `pricing.local.yaml` next to
+`pricing.yaml`; import never overwrites it. Use `aliases:` to map the model
+name clients send (e.g. Ollama's `glm-5.3`) to a priced LiteLLM key
+(`zai/glm-5.3`). After importing or editing prices, apply them to history:
+
+```bash
+bin/localrouter pricing reprice
+```
+
 Subscription accounts record `api_equivalent` cost (what it would cost at API list
 price), not actual spend. Unpriced models show as unpriced, never $0.
 

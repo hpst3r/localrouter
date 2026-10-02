@@ -33,6 +33,16 @@ type Pricing struct {
 
 type pricingFile struct {
 	Models map[string]ModelPrice `yaml:"models"`
+	// Aliases (overrides file only) map a model name as clients send it to
+	// another priced key, e.g. "glm-5.3": "zai/glm-5.3".
+	Aliases map[string]string `yaml:"aliases"`
+}
+
+// LocalPricingPath is the hand-maintained overrides file that sits beside
+// the imported pricing file. Import never writes it.
+func LocalPricingPath(path string) string {
+	ext := filepath.Ext(path)
+	return strings.TrimSuffix(path, ext) + ".local" + ext
 }
 
 // NewPricing builds a Pricing from a model→price map.
@@ -51,26 +61,60 @@ func NewPricing(models map[string]ModelPrice) *Pricing {
 	return p
 }
 
-// LoadPricing reads a pricing YAML file. A missing file yields an empty table.
+// LoadPricing reads a pricing YAML file plus its optional overrides file
+// (LocalPricingPath). Overrides' models replace imported entries; overrides'
+// aliases resolve to a priced key after merging (exact or case-insensitive).
+// Missing files yield an empty table. An alias to an unpriced key is an
+// error so typos are caught at startup.
 func LoadPricing(path string) (*Pricing, error) {
+	base, err := readPricingFile(path)
+	if err != nil {
+		return nil, err
+	}
+	local, err := readPricingFile(LocalPricingPath(path))
+	if err != nil {
+		return nil, err
+	}
+	models := make(map[string]ModelPrice, len(base.Models)+len(local.Models)+len(local.Aliases))
+	for k, v := range base.Models {
+		models[k] = v
+	}
+	for k, v := range local.Models {
+		models[k] = v
+	}
+	merged := NewPricing(models)
+	for name, target := range local.Aliases {
+		mp, ok := merged.Lookup(target)
+		if !ok {
+			return nil, fmt.Errorf("pricing: alias %q -> %q: target is not priced", name, target)
+		}
+		models[name] = mp
+	}
+	if len(base.Aliases) > 0 {
+		return nil, fmt.Errorf("pricing: aliases belong in %s, not %s", LocalPricingPath(path), path)
+	}
+	return NewPricing(models), nil
+}
+
+func readPricingFile(path string) (pricingFile, error) {
+	var f pricingFile
 	b, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return NewPricing(nil), nil
+		return f, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("pricing: %w", err)
+		return f, fmt.Errorf("pricing: %w", err)
 	}
-	var f pricingFile
 	if err := yaml.Unmarshal(b, &f); err != nil {
-		return nil, fmt.Errorf("pricing: parse %s: %w", path, err)
+		return f, fmt.Errorf("pricing: parse %s: %w", path, err)
 	}
 	for name, mp := range f.Models {
 		if mp.Input < 0 || mp.Output < 0 || (mp.CachedInput != nil && *mp.CachedInput < 0) ||
 			(mp.CacheCreationInput != nil && *mp.CacheCreationInput < 0) {
-			return nil, fmt.Errorf("pricing: model %q: negative price", name)
+			return f, fmt.Errorf("pricing: model %q: negative price", name)
 		}
 	}
-	return NewPricing(f.Models), nil
+	return f, nil
 }
 
 // Lookup returns the price for model by exact name, then case-insensitively.
