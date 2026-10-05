@@ -282,7 +282,7 @@ func TestKeychainCredentials(t *testing.T) {
 	if err != nil || string(b) != `{"claudeAiOauth":{"accessToken":"tok"}}` {
 		t.Fatalf("got %q %v", b, err)
 	}
-	if fmt.Sprint(f.calls[0]) != "[security find-generic-password -s Claude Code-credentials -w]" || !f.dl {
+	if fmt.Sprint(f.calls[0]) != "[security find-generic-password -a "+DefaultKeychainAccount()+" -s Claude Code-credentials -w]" || !f.dl {
 		t.Fatalf("calls %q deadline=%v", f.calls, f.dl)
 	}
 	f.err, f.out = errors.New("exit status 44: secret stderr tok"), "partial tok"

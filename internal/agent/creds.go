@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
+	"regexp"
 	"time"
 )
 
@@ -76,10 +78,29 @@ func (f FileCredentials) ReadCredentials(context.Context) ([]byte, error) {
 }
 
 // KeychainCredentials reads a macOS keychain generic password with
-// `security find-generic-password -s <Service> -w`.
+// `security find-generic-password -a <Account> -s <Service> -w`, matching how
+// Claude Code itself reads its login (account = $USER).
 type KeychainCredentials struct {
 	Service string
+	Account string        // "" = DefaultKeychainAccount()
 	Run     CommandRunner // nil = ExecRunner
+}
+
+var keychainAccountRe = regexp.MustCompile(`^[a-zA-Z0-9._-]+$`)
+
+// DefaultKeychainAccount mirrors Claude Code: $USER (or the OS username),
+// falling back to "claude-code-user" when unset or not [a-zA-Z0-9._-]+.
+func DefaultKeychainAccount() string {
+	name := os.Getenv("USER")
+	if name == "" {
+		if u, err := user.Current(); err == nil {
+			name = u.Username
+		}
+	}
+	if !keychainAccountRe.MatchString(name) {
+		return "claude-code-user"
+	}
+	return name
 }
 
 // ReadCredentials implements CredentialReader.
@@ -90,7 +111,11 @@ func (k KeychainCredentials) ReadCredentials(ctx context.Context) ([]byte, error
 	}
 	ctx, cancel := context.WithTimeout(ctx, keychainTimeout)
 	defer cancel()
-	out, err := run(ctx, "security", "find-generic-password", "-s", k.Service, "-w")
+	acct := k.Account
+	if acct == "" {
+		acct = DefaultKeychainAccount()
+	}
+	out, err := run(ctx, "security", "find-generic-password", "-a", acct, "-s", k.Service, "-w")
 	out = bytes.TrimSpace(out)
 	if err != nil || len(out) == 0 {
 		return nil, ErrKeychainUnavailable
@@ -117,7 +142,7 @@ func (rs firstOf) ReadCredentials(ctx context.Context) ([]byte, error) {
 // keychain then file on darwin, file elsewhere. run nil uses ExecRunner.
 func NewCredentialReader(cc CredentialsConfig, goos string, run CommandRunner) (CredentialReader, error) {
 	file := FileCredentials{Path: cc.File}
-	kc := KeychainCredentials{Service: cc.KeychainService, Run: run}
+	kc := KeychainCredentials{Service: cc.KeychainService, Account: cc.KeychainAccount, Run: run}
 	switch cc.Source {
 	case SourceFile:
 		return file, nil

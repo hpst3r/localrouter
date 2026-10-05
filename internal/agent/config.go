@@ -51,6 +51,8 @@ type CredentialsConfig struct {
 	Source          string // auto | file | keychain
 	File            string
 	KeychainService string
+	// KeychainAccount defaults to $USER (Claude Code's own convention).
+	KeychainAccount string
 }
 
 type fileConfig struct {
@@ -69,6 +71,7 @@ type fileCreds struct {
 	Source          string `yaml:"source"`
 	File            string `yaml:"file"`
 	KeychainService string `yaml:"keychain_service"`
+	KeychainAccount string `yaml:"keychain_account"`
 }
 
 type duration time.Duration
@@ -142,6 +145,7 @@ func parseConfig(b []byte, baseDir, home, goos string) (*Config, error) {
 			Source:          fc.Credentials.Source,
 			File:            exp(fc.Credentials.File, "~/.claude/.credentials.json"),
 			KeychainService: fc.Credentials.KeychainService,
+			KeychainAccount: fc.Credentials.KeychainAccount,
 		},
 		PushInterval:  DefaultPushInterval,
 		QuotaInterval: DefaultQuotaInterval,
