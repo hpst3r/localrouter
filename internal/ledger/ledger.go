@@ -25,7 +25,13 @@ type Ledger struct {
 	mu      sync.Mutex // serializes writes
 }
 
-var _ core.Ledger = (*Ledger)(nil)
+var (
+	_ core.Ledger      = (*Ledger)(nil)
+	_ core.BatchLedger = (*Ledger)(nil)
+)
+
+// MaxBatch is the maximum number of records accepted by RecordBatch.
+const MaxBatch = 1000
 
 // migrations are applied in order; index+1 is the schema version.
 // The requests table must never gain prompt/response content columns.
@@ -60,6 +66,7 @@ var migrations = []string{
 	CREATE INDEX requests_started_at ON requests(started_at);
 	CREATE INDEX requests_account_id ON requests(account_id);`,
 	`ALTER TABLE requests ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0;`,
+	`ALTER TABLE requests ADD COLUMN host TEXT NOT NULL DEFAULT '';`,
 }
 
 // Open opens (creating if needed) the ledger database at path. pricing may be
@@ -134,10 +141,67 @@ func (l *Ledger) migrate() error {
 // Close closes the database.
 func (l *Ledger) Close() error { return l.db.Close() }
 
+const insertSQL = `INSERT INTO requests (
+	id, started_at, finished_at, client, class, route, model, provider,
+	account_id, upstream_identity, status, failover_of, input_tokens,
+	cached_input_tokens, output_tokens, reasoning_tokens, usage_known,
+	cost_usd, cost_basis, latency_ms, bytes_out, session, task, agent, error,
+	cache_creation_input_tokens, host
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(id) DO NOTHING`
+
 // Record inserts one request row, computing cost from pricing. An empty
 // r.ID is replaced with a random one. Record is idempotent on ID: if a row
 // with r.ID already exists it is left unchanged and nil is returned.
 func (l *Ledger) Record(ctx context.Context, r core.RequestRecord) error {
+	args := l.insertArgs(r)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if _, err := l.db.ExecContext(ctx, insertSQL, args...); err != nil {
+		return fmt.Errorf("ledger: record: %w", err)
+	}
+	return nil
+}
+
+// RecordBatch inserts up to MaxBatch rows in one transaction with the same
+// semantics as Record: rows whose ID already exists are skipped silently.
+// Either every new row is written or none is.
+func (l *Ledger) RecordBatch(ctx context.Context, rs []core.RequestRecord) error {
+	if len(rs) > MaxBatch {
+		return fmt.Errorf("ledger: record batch: %d records exceeds max %d", len(rs), MaxBatch)
+	}
+	if len(rs) == 0 {
+		return nil
+	}
+	args := make([][]any, len(rs))
+	for i, r := range rs {
+		args[i] = l.insertArgs(r)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("ledger: record batch: %w", err)
+	}
+	defer tx.Rollback()
+	stmt, err := tx.PrepareContext(ctx, insertSQL)
+	if err != nil {
+		return fmt.Errorf("ledger: record batch: %w", err)
+	}
+	defer stmt.Close()
+	for _, a := range args {
+		if _, err := stmt.ExecContext(ctx, a...); err != nil {
+			return fmt.Errorf("ledger: record batch: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("ledger: record batch: %w", err)
+	}
+	return nil
+}
+
+// insertArgs computes cost and returns the bind arguments for insertSQL.
+func (l *Ledger) insertArgs(r core.RequestRecord) []any {
 	if r.ID == "" {
 		var b [16]byte
 		_, _ = rand.Read(b[:])
@@ -167,26 +231,13 @@ func (l *Ledger) Record(ctx context.Context, r core.RequestRecord) error {
 	if r.UsageKnown {
 		usageKnown = 1
 	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	_, err := l.db.ExecContext(ctx, `INSERT INTO requests (
-		id, started_at, finished_at, client, class, route, model, provider,
-		account_id, upstream_identity, status, failover_of, input_tokens,
-		cached_input_tokens, output_tokens, reasoning_tokens, usage_known,
-		cost_usd, cost_basis, latency_ms, bytes_out, session, task, agent, error,
-		cache_creation_input_tokens
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-	ON CONFLICT(id) DO NOTHING`,
+	return []any{
 		r.ID, r.StartedAt.UnixMilli(), finished, r.Client, string(r.Class), r.Route, r.Model, r.Provider,
 		r.AccountID, r.UpstreamIdentity, r.Status, failoverOf, r.Usage.InputTokens,
 		r.Usage.CachedInputTokens, r.Usage.OutputTokens, r.Usage.ReasoningTokens, usageKnown,
 		cost, basis, r.LatencyMS, r.BytesOut, r.Session, r.Task, r.Agent, r.Error,
-		r.Usage.CacheCreationInputTokens)
-	if err != nil {
-		return fmt.Errorf("ledger: record: %w", err)
+		r.Usage.CacheCreationInputTokens, r.Host,
 	}
-	return nil
 }
 
 // Reprice recomputes cost_usd and cost_basis for every row with known usage
@@ -261,6 +312,7 @@ var groupColumns = map[string]string{
 	"class":   "class",
 	"client":  "client",
 	"route":   "route",
+	"host":    "host",
 }
 
 const aggCols = `COUNT(*), SUM(input_tokens), SUM(cached_input_tokens),
@@ -269,7 +321,7 @@ const aggCols = `COUNT(*), SUM(input_tokens), SUM(cached_input_tokens),
 	SUM(CASE WHEN usage_known = 1 AND cost_usd IS NULL THEN 1 ELSE 0 END)`
 
 // Summary aggregates requests started at or after since, grouped by one of
-// account, model, class, client, route, or day (local date YYYY-MM-DD).
+// account, model, class, client, route, host, or day (local date YYYY-MM-DD).
 // Rows are ordered by key.
 func (l *Ledger) Summary(ctx context.Context, since time.Time, group string) ([]core.UsageRow, error) {
 	if group == "day" {

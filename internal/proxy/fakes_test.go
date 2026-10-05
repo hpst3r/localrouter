@@ -217,7 +217,7 @@ func (h *harness) start() {
 			case clientKey:
 				return core.Client{Name: "alice", Class: core.ClassInteractive}, true
 			case bgKey:
-				return core.Client{Name: "batch", Class: core.ClassBackground}, true
+				return core.Client{Name: "batch", Class: core.ClassBackground, Host: "vm1"}, true
 			}
 			return core.Client{}, false
 		},

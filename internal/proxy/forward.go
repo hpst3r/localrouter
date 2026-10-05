@@ -339,6 +339,7 @@ func (p *Proxy) newRecord(req *request, account core.Account, failoverOf string)
 		Session:    req.session,
 		Task:       req.task,
 		Agent:      req.agent,
+		Host:       req.client.Host,
 	}
 }
 
