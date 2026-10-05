@@ -29,6 +29,20 @@ const maxLineBytes = 8 << 20
 // call.
 const MaxBatch = 500
 
+// maxTokens bounds every usage field of a parsed record; larger values are
+// implausible and would be rejected by the server's ingest validation.
+const maxTokens = 1_000_000_000_000
+
+// maxIDLen bounds RequestRecord.ID (ours are always 39 bytes).
+const maxIDLen = 128
+
+// PermanentError is implemented by ledger errors that classify themselves
+// (e.g. *agent.HTTPError). Permanent() == true means the records were
+// rejected as invalid and resending them unchanged cannot succeed.
+type PermanentError interface {
+	Permanent() bool
+}
+
 // Defaults for Options.
 const (
 	DefaultScanInterval = time.Minute
@@ -62,7 +76,8 @@ type Stats struct {
 	Lines    int // complete lines read
 	Recorded int // final messages passed to Ledger.Record/RecordBatch without error
 	Pending  int // messages awaiting finality after the scan
-	Skipped  int // lines yielding no usage (other entry types, malformed, oversized, synthetic, zero usage)
+	Skipped  int // lines yielding no usage (other entry types, malformed, oversized, synthetic, zero or invalid usage)
+	Dropped  int // final messages the ledger permanently rejected; dropped so the file can advance
 }
 
 // Collector incrementally ingests Claude Code transcripts into a ledger.
@@ -158,7 +173,7 @@ func (c *Collector) ScanOnce(ctx context.Context) (Stats, error) {
 			if path == c.opts.Dir && errors.Is(err, fs.ErrNotExist) {
 				return fs.SkipAll
 			}
-			c.opts.Logger.Warn("claudelog: walk", "path", path, "err", err)
+			c.opts.Logger.Warn("claudelog: walk", "project", c.walkProject(path, d), "err", stripPath(err))
 			if d != nil && d.IsDir() {
 				return fs.SkipDir
 			}
@@ -183,6 +198,7 @@ func (c *Collector) ScanOnce(ctx context.Context) (Stats, error) {
 		}
 		if err != nil {
 			// Log only the project dir slug, never the session file path.
+			err = stripPath(err)
 			c.opts.Logger.Warn("claudelog: scan file", "project", projectName(rel), "err", err)
 			if firstErr == nil {
 				firstErr = err
@@ -191,7 +207,7 @@ func (c *Collector) ScanOnce(ctx context.Context) (Stats, error) {
 		return nil
 	})
 	if walkErr != nil && firstErr == nil {
-		firstErr = walkErr
+		firstErr = stripPath(walkErr)
 	}
 	if walkErr == nil {
 		for rel := range c.files {
@@ -208,6 +224,7 @@ func (c *Collector) ScanOnce(ctx context.Context) (Stats, error) {
 	}
 	if dirty {
 		if err := c.saveState(); err != nil {
+			err = stripPath(err)
 			c.opts.Logger.Warn("claudelog: save state", "err", err)
 			if firstErr == nil {
 				firstErr = err
@@ -255,6 +272,11 @@ func (c *Collector) scanFile(ctx context.Context, path, rel string, st *Stats) (
 				st.Skipped++
 				return
 			}
+			if why := invalid(rec); why != "" {
+				st.Skipped++
+				c.opts.Logger.Warn("claudelog: skipping invalid usage", "project", task, "reason", why)
+				return
+			}
 			p := next.pending
 			switch {
 			case p == nil:
@@ -291,27 +313,98 @@ func (c *Collector) scanFile(ctx context.Context, path, rel string, st *Stats) (
 	return changed, nil
 }
 
-// record writes finals to the ledger, batched when supported. It returns the
-// first error; the caller then keeps the file's old state.
+// record writes finals to the ledger, batched when supported. A permanent
+// rejection (see PermanentError) is narrowed down by bisection and only the
+// rejected records are dropped, so one bad record cannot stall its file
+// forever. Any other error is returned; the caller then keeps the file's old
+// state and the records are resent next scan (IDs dedupe).
 func (c *Collector) record(ctx context.Context, finals []core.RequestRecord, st *Stats) error {
 	if bl, ok := c.ledger.(core.BatchLedger); ok {
 		for len(finals) > 0 {
 			n := min(len(finals), MaxBatch)
-			if err := bl.RecordBatch(ctx, finals[:n]); err != nil {
+			if err := c.sendBatch(ctx, bl, finals[:n], st); err != nil {
 				return fmt.Errorf("record batch: %w", err)
 			}
-			st.Recorded += n
 			finals = finals[n:]
 		}
 		return nil
 	}
 	for _, r := range finals {
 		if err := c.ledger.Record(ctx, r); err != nil {
-			return fmt.Errorf("record: %w", err)
+			if !isPermanent(err) {
+				return fmt.Errorf("record: %w", err)
+			}
+			c.drop(r, err, st)
+			continue
 		}
 		st.Recorded++
 	}
 	return nil
+}
+
+// sendBatch records rs, bisecting on permanent errors to isolate and drop
+// only the rejected records.
+func (c *Collector) sendBatch(ctx context.Context, bl core.BatchLedger, rs []core.RequestRecord, st *Stats) error {
+	err := bl.RecordBatch(ctx, rs)
+	switch {
+	case err == nil:
+		st.Recorded += len(rs)
+		return nil
+	case !isPermanent(err):
+		return err
+	case len(rs) == 1:
+		c.drop(rs[0], err, st)
+		return nil
+	}
+	mid := len(rs) / 2
+	if err := c.sendBatch(ctx, bl, rs[:mid], st); err != nil {
+		return err
+	}
+	return c.sendBatch(ctx, bl, rs[mid:], st)
+}
+
+// drop counts and logs (project slug and record ID only) a rejected record.
+func (c *Collector) drop(r core.RequestRecord, err error, st *Stats) {
+	st.Dropped++
+	c.opts.Logger.Warn("claudelog: ledger rejected record; dropping", "project", r.Task, "id", r.ID, "err", err)
+}
+
+func isPermanent(err error) bool {
+	var pe PermanentError
+	return errors.As(err, &pe) && pe.Permanent()
+}
+
+// invalid returns why rec would fail ingest validation, or "" if it is valid.
+func invalid(rec core.RequestRecord) string {
+	u := rec.Usage
+	for _, v := range []int64{u.InputTokens, u.CachedInputTokens, u.CacheCreationInputTokens, u.OutputTokens, u.ReasoningTokens} {
+		if v < 0 {
+			return "negative usage"
+		}
+		if v > maxTokens {
+			return "implausible usage"
+		}
+	}
+	if rec.ID == "" || len(rec.ID) > maxIDLen {
+		return "bad id"
+	}
+	if rec.StartedAt.IsZero() {
+		return "missing timestamp"
+	}
+	return ""
+}
+
+// sumTokens adds token counts, returning -1 (rejected by invalid) if any term
+// is out of range, which also rules out overflow.
+func sumTokens(vs ...int64) int64 {
+	var s int64
+	for _, v := range vs {
+		if v < 0 || v > maxTokens {
+			return -1
+		}
+		s += v
+	}
+	return s
 }
 
 // readLines reads complete newline-terminated lines from f starting at off,
@@ -400,10 +493,8 @@ func (c *Collector) parse(line []byte, task string) (key string, rec core.Reques
 	default:
 		return "", rec, false
 	}
-	ts, err := time.Parse(time.RFC3339Nano, e.Timestamp)
-	if err != nil {
-		ts = c.opts.Clock.Now()
-	}
+	// An unparseable timestamp leaves ts zero; invalid then rejects the line.
+	ts, _ := time.Parse(time.RFC3339Nano, e.Timestamp)
 	var thinking int64
 	if u.OutputTokensDetails != nil {
 		thinking = u.OutputTokensDetails.ThinkingTokens
@@ -425,7 +516,7 @@ func (c *Collector) parse(line []byte, task string) (key string, rec core.Reques
 		AccountID:  c.opts.AccountID,
 		Status:     200,
 		Usage: core.Usage{
-			InputTokens:              u.InputTokens + u.CacheCreationTokens + u.CacheReadTokens,
+			InputTokens:              sumTokens(u.InputTokens, u.CacheCreationTokens, u.CacheReadTokens),
 			CachedInputTokens:        u.CacheReadTokens,
 			CacheCreationInputTokens: u.CacheCreationTokens,
 			OutputTokens:             u.OutputTokens,
@@ -449,6 +540,37 @@ func projectName(rel string) string {
 	return ""
 }
 
+// walkProject returns the project slug for a walk entry: the first path
+// element under Dir, or "" for Dir itself and files directly in it.
+func (c *Collector) walkProject(path string, d fs.DirEntry) string {
+	rel, err := filepath.Rel(c.opts.Dir, path)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	rel = filepath.ToSlash(rel)
+	if p := projectName(rel); p != "" {
+		return p
+	}
+	if d != nil && d.IsDir() {
+		return rel
+	}
+	return ""
+}
+
+// stripPath drops file paths from *fs.PathError and *os.LinkError, keeping
+// the operation and cause, so logs and returned errors stay path-free.
+func stripPath(err error) error {
+	var pe *fs.PathError
+	if errors.As(err, &pe) {
+		return fmt.Errorf("%s: %w", pe.Op, pe.Err)
+	}
+	var le *os.LinkError
+	if errors.As(err, &le) {
+		return fmt.Errorf("%s: %w", le.Op, le.Err)
+	}
+	return err
+}
+
 // persisted is the on-disk state format.
 type persisted struct {
 	Files map[string]persistedFile `json:"files"`
@@ -466,7 +588,7 @@ func (c *Collector) loadState() {
 	b, err := os.ReadFile(c.opts.StatePath)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
-			c.opts.Logger.Warn("claudelog: load state", "err", err)
+			c.opts.Logger.Warn("claudelog: load state", "err", stripPath(err))
 		}
 		return
 	}

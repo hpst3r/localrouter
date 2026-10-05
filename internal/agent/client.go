@@ -37,6 +37,18 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("ingest: http %d: %s", e.Status, e.Body)
 }
 
+// Permanent reports whether the server rejected the request content itself
+// (400, 413, 422), so resending it unchanged cannot succeed. Other statuses
+// (401/403, 429, 5xx) are transient. Callers such as claudelog detect this
+// via errors.As with interface{ Permanent() bool }.
+func (e *HTTPError) Permanent() bool {
+	switch e.Status {
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+		return true
+	}
+	return false
+}
+
 // Client posts ingest requests to the central server.
 type Client struct {
 	endpoint string
@@ -152,7 +164,8 @@ func (l *RemoteLedger) Record(ctx context.Context, r core.RequestRecord) error {
 
 // RecordBatch sends rs in chunks of at most MaxBatch, stamping each record
 // with the client's host. The server dedupes by ID, so a partially delivered
-// batch that is retried yields no duplicates.
+// batch that is retried yields no duplicates. A rejected chunk returns an
+// *HTTPError whose Permanent method classifies it.
 func (l *RemoteLedger) RecordBatch(ctx context.Context, rs []core.RequestRecord) error {
 	for len(rs) > 0 {
 		n := min(len(rs), MaxBatch)
