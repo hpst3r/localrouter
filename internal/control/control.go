@@ -87,6 +87,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /{$}", s.widget)
 	mux.Handle("GET /control/v1/status", s.auth(http.HandlerFunc(s.status)))
 	mux.Handle("GET /control/v1/usage", s.auth(http.HandlerFunc(s.usage)))
+	mux.Handle("GET /control/v1/analytics", s.auth(http.HandlerFunc(s.analytics)))
+	mux.Handle("GET /control/v1/analytics/dimensions", s.auth(http.HandlerFunc(s.analyticsDimensions)))
 	mux.Handle("POST /control/v1/admit", s.auth(http.HandlerFunc(s.admit)))
 	mux.HandleFunc("POST /control/v1/ingest", s.ingest)
 	return mux
@@ -270,7 +272,7 @@ type usageDoc struct {
 	Rows          []core.UsageRow `json:"rows"`
 }
 
-var usageGroups = []string{"account", "model", "class", "client", "host"}
+var usageGroups = []string{"account", "model", "class", "client", "host", "route", "task", "agent"}
 
 func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -288,7 +290,7 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 		group = "account"
 	}
 	if !slices.Contains(usageGroups, group) {
-		writeError(w, http.StatusBadRequest, "group must be one of account, model, class, client, host")
+		writeError(w, http.StatusBadRequest, "group must be one of "+strings.Join(usageGroups, ", "))
 		return
 	}
 	if s.deps.Ledger == nil {

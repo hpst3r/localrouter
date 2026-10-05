@@ -20,7 +20,14 @@
 //
 //	GET  /healthz            -> "ok"
 //	GET  /control/v1/status  -> per-account quota/admission state
-//	GET  /control/v1/usage   -> ledger summary (?since=24h|7d&group=account|model|class|client|host)
+//	GET  /control/v1/usage   -> ledger summary (?since=24h|7d&group=account|model|class|client|host|route|task|agent)
+//	GET  /control/v1/analytics -> core.AnalyticsResult time series
+//	                            (?range=24h|7d|30d|90d or from/to RFC 3339,
+//	                            bucket=hour|day, group=<dim>, filter.<dim>=v, top=1..50);
+//	                            needs Deps.Ledger to implement core.AnalyticsLedger
+//	                            (else 503). Ledger errors prefixed "analytics:" -> 400.
+//	GET  /control/v1/analytics/dimensions -> top 50 values per dimension
+//	                            in range (?range=30d, from/to, filter.<dim>)
 //	POST /control/v1/admit   -> dry-run admission {class, model} or {class, account}
 //	                            (exactly one of model/account); never creates a lease
 //	POST /control/v1/ingest  -> agent push of claude usage records and quota
