@@ -84,7 +84,11 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 	clients := map[string]core.Client{}
 	for _, c := range cfg.Clients {
 		keyFiles[c.Name] = c.KeyFile
-		clients[c.Name] = core.Client{Name: c.Name, Class: core.Class(c.Class), Host: c.Host, Ingest: c.Ingest}
+		host := c.Host
+		if host == "" {
+			host = cfg.HostName // usage from un-attributed clients happens on this machine
+		}
+		clients[c.Name] = core.Client{Name: c.Name, Class: core.Class(c.Class), Host: host, Ingest: c.Ingest}
 	}
 	clientKeys, err := auth.LoadClientKeys(keyFiles)
 	if err != nil {
@@ -171,6 +175,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		a.ClaudeLog = claudelog.New(led, claudelog.Options{
 			Dir:          cfg.ClaudeLogs.Dir,
 			AccountID:    cfg.ClaudeLogs.Account,
+			Host:         cfg.HostName,
 			StatePath:    filepath.Join(cfg.DataDir, "claudelog-state.json"),
 			ScanInterval: cfg.ClaudeLogs.ScanInterval.D(),
 			Clock:        clock,

@@ -238,6 +238,58 @@ type IngestResponse struct {
 	SnapshotsIgnored  int `json:"snapshots_ignored"` // older than what the server has
 }
 
+// AnalyticsDimensions are the ledger columns analytics can group/filter by.
+// "task" is the project (Claude Code project dir slug or X-LocalRouter-Task);
+// "agent" is main/subagent or X-LocalRouter-Agent.
+var AnalyticsDimensions = []string{"host", "account", "model", "client", "class", "route", "task", "agent"}
+
+// AnalyticsQuery selects ledger rows for time-series analytics.
+type AnalyticsQuery struct {
+	From, To time.Time
+	// Bucket is "hour" or "day" (local calendar days, DST-correct).
+	Bucket string
+	// Group is one of AnalyticsDimensions.
+	Group string
+	// Filters are exact matches on AnalyticsDimensions; a present key with ""
+	// matches rows whose column is empty.
+	Filters map[string]string
+	// TopN series are returned individually; the rest are summed into a
+	// series with Key AnalyticsOtherKey. 0 = 8.
+	TopN int
+}
+
+// AnalyticsOtherKey names the aggregate of groups outside the top N.
+const AnalyticsOtherKey = "__other__"
+
+// AnalyticsSeries is one group's time series aligned with BucketStarts.
+type AnalyticsSeries struct {
+	Key    string     `json:"key"`
+	Total  UsageRow   `json:"total"`
+	Points []UsageRow `json:"points"` // len == len(BucketStarts); Key empty
+}
+
+// AnalyticsResult answers an AnalyticsQuery. Ranking ("top") is by total
+// tokens = InputTokens + OutputTokens, ties by key.
+type AnalyticsResult struct {
+	SchemaVersion int               `json:"schema_version"`
+	From          time.Time         `json:"from"`
+	To            time.Time         `json:"to"`
+	Bucket        string            `json:"bucket"`
+	BucketStarts  []time.Time       `json:"bucket_starts"`
+	Group         string            `json:"group"`
+	Filters       map[string]string `json:"filters"`
+	Totals        UsageRow          `json:"totals"`
+	// Breakdown has every group key in range (not truncated), ranked.
+	Breakdown []UsageRow `json:"breakdown"`
+	// Series has the top N keys in rank order, then AnalyticsOtherKey if any.
+	Series []AnalyticsSeries `json:"series"`
+}
+
+// AnalyticsLedger is implemented by ledgers that support time-series analytics.
+type AnalyticsLedger interface {
+	Analytics(ctx context.Context, q AnalyticsQuery) (AnalyticsResult, error)
+}
+
 // Ledger persists request records and answers summaries.
 type Ledger interface {
 	// Record inserts r. It is idempotent on a non-empty r.ID: re-recording an

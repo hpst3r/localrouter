@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,18 +21,22 @@ type Config struct {
 	AllowNonLoopback bool   `yaml:"allow_non_loopback"`
 	// AllowedHosts are extra Host-header names/IPs accepted when
 	// allow_non_loopback is true (loopback names are always accepted).
-	AllowedHosts []string         `yaml:"allowed_hosts"`
-	TLSCertFile  string           `yaml:"tls_cert_file"`
-	TLSKeyFile   string           `yaml:"tls_key_file"`
-	DataDir      string           `yaml:"data_dir"`
-	PricingFile  string           `yaml:"pricing_file"`
-	Quota        QuotaConfig      `yaml:"quota"`
-	Policy       PolicyConfig     `yaml:"policy"`
-	Control      ControlConfig    `yaml:"control"`
-	Clients      []ClientConfig   `yaml:"clients"`
-	Accounts     []AccountConfig  `yaml:"accounts"`
-	Routes       []RouteConfig    `yaml:"routes"`
-	ClaudeLogs   ClaudeLogsConfig `yaml:"claude_logs"`
+	AllowedHosts []string `yaml:"allowed_hosts"`
+	TLSCertFile  string   `yaml:"tls_cert_file"`
+	TLSKeyFile   string   `yaml:"tls_key_file"`
+	// HostName labels usage that happens on this machine: proxied requests
+	// from clients without a host, and the local claude_logs collector.
+	// Default: the short OS hostname, lowercased.
+	HostName    string           `yaml:"host_name"`
+	DataDir     string           `yaml:"data_dir"`
+	PricingFile string           `yaml:"pricing_file"`
+	Quota       QuotaConfig      `yaml:"quota"`
+	Policy      PolicyConfig     `yaml:"policy"`
+	Control     ControlConfig    `yaml:"control"`
+	Clients     []ClientConfig   `yaml:"clients"`
+	Accounts    []AccountConfig  `yaml:"accounts"`
+	Routes      []RouteConfig    `yaml:"routes"`
+	ClaudeLogs  ClaudeLogsConfig `yaml:"claude_logs"`
 }
 
 // ClaudeLogsConfig controls ingestion of Claude Code transcript token usage.
@@ -157,6 +162,9 @@ func (c *Config) applyDefaults(baseDir string) {
 	if c.TLSCertFile != "" {
 		c.TLSCertFile = expand(c.TLSCertFile, baseDir)
 	}
+	if c.HostName == "" {
+		c.HostName = defaultHostName()
+	}
 	if c.TLSKeyFile != "" {
 		c.TLSKeyFile = expand(c.TLSKeyFile, baseDir)
 	}
@@ -201,6 +209,20 @@ func (c *Config) applyDefaults(baseDir string) {
 	}
 }
 
+var hostNameRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// defaultHostName is the short OS hostname, lowercased ("" if unknown).
+func defaultHostName() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return ""
+	}
+	if i := strings.IndexByte(h, '.'); i > 0 {
+		h = h[:i]
+	}
+	return strings.ToLower(h)
+}
+
 func absOr(p string) string {
 	if a, err := filepath.Abs(p); err == nil {
 		return a
@@ -234,6 +256,9 @@ func (c *Config) Validate() error {
 		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
 			errs = append(errs, fmt.Errorf("listen %q is not loopback; set allow_non_loopback: true to override", c.Listen))
 		}
+	}
+	if c.HostName != "" && !hostNameRE.MatchString(c.HostName) {
+		errs = append(errs, fmt.Errorf("host_name %q must match [A-Za-z0-9._-]{1,64}", c.HostName))
 	}
 	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
 		errs = append(errs, errors.New("tls_cert_file and tls_key_file must be set together"))

@@ -480,6 +480,98 @@ to LocalRouter only through the documented control API.
   to the configured LocalRouter URL. Tests with `unittest` + a stdlib
   `http.server` fake; no network.
 
+## Analytics (time series + drill-down)
+
+### Host attribution
+
+- Config `host_name` (default: short OS hostname, lowercased). Proxied
+  requests from clients without `host` and the local `claude_logs` collector
+  record `Host = host_name`. Agents record their own `host`.
+- `localrouter ledger relabel-host --from "" --to <name> [-config PATH]`
+  updates rows whose host equals `--from` (default "") to `--to` (one
+  transaction, prints count). Used once to backfill pre-attribution history.
+
+### Ledger: `Analytics(ctx, core.AnalyticsQuery) (core.AnalyticsResult, error)`
+
+- Validation: Group in core.AnalyticsDimensions; filter keys in the same set;
+  Bucket "hour"|"day"; From < To; span <= 400 days; hour buckets <= 31 days
+  (else error). TopN 0 -> 8, max 50.
+- Buckets: "hour" = UTC-aligned hours; "day" = LOCAL calendar days
+  (time.Local, DST-correct: bucket boundaries are local midnights; a 23h or
+  25h day is one bucket). BucketStarts covers [From, To) from the bucket
+  containing From to the bucket containing To-1ns.
+- One SQL query aggregates by (bucket key, group key) over
+  `started_at >= From AND started_at < To` + filters; bucketing of local days
+  happens in Go (do NOT trust SQLite localtime). Must handle 1M rows in < 1s
+  on a laptop: aggregate in SQL by hour (`started_at/3600000`), then fold
+  hours into local days in Go. Add index (started_at, host) if useful
+  (migration v4).
+- Sums use the existing overflow-safe approach (REAL/TOTAL); counts
+  (requests, unknown_usage, unpriced) per point; cost_usd per point nil if
+  the point has requests but none priced, else sum of priced; same rule as
+  Summary.
+- Rank keys by total tokens (input+output) desc, then key asc. Breakdown =
+  all keys ranked (UsageRow.Key = group value, "" allowed). Series = top N in
+  rank order, then `__other__` summing the rest (omitted if none). Every
+  series has exactly len(BucketStarts) points (zeros where empty).
+- Totals = sum over everything matched.
+
+### HTTP
+
+- `GET /control/v1/analytics?from=RFC3339&to=RFC3339|range=24h|7d|30d|90d
+  &bucket=hour|day&group=host&filter.<dim>=<value>&top=8` (auth like
+  usage). `range` is relative to now (to=now); `from`/`to` override. Default
+  range=7d, bucket=day for ranges > 48h else hour. Filter values: use
+  `filter.host=` (empty) to match empty. 400 on invalid input.
+- `GET /control/v1/analytics/dimensions?range=30d` -> `{"dimensions":
+  {"host":[{"key":..,"requests":..,"tokens":..}],...}}` distinct values per
+  dimension in range (top 50 each, ranked by tokens) for filter dropdowns.
+- `/control/v1/usage?group=` additionally accepts route, task, agent.
+
+### Widget (internal/control/static/index.html, single file, no external
+loads; CSP unchanged: inline script/style only, connect-src 'self')
+
+A polished dashboard that respects `prefers-color-scheme` (light + dark),
+system font stack, and also renders well narrow (Hermes side pane ~420px)
+and wide (browser). Sections:
+
+1. **Header**: title, last-updated, range picker (24h / 7d / 30d / 90d),
+   metric picker (tokens | cost | requests), group-by picker (host, model,
+   account, client, task, agent, class, route), key box (when auth needed).
+2. **Quota cards** (existing data, restyled): per account a card with
+   provider badge, plan, each window as a horizontal bar with remaining %,
+   reserve marker, reset countdown, admissibility chips (interactive /
+   background) and stale/error state. Provider-reported model counts (Ollama)
+   as a compact list under the account.
+3. **Stacked chart** (hand-written SVG, no libraries): stacked bars per
+   bucket for the selected metric, one color per series (stable color per
+   key across reloads via hash -> palette; `__other__` grey). Hover/focus a
+   bar segment -> tooltip with bucket, key, value, and share. Legend chips
+   toggle a series on/off. Y-axis with nice ticks and human units
+   (1.2M tokens, $3.40). Bucket labels adapt (hours vs dates).
+4. **Drill-down**: clicking a series (legend chip or bar segment) adds a
+   filter `<group>=<key>` (breadcrumb chips above the chart, each removable,
+   "All" resets) and advances group-by to the next sensible dimension
+   (host -> model -> task -> agent; model -> host; account -> model;
+   task -> model; otherwise model). Clicking a bar's bucket (x-axis label)
+   zooms the time range to that bucket (day -> hourly view of that day).
+   State is kept in the URL hash (`#range=7d&group=model&f.host=pf3llssv`) so
+   reload/back works.
+5. **Breakdown table** under the chart: the full Breakdown with columns key,
+   requests, input, cached (and % cache hit), cache write, output, cost,
+   share bar (inline CSS bar). Sortable by clicking headers. Rows clickable
+   = drill down.
+6. **Machines strip**: one compact card per host (from a host-grouped query
+   for the current range, unfiltered): tokens, cost, requests, last seen
+   (max started_at is NOT available from the API — show a 24h sparkline of
+   tokens instead from an hourly host-grouped query).
+- Accessibility: buttons are real <button>s, focus styles, chart has
+  aria-label summary and the table is the accessible equivalent.
+- Performance: at most 4 fetches per refresh; auto-refresh every 30s only
+  when the tab is visible; never re-render the chart while hovering (defer).
+- Security: all text via textContent; no innerHTML with data; key in
+  localStorage as today.
+
 ## Engineering constraints
 
 - Go 1.26, module `github.com/hpst3r/localrouter`.
