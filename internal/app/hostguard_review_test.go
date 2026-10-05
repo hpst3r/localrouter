@@ -21,7 +21,6 @@ func reviewBug(t *testing.T, msg string) {
 // names the same host but is rejected, so agents/browsers configured with an
 // absolute FQDN get 403. Fail-closed (not a rebinding bypass) but surprising.
 func TestReviewHostGuardTrailingDot(t *testing.T) {
-	reviewBug(t, "HostGuard does not normalize a trailing dot in Host / allowed_hosts")
 	h := HostGuard([]string{"Router.Tail"}, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
 	for _, host := range []string{"router.tail.", "router.tail.:8787", "localhost.:8787"} {
 		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)

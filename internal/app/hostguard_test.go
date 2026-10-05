@@ -23,6 +23,25 @@ func TestLocalHostGuard(t *testing.T) {
 	}
 }
 
+func TestHostGuardNormalization(t *testing.T) {
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
+	h := HostGuard([]string{"router.tail.", "[fe80::1%eth0]:8787", "::ffff:100.64.0.10"}, ok)
+	for host, want := range map[string]int{
+		"Router.Tail": 204, "router.tail.:8787": 204, "localhost.": 204, "100.64.0.10": 204,
+		"[::1%lo]:8787": 204, "[fe80::1]:8787": 204, "[fe80::1%25en0]": 204, "[::ffff:127.0.0.1]:8787": 204,
+		"": 403, ".": 403, ":8787": 403, "[]:8787": 403, "router.tail..": 403,
+		"127.0.0.1.": 403, "[fe80::2%eth0]": 403, "evil.example.": 403,
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Errorf("host %q: got %d want %d", host, rec.Code, want)
+		}
+	}
+}
+
 func TestHostGuardAllowed(t *testing.T) {
 	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(204) })
 	h := HostGuard([]string{"Router.Tail", "100.64.0.10", "[fd00::1]", "mesh.example:8787"}, ok)
