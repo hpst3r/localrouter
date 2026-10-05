@@ -25,6 +25,10 @@ import (
 // parsed; longer lines are skipped.
 const maxLineBytes = 8 << 20
 
+// MaxBatch is the largest slice passed to one core.BatchLedger.RecordBatch
+// call.
+const MaxBatch = 500
+
 // Defaults for Options.
 const (
 	DefaultScanInterval = time.Minute
@@ -37,6 +41,9 @@ type Options struct {
 	Dir string
 	// AccountID is the ledger account (claude_logs.account).
 	AccountID string
+	// Host is set on every produced RequestRecord.Host. The per-host agent
+	// sets it; the server-local collector leaves it "".
+	Host string
 	// StatePath is the JSON file persisting per-file offsets; empty disables
 	// persistence (every restart rescans, which is safe but slower).
 	StatePath string
@@ -53,7 +60,7 @@ type Options struct {
 type Stats struct {
 	Files    int // transcript files examined
 	Lines    int // complete lines read
-	Recorded int // final messages passed to Ledger.Record without error
+	Recorded int // final messages passed to Ledger.Record/RecordBatch without error
 	Pending  int // messages awaiting finality after the scan
 	Skipped  int // lines yielding no usage (other entry types, malformed, oversized, synthetic, zero usage)
 }
@@ -131,9 +138,12 @@ func (c *Collector) Start(ctx context.Context) {
 }
 
 // ScanOnce walks Dir for *.jsonl files, reads newly appended complete lines,
-// records messages whose usage is final, and persists offsets. A missing Dir
-// is not an error. On a ledger error the affected file's state is left
-// unchanged (it is re-read next scan) and the first such error is returned.
+// records messages whose usage is final, and persists offsets. If the ledger
+// implements core.BatchLedger, each file's final messages are sent with
+// RecordBatch in chunks of at most MaxBatch; otherwise Record is called per
+// message. A missing Dir is not an error. On a ledger error the affected
+// file's state is left unchanged (it is re-read next scan and IDs dedupe) and
+// the first such error is returned.
 func (c *Collector) ScanOnce(ctx context.Context) (Stats, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -272,15 +282,35 @@ func (c *Collector) scanFile(ctx context.Context, path, rel string, st *Stats) (
 		}
 	}
 
-	for _, r := range finals {
-		if err := c.ledger.Record(ctx, r); err != nil {
-			return false, fmt.Errorf("record: %w", err)
-		}
-		st.Recorded++
+	if err := c.record(ctx, finals, st); err != nil {
+		return false, err
 	}
 	changed = old.Size != next.Size || old.commitOffset() != next.commitOffset() || c.files[rel] == nil
 	c.files[rel] = &next
 	return changed, nil
+}
+
+// record writes finals to the ledger, batched when supported. It returns the
+// first error; the caller then keeps the file's old state.
+func (c *Collector) record(ctx context.Context, finals []core.RequestRecord, st *Stats) error {
+	if bl, ok := c.ledger.(core.BatchLedger); ok {
+		for len(finals) > 0 {
+			n := min(len(finals), MaxBatch)
+			if err := bl.RecordBatch(ctx, finals[:n]); err != nil {
+				return fmt.Errorf("record batch: %w", err)
+			}
+			st.Recorded += n
+			finals = finals[n:]
+		}
+		return nil
+	}
+	for _, r := range finals {
+		if err := c.ledger.Record(ctx, r); err != nil {
+			return fmt.Errorf("record: %w", err)
+		}
+		st.Recorded++
+	}
+	return nil
 }
 
 // readLines reads complete newline-terminated lines from f starting at off,
@@ -404,6 +434,7 @@ func (c *Collector) parse(line []byte, task string) (key string, rec core.Reques
 		Session:    e.SessionID,
 		Task:       task,
 		Agent:      agent,
+		Host:       c.opts.Host,
 	}
 	return key, rec, true
 }

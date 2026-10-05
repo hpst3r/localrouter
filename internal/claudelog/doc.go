@@ -15,6 +15,13 @@
 //
 // ScanOnce runs a single synchronous scan and returns Stats.
 //
+// Options.Host is copied to every RequestRecord.Host (the per-host agent sets
+// it; the server-local collector leaves it ""). If the ledger also implements
+// core.BatchLedger (e.g. the agent's remote ledger), each file's final
+// messages are sent via RecordBatch in chunks of at most MaxBatch, and the
+// file's offset is persisted only after every chunk succeeded; on error the
+// file is re-read next scan and IDs dedupe.
+//
 // Each API message is recorded once its usage is final, under the ID
 // "claude:" + hex(sha256(message.id + ":" + requestId))[:32], so re-ingestion
 // is idempotent given the ledger's ON CONFLICT DO NOTHING. Only token counts,
