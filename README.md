@@ -49,6 +49,49 @@ the home directory is read-only except `~/.config/localrouter`. To upgrade,
 rebuild, re-run `install`, then `systemctl --user restart localrouter`. With
 lingering enabled (`loginctl enable-linger`), it runs without a login session.
 
+## Multi-host (central router + agents)
+
+One router serves every machine on the mesh (Tailscale/NetBird). Each machine
+that runs Claude Code also runs `localrouter agent`, which pushes its Claude
+transcript usage and Claude quota to the router. Codex/Ollama logins live only
+on the router.
+
+```text
+laptop / Mac / vm1 / vm2                         router box (always on)
+  Hermes, scripts ── /v1 (own client key) ─────► localrouter serve
+  localrouter agent ─ /control/v1/ingest ──────►  ├ Codex + Ollama credentials
+    (reads ~/.claude read-only)                    ├ ledger (per-host), widget
+                                                   └ reserve gate for every host
+```
+
+Router box:
+
+```bash
+cp config.server.example.yaml ~/.config/localrouter/config.yaml   # set listen IP + allowed_hosts
+for k in laptop mac vm1 vm2 laptop-bg mac-bg; do localrouter keygen ~/.config/localrouter/keys/$k.key; done
+localrouter check && systemctl --user enable --now localrouter
+```
+
+Network mode requires `control.require_auth: true`; the widget asks for a key
+once and remembers it in the browser. Requests with a Host header that is
+not loopback or in `allowed_hosts` are refused (DNS-rebinding protection).
+
+Each host (copy that host's key from the router to `~/.config/localrouter/agent.key`, mode 0600):
+
+```bash
+cp agent.example.yaml ~/.config/localrouter/agent.yaml           # set server + host
+localrouter agent -config ~/.config/localrouter/agent.yaml --once   # test
+# Linux:
+install -Dm644 deploy/localrouter-agent.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now localrouter-agent
+# macOS: see deploy/org.wporter.localrouter-agent.plist (reads the Keychain read-only)
+```
+
+Point each host's Hermes at `http://<router>:8787/v1` with its interactive key,
+and delegation/cron at its `-bg` key. Agents buffer nothing in memory beyond a
+scan: if the router is down, they do not advance their transcript offsets and
+re-send later (records are deduplicated by ID).
+
 ## Pricing
 
 Costs are only computed for models present in `pricing.yaml` (USD per 1M tokens).
