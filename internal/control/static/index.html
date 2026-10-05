@@ -75,6 +75,9 @@ button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; b
 <h2>Models (24h)</h2>
 <div class="card"><table id="models"></table></div>
 
+<h2>By host (24h)</h2>
+<div class="card"><table id="hosts"></table></div>
+
 <h2>Provider-reported requests (weekly)</h2>
 <div class="card"><table id="provmodels"></table>
 <div class="small muted">Counts from each provider's usage API — all clients and hosts, including traffic that bypassed LocalRouter. Tokens/cost only exist for routed traffic.</div></div>
@@ -274,6 +277,19 @@ button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; b
     });
   }
 
+  function renderHosts(doc) {
+    var table = document.getElementById("hosts");
+    clear(table);
+    headerRow(table, ["host", "req", "in", "out", "cost"]);
+    var rows = (doc && doc.rows) || [];
+    if (!doc) { dataRow(table, ["unavailable", "", "", "", ""]); return; }
+    if (!rows.length) { dataRow(table, ["no requests", "", "", "", ""]); return; }
+    rows.slice().sort(function (a, b) { return (b.requests || 0) - (a.requests || 0); }).forEach(function (r) {
+      var t = total([r]);
+      dataRow(table, [r.key || "(server)", t.requests, humanTokens(t.input), humanTokens(t.output), costText(t)], r.key);
+    });
+  }
+
   function renderProviderModels(status, week) {
     var table = document.getElementById("provmodels");
     clear(table);
@@ -318,7 +334,8 @@ button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; b
       settle(api("/control/v1/usage?since=24h&group=account")),
       settle(api("/control/v1/usage?since=7d&group=account")),
       settle(api("/control/v1/usage?since=24h&group=model")),
-      settle(api("/control/v1/usage?since=7d&group=model"))
+      settle(api("/control/v1/usage?since=7d&group=model")),
+      settle(api("/control/v1/usage?since=24h&group=host"))
     ]).then(function (res) {
       var unauthorized = res.some(function (r) { return !r.ok && r.e && r.e.unauthorized; });
       showKeyPrompt(unauthorized);
@@ -330,6 +347,7 @@ button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; b
       renderTotals(res[1].ok ? res[1].v : null, res[2].ok ? res[2].v : null);
       renderModels(res[3].ok ? res[3].v : null);
       renderProviderModels(lastStatus, res[4].ok ? res[4].v : null);
+      renderHosts(res[5].ok ? res[5].v : null);
       document.getElementById("updated").textContent = res[0].ok
         ? "updated " + new Date().toLocaleTimeString()
         : (unauthorized ? "key required" : "update failed " + new Date().toLocaleTimeString());

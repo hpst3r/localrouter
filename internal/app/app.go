@@ -80,10 +80,10 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 	}
 
 	keyFiles := map[string]string{}
-	classes := map[string]core.Class{}
+	clients := map[string]core.Client{}
 	for _, c := range cfg.Clients {
 		keyFiles[c.Name] = c.KeyFile
-		classes[c.Name] = core.Class(c.Class)
+		clients[c.Name] = core.Client{Name: c.Name, Class: core.Class(c.Class), Host: c.Host, Ingest: c.Ingest}
 	}
 	clientKeys, err := auth.LoadClientKeys(keyFiles)
 	if err != nil {
@@ -94,7 +94,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		if !ok {
 			return core.Client{}, false
 		}
-		return core.Client{Name: name, Class: classes[name]}, true
+		return clients[name], true
 	}
 
 	accounts := cfg.CoreAccounts()
@@ -145,18 +145,25 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		Accounts: acctMap, Routes: routes, Creds: creds, Quota: qm, Policy: pol,
 		Ledger: led, Authenticate: authenticate, Clock: clock, Logger: logger,
 	}, proxy.Options{MaxFailovers: cfg.Policy.MaxFailovers})
-	ctl := control.New(control.Deps{
+	ctlDeps := control.Deps{
 		Accounts: accounts, Quota: qm, Policy: pol, Ledger: led, Routes: routes,
 		Authenticate: authenticate, Clock: clock,
-	}, control.Options{RequireAuth: cfg.Control.RequireAuth, StaleAfter: cfg.Policy.StaleAfter.D()})
+	}
+	if ing, ok := any(qm).(core.SnapshotIngester); ok {
+		ctlDeps.Ingester = ing
+	}
+	ctl := control.New(ctlDeps, control.Options{RequireAuth: cfg.Control.RequireAuth, StaleAfter: cfg.Policy.StaleAfter.D()})
 
 	mux := http.NewServeMux()
 	mux.Handle("/v1/", px.Handler())
 	mux.Handle("/", ctl.Handler())
-	var h http.Handler = mux
-	if !cfg.AllowNonLoopback {
-		h = LocalHostGuard(mux)
+	// The Host guard is always on; allowed_hosts only applies in network
+	// mode (config validation rejects it otherwise).
+	var allowed []string
+	if cfg.AllowNonLoopback {
+		allowed = cfg.AllowedHosts
 	}
+	h := HostGuard(allowed, mux)
 	a := &App{Handler: h, Quota: qm, Policy: pol, Ledger: led, Auth: creds}
 	if cfg.ClaudeLogs.Enabled {
 		a.ClaudeLog = claudelog.New(led, claudelog.Options{

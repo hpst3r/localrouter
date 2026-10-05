@@ -64,7 +64,7 @@ func TestSchemaHasNoContentColumns(t *testing.T) {
 		"provider", "account_id", "upstream_identity", "status", "failover_of", "input_tokens",
 		"cached_input_tokens", "output_tokens", "reasoning_tokens", "usage_known", "cost_usd",
 		"cost_basis", "latency_ms", "bytes_out", "session", "task", "agent", "error",
-		"cache_creation_input_tokens"}
+		"cache_creation_input_tokens", "host"}
 	if !reflect.DeepEqual(cols, want) {
 		t.Fatalf("columns = %v\nwant %v", cols, want)
 	}
@@ -159,7 +159,7 @@ func TestMigrateV1InPlace(t *testing.T) {
 	defer l.Close()
 	var v int
 	l.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v)
-	if v != 2 || len(migrations) != 2 {
+	if v != 3 || len(migrations) != 3 {
 		t.Fatalf("version = %d, migrations = %d", v, len(migrations))
 	}
 	var in, creation int64

@@ -8,7 +8,8 @@
 //	        func(accountID string) string { return basisByAccount[accountID] })
 //	defer l.Close()
 //	l.Record(ctx, rec)                                           // computes cost_usd/cost_basis; no-op on existing rec.ID
-//	rows, err := l.Summary(ctx, since, "account")                // account|model|class|client|route|day
+//	l.RecordBatch(ctx, recs)                                     // core.BatchLedger: one tx, <= MaxBatch, idempotent
+//	rows, err := l.Summary(ctx, since, "account")                // account|model|class|client|route|host|day
 //
 // Pricing import (`localrouter pricing import <litellm json>`):
 //

@@ -40,8 +40,16 @@ type Deps struct {
 	Policy   core.Policy
 	Ledger   core.Ledger
 	Routes   []core.Route
-	// Authenticate validates a client bearer key. Required when RequireAuth.
+	// Authenticate validates a client bearer key. Required when RequireAuth
+	// and always for POST /control/v1/ingest (which also needs Client.Ingest).
 	Authenticate func(bearer string) (core.Client, bool)
+	// Ingester stores agent-pushed quota snapshots; nil rejects snapshots
+	// with 503. Records go to Ledger (via core.BatchLedger when implemented).
+	Ingester core.SnapshotIngester
+	// IsSnapshotStale reports whether an Ingester error means "not newer than
+	// the stored snapshot" (counted as ignored, not a failure). Nil falls back
+	// to matching "stale" in the error text.
+	IsSnapshotStale func(error) bool
 	// Clock defaults to core.SystemClock.
 	Clock core.Clock
 }
@@ -80,6 +88,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /control/v1/status", s.auth(http.HandlerFunc(s.status)))
 	mux.Handle("GET /control/v1/usage", s.auth(http.HandlerFunc(s.usage)))
 	mux.Handle("POST /control/v1/admit", s.auth(http.HandlerFunc(s.admit)))
+	mux.HandleFunc("POST /control/v1/ingest", s.ingest)
 	return mux
 }
 
@@ -261,7 +270,7 @@ type usageDoc struct {
 	Rows          []core.UsageRow `json:"rows"`
 }
 
-var usageGroups = []string{"account", "model", "class", "client"}
+var usageGroups = []string{"account", "model", "class", "client", "host"}
 
 func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
@@ -279,7 +288,7 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 		group = "account"
 	}
 	if !slices.Contains(usageGroups, group) {
-		writeError(w, http.StatusBadRequest, "group must be one of account, model, class, client")
+		writeError(w, http.StatusBadRequest, "group must be one of account, model, class, client, host")
 		return
 	}
 	if s.deps.Ledger == nil {

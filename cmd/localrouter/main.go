@@ -258,9 +258,16 @@ func cmdServe(args []string) error {
 		return err
 	}
 	srv := &http.Server{Handler: a.Handler, ReadHeaderTimeout: 10 * time.Second}
-	logger.Info("localrouter listening", "addr", ln.Addr().String(), "accounts", len(cfg.Accounts), "routes", len(cfg.Routes))
+	tls := cfg.TLSCertFile != ""
+	logger.Info("localrouter listening", "addr", ln.Addr().String(), "tls", tls, "accounts", len(cfg.Accounts), "routes", len(cfg.Routes))
 	errc := make(chan error, 1)
-	go func() { errc <- srv.Serve(ln) }()
+	go func() {
+		if tls {
+			errc <- srv.ServeTLS(ln, cfg.TLSCertFile, cfg.TLSKeyFile)
+			return
+		}
+		errc <- srv.Serve(ln)
+	}()
 	select {
 	case <-ctx.Done():
 		logger.Info("shutting down; draining in-flight requests (up to 30s)")
