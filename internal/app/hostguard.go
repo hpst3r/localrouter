@@ -3,6 +3,7 @@ package app
 import (
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 )
 
@@ -13,30 +14,25 @@ func LocalHostGuard(next http.Handler) http.Handler { return HostGuard(nil, next
 
 // HostGuard rejects (403) requests whose Host header is neither a loopback
 // name nor one of allowed. Names match case-insensitively on the host part
-// (any port is ignored); IP literals are compared as IPs.
+// (any port and a single trailing dot are ignored); IP literals are compared
+// as IPs (brackets and any IPv6 zone are ignored). An empty Host is rejected.
 func HostGuard(allowed []string, next http.Handler) http.Handler {
 	names := map[string]bool{}
-	var ips []net.IP
+	ips := map[netip.Addr]bool{}
 	for _, a := range allowed {
-		h := hostPart(a)
-		if ip := net.ParseIP(h); ip != nil {
-			ips = append(ips, ip)
-		} else if h != "" {
-			names[strings.ToLower(h)] = true
+		if ip, name := parseHost(a); ip.IsValid() {
+			ips[ip] = true
+		} else if name != "" {
+			names[name] = true
 		}
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host := hostPart(r.Host)
-		ok := isLoopbackHost(host) || names[strings.ToLower(host)]
-		if !ok {
-			if ip := net.ParseIP(host); ip != nil {
-				for _, a := range ips {
-					if a.Equal(ip) {
-						ok = true
-						break
-					}
-				}
-			}
+		ip, name := parseHost(r.Host)
+		var ok bool
+		if ip.IsValid() {
+			ok = ip.IsLoopback() || ips[ip]
+		} else {
+			ok = name != "" && (name == "localhost" || names[name])
 		}
 		if !ok {
 			http.Error(w, "localrouter: forbidden host", http.StatusForbidden)
@@ -46,19 +42,19 @@ func HostGuard(allowed []string, next http.Handler) http.Handler {
 	})
 }
 
-// hostPart strips an optional port and IPv6 brackets.
-func hostPart(hostport string) string {
+// parseHost strips an optional port and IPv6 brackets from hostport. It
+// returns the IP (unmapped, zone dropped) for an IP literal, otherwise the
+// lower-cased name with one trailing dot removed (FQDN form "host." is the
+// same host). Trailing-dot stripping applies to names only, so "127.0.0.1."
+// is a name and never matches as loopback.
+func parseHost(hostport string) (netip.Addr, string) {
 	host := hostport
 	if h, _, err := net.SplitHostPort(hostport); err == nil {
 		host = h
 	}
-	return strings.Trim(host, "[]")
-}
-
-func isLoopbackHost(host string) bool {
-	if strings.EqualFold(host, "localhost") {
-		return true
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return ip.WithZone("").Unmap(), ""
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	return netip.Addr{}, strings.ToLower(strings.TrimSuffix(host, "."))
 }
