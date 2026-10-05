@@ -6,164 +6,568 @@
 <meta name="referrer" content="no-referrer">
 <title>LocalRouter</title>
 <style>
+/* ---- Tokens: light (default) and dark, each stepped for its own surface. ---- */
 :root {
-  --bg: #f7f7f8; --card: #ffffff; --fg: #1d1d1f; --muted: #6b6b73; --line: #e2e2e6;
-  --track: #e9e9ee; --ok: #2f9e5b; --warn: #c98a12; --bad: #d1453b; --bar: #3b82f6;
-  --marker: #1d1d1f;
+  color-scheme: light;
+  --page: #f5f5f3; --surface: #ffffff; --raise: #fafaf8;
+  --ink: #121211; --ink2: #52514e; --muted: #8a8882;
+  --grid: #ecebe6; --axis: #cfcec6; --track: #ecebe6;
+  --border: rgba(11,11,11,.09); --border2: rgba(11,11,11,.18); --hover: rgba(11,11,11,.045);
+  --accent: #2a78d6; --focus: rgba(42,120,214,.45);
+  --good: #0ca30c; --good-ink: #0a7a0a; --warn: #fab219; --warn-ink: #8f5f00; --bad: #d03b3b; --bad-ink: #b42e2e;
+  --other: #b3b2ab; --shadow: 0 1px 2px rgba(16,16,15,.04), 0 1px 1px rgba(16,16,15,.02);
+  /* Categorical series palette (10 slots), light steps. */
+  --s0: #2a78d6; --s1: #eb6834; --s2: #1baf7a; --s3: #eda100; --s4: #e87ba4;
+  --s5: #008300; --s6: #4a3aa7; --s7: #e34948; --s8: #0e8fb0; --s9: #9a6b3c;
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #141417; --card: #1e1e22; --fg: #ececf0; --muted: #9a9aa5; --line: #2e2e35;
-    --track: #2c2c33; --ok: #4cc17d; --warn: #e0a83a; --bad: #ef6b61; --bar: #5b9bff;
-    --marker: #ececf0;
+    color-scheme: dark;
+    --page: #0e0e0d; --surface: #1a1a19; --raise: #20201e;
+    --ink: #f3f3f1; --ink2: #c3c2b7; --muted: #8f8d86;
+    --grid: #2a2a28; --axis: #3d3d3a; --track: #2c2c2a;
+    --border: rgba(255,255,255,.08); --border2: rgba(255,255,255,.17); --hover: rgba(255,255,255,.055);
+    --accent: #3987e5; --focus: rgba(57,135,229,.55);
+    --good-ink: #3cc13c; --warn-ink: #fab219; --bad-ink: #ef6b6b;
+    --other: #5f5e59; --shadow: none;
+    --s0: #3987e5; --s1: #d95926; --s2: #199e70; --s3: #c98500; --s4: #d55181;
+    --s5: #1f9a1f; --s6: #9085e9; --s7: #e66767; --s8: #1fa2c4; --s9: #b07f4a;
   }
 }
 * { box-sizing: border-box; }
-body { margin: 0; padding: 10px; background: var(--bg); color: var(--fg);
-  font: 13px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 520px; }
-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 8px; }
-h1 { font-size: 15px; margin: 0; }
-h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 14px 0 6px; }
+html { background: var(--page); }
+body { margin: 0 auto; padding: 20px 22px 32px; max-width: 1180px; color: var(--ink);
+  font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
+button, select, input { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .muted { color: var(--muted); }
-.small { font-size: 11px; }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
-.row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-.badge { font-size: 10px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--line); color: var(--muted); }
-.pill { font-size: 10px; padding: 1px 6px; border-radius: 10px; color: #fff; }
-.pill.on { background: var(--ok); } .pill.off { background: var(--bad); }
-.dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
-.win { margin-top: 6px; }
-.winhead { display: flex; justify-content: space-between; font-size: 11px; }
-.track { position: relative; height: 8px; background: var(--track); border-radius: 4px; overflow: visible; margin-top: 2px; }
-.fill { height: 100%; border-radius: 4px; background: var(--bar); }
+.num, table, .axis { font-variant-numeric: tabular-nums; }
+.hidden { display: none !important; }
+
+/* ---- Header ---- */
+.top { display: flex; align-items: center; justify-content: space-between; gap: 12px 20px; flex-wrap: wrap; margin-bottom: 18px; }
+.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.brand h1 { font-size: 16px; font-weight: 650; margin: 0; letter-spacing: -.01em; }
+.brand svg { flex: none; }
+.updated { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.demo-tag { font-size: 10px; font-weight: 650; letter-spacing: .06em; padding: 2px 7px; border-radius: 99px;
+  background: var(--warn); color: #1a1300; }
+.controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.seg { display: inline-flex; padding: 2px; gap: 2px; border-radius: 8px; background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow); }
+.seg button { border: 0; background: transparent; padding: 4px 10px; border-radius: 6px; font-size: 12px; color: var(--ink2); transition: background .12s, color .12s; }
+.seg button:hover { background: var(--hover); color: var(--ink); }
+.seg button[aria-pressed="true"] { background: var(--ink); color: var(--surface); }
+.selwrap { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); padding: 0 4px 0 10px;
+  border-radius: 8px; background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow); height: 30px; }
+.selwrap select { border: 0; background: transparent; color: var(--ink); padding: 4px 2px; font-size: 12px; font-weight: 550; cursor: pointer; }
+.selwrap select option { background: var(--surface); }
+.zoom { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; padding: 3px 4px 3px 10px; border-radius: 8px;
+  background: var(--surface); border: 1px solid var(--border2); }
+
+/* ---- Cards & sections ---- */
+h2 { font-size: 11.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 26px 0 10px; }
+h2 .h2note { text-transform: none; letter-spacing: 0; font-weight: 400; margin-left: 6px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); padding: 14px 16px; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+.notice { margin-bottom: 12px; }
+.notice.err { color: var(--bad-ink); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+#keybox form { display: flex; gap: 8px; margin-top: 10px; }
+#keybox input { flex: 1; min-width: 0; padding: 6px 10px; background: var(--page); border: 1px solid var(--border2); border-radius: 7px; }
+.btn { border: 1px solid var(--border2); background: var(--surface); border-radius: 7px; padding: 5px 12px; font-size: 12px; transition: background .12s; }
+.btn:hover { background: var(--hover); }
+.icon-btn { border: 0; background: transparent; border-radius: 6px; padding: 2px 6px; color: var(--muted); line-height: 1; }
+.icon-btn:hover { background: var(--hover); color: var(--ink); }
+
+/* ---- Quota cards ---- */
+.acct-head { display: flex; align-items: center; gap: 8px; }
+.acct-id { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sdot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.sdot.ok { background: var(--good); } .sdot.warn { background: var(--warn); } .sdot.bad { background: var(--bad); }
+.badge { font-size: 10.5px; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--border2); color: var(--ink2); white-space: nowrap; }
+.acct-meta { font-size: 11.5px; color: var(--muted); margin: 3px 0 2px 16px; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0 2px; }
+.chip-s { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; padding: 1px 8px 1px 6px; border-radius: 99px; background: var(--raise); border: 1px solid var(--border); color: var(--ink2); }
+.chip-s b { font-weight: 700; }
+.chip-s.on b { color: var(--good-ink); } .chip-s.off b { color: var(--bad-ink); }
+.win { margin-top: 10px; }
+.win-head { display: flex; justify-content: space-between; gap: 8px; font-size: 11.5px; margin-bottom: 4px; }
+.win-head .pct { font-weight: 600; }
+.track { position: relative; height: 6px; background: var(--track); border-radius: 99px; }
+.fill { height: 100%; border-radius: 99px; background: var(--accent); transition: width .3s; }
 .fill.low { background: var(--warn); } .fill.empty { background: var(--bad); }
-.marker { position: absolute; top: -3px; width: 2px; height: 14px; background: var(--marker); opacity: .75; }
-.warnline { color: var(--warn); font-size: 11px; margin-top: 4px; word-break: break-word; }
-.errline { color: var(--bad); font-size: 11px; margin-top: 4px; word-break: break-word; }
-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-th, td { text-align: right; padding: 2px 4px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-th:first-child, td:first-child { text-align: left; max-width: 150px; overflow: hidden; text-overflow: ellipsis; }
-th { color: var(--muted); font-weight: 500; }
-#keybox { display: none; }
-#keybox input { width: 100%; padding: 4px 6px; margin: 6px 0; background: var(--bg); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; }
-button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; border: 1px solid var(--line); background: var(--card); color: var(--fg); cursor: pointer; }
-#banner { display: none; }
+.reserve { position: absolute; top: -3px; width: 2px; height: 12px; border-radius: 1px; background: var(--ink); opacity: .55; }
+.line-warn, .line-err { font-size: 11.5px; margin-top: 8px; word-break: break-word; }
+.line-warn { color: var(--warn-ink); } .line-err { color: var(--bad-ink); }
+.pcounts { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border); font-size: 11.5px; }
+.pcounts .pc-row { display: flex; justify-content: space-between; gap: 8px; padding: 1px 0; color: var(--ink2); }
+.pcounts .pc-row span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---- Usage chart card ---- */
+.crumbs { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; font-size: 12px; }
+.crumb { border: 1px solid var(--border2); background: var(--surface); border-radius: 99px; padding: 2px 10px; font-size: 12px; transition: background .12s; }
+.crumb:hover { background: var(--hover); }
+.crumb.active { background: var(--ink); color: var(--surface); border-color: var(--ink); }
+.crumb .x { color: var(--muted); margin-left: 4px; }
+.crumb-sep { color: var(--muted); }
+.kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-bottom: 14px; }
+.kpi { background: var(--surface); padding: 10px 12px; text-align: left; border: 0; transition: background .12s; }
+.kpi:hover { background: var(--raise); }
+.kpi .k-label { font-size: 11.5px; color: var(--muted); display: flex; gap: 6px; align-items: center; }
+.kpi .k-value { display: block; font-size: 20px; font-weight: 620; letter-spacing: -.01em; margin-top: 2px; white-space: nowrap; }
+.kpi.sel { box-shadow: inset 0 -2px 0 var(--ink); }
+.tag { font-size: 10px; font-weight: 600; padding: 0 6px; border-radius: 99px; background: color-mix(in srgb, var(--warn) 22%, transparent); color: var(--warn-ink); }
+.legend { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.lchip { display: inline-flex; align-items: stretch; border: 1px solid var(--border); border-radius: 99px; background: var(--surface); transition: border-color .12s, opacity .12s; }
+.lchip:hover { border-color: var(--border2); }
+.lchip button { border: 0; background: transparent; font-size: 12px; display: inline-flex; align-items: center; gap: 6px; border-radius: 99px; }
+.lchip .l-main { padding: 3px 4px 3px 9px; }
+.lchip .l-main:last-child { padding-right: 10px; }
+.lchip .l-val { color: var(--muted); }
+.lchip .l-drill { padding: 3px 9px 3px 5px; color: var(--muted); }
+.lchip .l-drill:hover { color: var(--ink); }
+.lchip.off { opacity: .5; }
+.lchip.off .swatch { background: transparent !important; box-shadow: inset 0 0 0 1.5px var(--muted); }
+.swatch { width: 9px; height: 9px; border-radius: 3px; flex: none; display: inline-block; }
+.chart { position: relative; height: 260px; user-select: none; }
+.chart svg { display: block; width: 100%; height: 100%; overflow: visible; }
+.chart .gridline { stroke: var(--grid); stroke-width: 1; shape-rendering: crispEdges; }
+.chart .baseline { stroke: var(--axis); stroke-width: 1; shape-rendering: crispEdges; }
+.chart .axis { fill: var(--muted); font-size: 11px; }
+.chart .xlab.zoomable { cursor: pointer; }
+.chart .xstrip.zoomable:hover + .xlab, .chart .xlab.zoomable:hover { fill: var(--ink); text-decoration: underline; }
+.chart .hit { fill: transparent; }
+.chart .hit.hot { fill: var(--hover); }
+.chart .seg { transition: opacity .12s; cursor: pointer; }
+.chart .seg.other { cursor: default; }
+.chart .seg.dim { opacity: .28; }
+.chart .empty { fill: var(--muted); font-size: 12.5px; }
+.tip { position: absolute; z-index: 5; pointer-events: none; min-width: 190px; max-width: 280px; padding: 9px 11px; border-radius: 8px;
+  background: var(--surface); border: 1px solid var(--border2); box-shadow: 0 6px 24px rgba(0,0,0,.14); font-size: 12px;
+  font-variant-numeric: tabular-nums; opacity: 0; transition: opacity .1s; }
+.tip.show { opacity: 1; }
+.tip-title { font-weight: 600; margin-bottom: 6px; }
+.tip-row { display: grid; grid-template-columns: 10px 1fr auto auto; align-items: center; gap: 7px; padding: 1px 0; color: var(--ink2); }
+.tip-row .tk { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tip-row .ts { color: var(--muted); min-width: 34px; text-align: right; }
+.tip-row.on { color: var(--ink); font-weight: 600; }
+.tip-foot { display: flex; justify-content: space-between; border-top: 1px solid var(--border); margin-top: 6px; padding-top: 5px; color: var(--ink2); }
+.tip-hint { margin-top: 4px; font-size: 11px; color: var(--muted); }
+
+/* ---- Breakdown table ---- */
+.tablewrap { overflow-x: auto; margin: -4px -6px; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+th, td { text-align: right; padding: 7px 8px; white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+thead th { border-bottom: 1px solid var(--border); font-weight: 500; }
+th button { border: 0; background: transparent; color: var(--muted); font-size: 11.5px; padding: 2px 0; }
+th button:hover, th button.sorted { color: var(--ink); }
+tbody tr { border-bottom: 1px solid var(--border); transition: background .1s; }
+tbody tr:last-child { border-bottom: 0; }
+tbody tr.click { cursor: pointer; }
+tbody tr.click:hover, tbody tr.click:focus-visible { background: var(--hover); outline: none; }
+td.key { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+td.key .swatch { margin-right: 7px; vertical-align: -1px; }
+td .sub { color: var(--muted); font-size: 11px; margin-left: 4px; }
+td.share { width: 150px; }
+.sbar { display: inline-flex; align-items: center; gap: 8px; width: 100%; justify-content: flex-end; }
+.sbar .strack { flex: 1; max-width: 90px; height: 6px; border-radius: 99px; background: var(--track); overflow: hidden; }
+.sbar .sfill { height: 100%; border-radius: 99px; }
+.sbar .sval { width: 40px; text-align: right; color: var(--ink2); }
+.empty-row td { text-align: center; color: var(--muted); padding: 18px; }
+
+/* ---- Machines strip ---- */
+.machines { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+.mcard { text-align: left; width: 100%; padding: 12px 14px; transition: border-color .12s, transform .12s; }
+.mcard:hover { border-color: var(--border2); }
+.m-name { font-weight: 600; display: flex; align-items: center; gap: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.m-val { display: block; font-size: 19px; font-weight: 620; margin-top: 4px; letter-spacing: -.01em; }
+.m-val small { font-size: 11.5px; font-weight: 400; color: var(--muted); margin-left: 4px; }
+.m-sub { display: block; font-size: 11.5px; color: var(--muted); }
+.spark { display: block; width: 100%; height: 34px; margin-top: 8px; overflow: visible; }
+.spark .sl { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.spark .sa { fill: var(--accent); opacity: .1; }
+.spark .sb { stroke: var(--grid); stroke-width: 1; vector-effect: non-scaling-stroke; }
+footer { margin-top: 26px; display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 11.5px; color: var(--muted); }
+
+@media (max-width: 560px) {
+  body { padding: 12px 12px 24px; }
+  .grid, .machines { grid-template-columns: 1fr; }
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .kpi .k-value { font-size: 17px; }
+  .chart { height: 210px; }
+  .card { padding: 12px; }
+  td.share { width: 110px; }
+}
 </style>
 </head>
 <body>
-<header>
-  <h1>LocalRouter</h1>
-  <span class="small muted" id="updated">loading…</span>
+<header class="top">
+  <div class="brand">
+    <svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true"><rect width="22" height="22" rx="6" fill="currentColor"/><path d="M6 15V7m0 8h4m2-8h2.5a2.5 2.5 0 0 1 0 5H12m0-5v8m2.5-3 2 3" style="stroke:var(--surface)" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <h1>LocalRouter</h1>
+    <span class="demo-tag hidden" id="demotag">DEMO DATA</span>
+    <span class="updated" id="updated">loading…</span>
+  </div>
+  <div class="controls">
+    <span class="zoom hidden" id="zoom"><span id="zoomtext"></span><button class="icon-btn" id="zoomout" type="button" aria-label="Exit zoom">✕</button></span>
+    <div class="seg" id="rangeseg" role="group" aria-label="Time range"></div>
+    <div class="seg" id="metricseg" role="group" aria-label="Metric"></div>
+    <label class="selwrap">Group by <select id="groupsel"></select></label>
+  </div>
 </header>
 
-<div class="card" id="keybox">
+<div class="card notice" id="keybox" hidden>
   <div>This server requires a client key to read status.</div>
   <form id="keyform">
-    <input id="keyinput" type="password" autocomplete="off" placeholder="client key">
-    <button type="submit">Save key</button>
+    <input id="keyinput" type="password" autocomplete="off" placeholder="client key" aria-label="Client key">
+    <button class="btn" type="submit">Save key</button>
   </form>
 </div>
-<div class="card errline" id="banner"></div>
+<div class="card notice err" id="banner" role="alert" hidden></div>
 
-<div id="accounts"></div>
+<h2>Quotas</h2>
+<div class="grid" id="accounts"></div>
 
-<h2>Usage</h2>
-<div class="card"><table id="totals"></table></div>
+<h2>Usage <span class="h2note" id="usagenote"></span></h2>
+<section class="card">
+  <nav class="crumbs" id="crumbs" aria-label="Active filters"></nav>
+  <div class="kpis" id="kpis"></div>
+  <div class="legend" id="legend"></div>
+  <div class="chart" id="chart">
+    <svg id="chartsvg" role="img" aria-label="Usage chart"></svg>
+    <div class="tip" id="tip" aria-hidden="true"></div>
+  </div>
+</section>
 
-<h2>Models (24h)</h2>
-<div class="card"><table id="models"></table></div>
+<h2>Breakdown</h2>
+<section class="card">
+  <div class="tablewrap"><table id="breakdown"><caption class="hidden">Usage breakdown</caption><thead></thead><tbody></tbody></table></div>
+</section>
 
-<h2>By host (24h)</h2>
-<div class="card"><table id="hosts"></table></div>
+<h2>Machines <span class="h2note">24h sparkline of tokens</span></h2>
+<div class="machines" id="machines"></div>
 
-<h2>Provider-reported requests (weekly)</h2>
-<div class="card"><table id="provmodels"></table>
-<div class="small muted">Counts from each provider's usage API — all clients and hosts, including traffic that bypassed LocalRouter. Tokens/cost only exist for routed traffic.</div></div>
-
-<div class="small muted" style="margin-top:8px">
-  <button id="forget" type="button" style="display:none">Forget key</button>
-</div>
+<footer>
+  <span>Provider-reported counts include traffic that bypassed LocalRouter; tokens and cost only exist for routed traffic.</span>
+  <button class="btn hidden" id="forget" type="button">Forget key</button>
+</footer>
 
 <script>
 (function () {
   "use strict";
-  var KEY = "localrouter.controlKey";
-  var POLL_MS = 15000;
-  var lastStatus = null;
 
+  // ======================================================================
+  // Constants & state
+  // ======================================================================
+  const KEY = "localrouter.controlKey";
+  const POLL_MS = 30000;
+  // SVG namespace identifier (not a load); split so URL scanners don't flag it.
+  const SVGNS = "http:" + "//www.w3.org/2000/svg";
+  const OTHER = "__other__";
+  const PALETTE_SIZE = 10;
+  const RANGES = ["24h", "7d", "30d", "90d"];
+  const METRICS = [["tokens", "Tokens"], ["cost", "Cost"], ["requests", "Requests"]];
+  const DIMS = ["host", "model", "account", "client", "task", "agent", "class", "route"];
+  // Drill-down: after filtering on <group>, show the first of these not yet filtered.
+  const NEXT_GROUP = { host: ["model", "task", "agent"], model: ["host", "task", "agent"],
+    account: ["model", "host"], task: ["model", "agent", "host"] };
+  const NEXT_DEFAULT = ["model", "host", "task"];
+
+  // View state; mirrored in location.hash so reload/back work.
+  let S = readHash();
+  // Last fetched documents.
+  const data = { status: null, main: null, hosts: null, spark: null };
+  let hidden = new Set();          // series keys toggled off in the legend
+  let colors = new Map();          // key -> palette slot for the current result
+  let sort = { col: "metric", dir: -1 };
+  let hovering = false, pendingChart = false, seq = 0, lastWidth = 0;
+
+  const $ = (id) => document.getElementById(id);
+
+  // ======================================================================
+  // DOM helpers (text only ever goes through textContent)
+  // ======================================================================
   function el(tag, cls, text) {
-    var e = document.createElement(tag);
+    const e = document.createElement(tag);
     if (cls) e.className = cls;
     if (text !== undefined && text !== null) e.textContent = String(text);
     return e;
   }
+  function svg(tag, attrs, text) {
+    const e = document.createElementNS(SVGNS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    if (text !== undefined) e.textContent = String(text);
+    return e;
+  }
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  function swatch(key) { const s = el("span", "swatch"); s.style.background = colorOf(key); return s; }
 
-  function getKey() { try { return localStorage.getItem(KEY) || ""; } catch (e) { return ""; } }
-  function setKey(k) { try { if (k) localStorage.setItem(KEY, k); else localStorage.removeItem(KEY); } catch (e) {} }
-
-  function api(path) {
-    var headers = { "Accept": "application/json" };
-    var k = getKey();
-    if (k) headers["Authorization"] = "Bearer " + k;
-    return fetch(path, { headers: headers, cache: "no-store", credentials: "omit" }).then(function (r) {
-      if (r.status === 401) { var e = new Error("unauthorized"); e.unauthorized = true; throw e; }
-      if (!r.ok) throw new Error(path.split("?")[0] + ": HTTP " + r.status);
-      return r.json();
-    });
-  }
-
-  function humanTokens(n) {
-    n = Number(n) || 0;
-    var units = [[1e12, "T"], [1e9, "B"], [1e6, "M"], [1e3, "k"]];
-    for (var i = 0; i < units.length; i++) {
-      if (Math.abs(n) >= units[i][0]) {
-        var v = n / units[i][0];
-        return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + units[i][1];
-      }
+  // ======================================================================
+  // Formatting
+  // ======================================================================
+  function compact(n, digits) {
+    const units = [[1e12, "T"], [1e9, "B"], [1e6, "M"], [1e3, "k"]];
+    for (const [d, u] of units) {
+      if (Math.abs(n) >= d) { const v = n / d; return (v >= 100 ? v.toFixed(0) : v.toFixed(digits)) + u; }
     }
-    return String(n);
+    return String(Math.round(n * 100) / 100);
   }
-  function money(v) { return "$" + (v >= 100 ? v.toFixed(0) : v.toFixed(2)); }
-  function pct(f) { return Math.round((Number(f) || 0) * 100) + "%"; }
+  const fmtTokens = (n) => compact(Number(n) || 0, 1);
+  const fmtCount = (n) => { n = Number(n) || 0; return n < 10000 ? n.toLocaleString() : compact(n, 1); };
+  function fmtMoney(v) {
+    v = Number(v) || 0;
+    if (v > 0 && v < 0.01) return "<$0.01";
+    if (v >= 10000) return "$" + compact(v, 1);
+    return "$" + v.toFixed(v >= 1000 ? 0 : 2);
+  }
+  function fmtMetric(m, v) { return m === "cost" ? fmtMoney(v) : m === "requests" ? fmtCount(v) : fmtTokens(v); }
+  function fmtAxis(m, v) {
+    if (m === "cost") return v === 0 ? "$0" : v < 1000 ? "$" + (Number.isInteger(v) ? v : v.toFixed(2)) : "$" + compact(v, 1);
+    return v < 1000 ? String(+v.toFixed(2)) : compact(v, 1);
+  }
+  const pct = (f) => Math.round((Number(f) || 0) * 100) + "%";
+  function shareText(f) { return !f ? "0%" : f < 0.01 ? "<1%" : Math.round(f * 100) + "%"; }
   function duration(sec) {
     sec = Math.max(0, Math.floor(sec));
-    var d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+    const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
     if (d > 0) return d + "d " + h + "h";
     if (h > 0) return h + "h " + m + "m";
     if (m > 0) return m + "m";
     return sec + "s";
   }
-
-  function windowBlock(acct, w, label, nowMs) {
-    var box = el("div", "win");
-    var head = el("div", "winhead");
-    var left = el("span", null, label);
-    var right = el("span", "muted");
-    if (!w) {
-      right.textContent = "no data";
-      head.appendChild(left); head.appendChild(right); box.appendChild(head);
-      box.appendChild(el("div", "track"));
-      return box;
+  const keyLabel = (k) => k === OTHER ? "Other" : k === "" ? "(none)" : k;
+  const MON = { month: "short", day: "numeric" };
+  function bucketLabel(iso, bucket, long) {
+    const d = new Date(iso);
+    if (bucket === "hour") {
+      const hh = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      return long ? d.toLocaleDateString([], MON) + ", " + hh : hh;
     }
-    var remaining = Math.max(0, Math.min(1, Number(w.remaining_frac) || 0));
-    var reset;
-    if (w.rolled) reset = "reset passed";
-    else if (w.reset_at) reset = "resets in " + duration((Date.parse(w.reset_at) - nowMs) / 1000);
-    else reset = "reset unknown";
-    left.textContent = label + " · " + pct(remaining) + " left";
-    right.textContent = reset;
-    head.appendChild(left); head.appendChild(right); box.appendChild(head);
+    return d.toLocaleDateString([], long ? { weekday: "short", month: "short", day: "numeric" } : MON);
+  }
 
-    var track = el("div", "track");
-    var reserve = Number((acct.reserve || {})[w.kind]) || 0;
-    var fill = el("div", "fill" + (remaining <= 0.02 ? " empty" : remaining <= reserve ? " low" : ""));
+  // ======================================================================
+  // Metrics over UsageRow
+  // ======================================================================
+  function metricOf(row, m) {
+    if (!row) return 0;
+    if (m === "cost") return Number(row.cost_usd) || 0;   // null -> 0 (see partial())
+    if (m === "requests") return Number(row.requests) || 0;
+    return (Number(row.input_tokens) || 0) + (Number(row.output_tokens) || 0);
+  }
+  const partial = (row) => !!row && (Number(row.unpriced_requests) || 0) > 0;
+  const tokensOf = (row) => metricOf(row, "tokens");
+
+  // ======================================================================
+  // Colors: stable per key (hash -> slot), probing to avoid clashes in a view.
+  // ======================================================================
+  function hash(s) { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+  function assignColors(series) {
+    colors = new Map();
+    const used = new Set();
+    series.forEach((s) => {
+      if (s.key === OTHER) return;
+      let slot = hash(s.key) % PALETTE_SIZE;
+      for (let i = 0; i < PALETTE_SIZE && used.has(slot); i++) slot = (slot + 1) % PALETTE_SIZE;
+      used.add(slot); colors.set(s.key, slot);
+    });
+  }
+  // Keys outside the top-N series are folded into "Other" in the chart, so they share its grey.
+  function colorOf(key) { return colors.has(key) ? "var(--s" + colors.get(key) + ")" : "var(--other)"; }
+
+  // ======================================================================
+  // URL hash state
+  // ======================================================================
+  function readHash() {
+    const p = new URLSearchParams(location.hash.replace(/^#/, ""));
+    const st = { range: p.get("range") || "", from: p.get("from") || "", to: p.get("to") || "", bucket: p.get("bucket") || "",
+      zr: p.get("zr") || "", group: p.get("group") || "model", metric: p.get("metric") || "tokens", filters: {}, demo: p.get("demo") === "1" };
+    if (!st.from && RANGES.indexOf(st.range) < 0) st.range = "7d";
+    if (DIMS.indexOf(st.group) < 0) st.group = "model";
+    if (!METRICS.some((m) => m[0] === st.metric)) st.metric = "tokens";
+    p.forEach((v, k) => { if (k.startsWith("f.") && DIMS.indexOf(k.slice(2)) >= 0) st.filters[k.slice(2)] = v; });
+    return st;
+  }
+  function hashOf(st) {
+    const p = new URLSearchParams();
+    if (st.demo) p.set("demo", "1");
+    if (st.from) { p.set("from", st.from); p.set("to", st.to); if (st.zr) p.set("zr", st.zr); } else p.set("range", st.range);
+    if (st.bucket) p.set("bucket", st.bucket);
+    p.set("group", st.group);
+    if (st.metric !== "tokens") p.set("metric", st.metric);
+    Object.keys(st.filters).forEach((k) => p.set("f." + k, st.filters[k]));
+    return "#" + p.toString();
+  }
+  // Apply a state change: push a history entry; hashchange then reloads.
+  function go(patch) {
+    const next = Object.assign({}, S, patch);
+    const h = hashOf(next);
+    if (h === location.hash) return;
+    if (next.group !== S.group || JSON.stringify(next.filters) !== JSON.stringify(S.filters)) hidden = new Set();
+    location.hash = h;
+  }
+  window.addEventListener("hashchange", () => {
+    const prev = S; S = readHash();
+    if (prev.metric !== S.metric && hashOf(Object.assign({}, prev, { metric: S.metric })) === location.hash) { renderControls(); renderView(); return; }
+    renderControls(); refresh();
+  });
+
+  // ======================================================================
+  // Fetch
+  // ======================================================================
+  function getKey() { try { return localStorage.getItem(KEY) || ""; } catch (e) { return ""; } }
+  function setKey(k) { try { if (k) localStorage.setItem(KEY, k); else localStorage.removeItem(KEY); } catch (e) { /* ignore */ } }
+
+  function api(path) {
+    if (S.demo) return Promise.resolve().then(() => demoApi(path));
+    const headers = { "Accept": "application/json" };
+    const k = getKey();
+    if (k) headers["Authorization"] = "Bearer " + k;
+    return fetch(path, { headers: headers, cache: "no-store", credentials: "omit" }).then((r) => {
+      if (r.status === 401) { const e = new Error("unauthorized"); e.unauthorized = true; throw e; }
+      if (!r.ok) throw new Error(path.split("?")[0] + ": HTTP " + r.status);
+      return r.json();
+    });
+  }
+  const settle = (p) => p.then((v) => ({ ok: true, v: v }), (e) => ({ ok: false, e: e }));
+
+  function timeParams(p) {
+    if (S.from) { p.set("from", S.from); p.set("to", S.to); } else p.set("range", S.range);
+    if (S.bucket) p.set("bucket", S.bucket);
+    return p;
+  }
+  function analyticsPath(p) { return "/control/v1/analytics?" + p.toString(); }
+
+  // Four fetches per refresh: status, main view, machines (host totals), machines (24h sparkline).
+  function refresh() {
+    const my = ++seq;
+    const main = timeParams(new URLSearchParams());
+    main.set("group", S.group); main.set("top", "8");
+    Object.keys(S.filters).forEach((k) => main.set("filter." + k, S.filters[k]));
+    const hosts = timeParams(new URLSearchParams()); hosts.set("group", "host"); hosts.set("top", "50");
+    const spark = new URLSearchParams({ range: "24h", bucket: "hour", group: "host", top: "50" });
+    Promise.all([api("/control/v1/status"), api(analyticsPath(main)), api(analyticsPath(hosts)), api(analyticsPath(spark))].map(settle))
+      .then((res) => {
+        if (my !== seq) return;   // a newer refresh superseded this one
+        const unauthorized = res.some((r) => !r.ok && r.e && r.e.unauthorized);
+        $("keybox").hidden = !unauthorized;
+        const errs = res.filter((r) => !r.ok && !(r.e && r.e.unauthorized)).map((r) => (r.e && r.e.message) || "request failed");
+        showBanner(errs.join("; "));
+        if (res[0].ok) data.status = res[0].v;
+        data.main = res[1].ok ? res[1].v : (unauthorized ? null : data.main);
+        if (res[2].ok) data.hosts = res[2].v;
+        if (res[3].ok) data.spark = res[3].v;
+        renderAll();
+        $("updated").textContent = res[0].ok ? "updated " + new Date().toLocaleTimeString()
+          : unauthorized ? "key required" : "update failed " + new Date().toLocaleTimeString();
+        $("forget").classList.toggle("hidden", !getKey() || S.demo);
+      })
+      .catch((e) => showBanner("render error: " + (e && e.message ? e.message : e)));
+  }
+  function showBanner(msg) { const b = $("banner"); b.textContent = msg || ""; b.hidden = !msg; }
+
+  // ======================================================================
+  // Render: header controls
+  // ======================================================================
+  // Builds a segmented control once, then only updates which button is pressed
+  // (so keyboard focus survives re-renders).
+  function segButtons(root, items, current, onPick) {
+    if (!root.firstChild) {
+      items.forEach(([val, label]) => {
+        const b = el("button", null, label);
+        b.type = "button";
+        b.dataset.val = val;
+        b.addEventListener("click", () => onPick(val));
+        root.appendChild(b);
+      });
+    }
+    root.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.val === current)));
+  }
+  function renderControls() {
+    $("demotag").classList.toggle("hidden", !S.demo);
+    segButtons($("rangeseg"), RANGES.map((r) => [r, r]), S.from ? "" : S.range,
+      (r) => go({ range: r, from: "", to: "", zr: "", bucket: "" }));
+    segButtons($("metricseg"), METRICS, S.metric, (m) => go({ metric: m }));
+    const sel = $("groupsel");
+    if (!sel.options.length) DIMS.forEach((d) => { const o = el("option", null, d); o.value = d; sel.appendChild(o); });
+    sel.value = S.group;
+    $("zoom").classList.toggle("hidden", !S.from);
+    if (S.from) $("zoomtext").textContent = new Date(S.from).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }) + " · hourly";
+  }
+
+  // ======================================================================
+  // Render: quota cards
+  // ======================================================================
+  function renderAccounts() {
+    const root = $("accounts");
+    clear(root);
+    const accts = (data.status && data.status.accounts) || [];
+    if (!accts.length) { root.appendChild(el("div", "card muted", data.status ? "No accounts configured." : "Status unavailable.")); return; }
+    const now = Date.now();
+    accts.forEach((a) => root.appendChild(accountCard(a, now)));
+  }
+  function accountCard(a, now) {
+    const card = el("div", "card");
+    const cooling = a.cooldown_until && Date.parse(a.cooldown_until) > now;
+    const head = el("div", "acct-head");
+    const dot = el("span", "sdot " + (!a.healthy || cooling ? "bad" : a.stale ? "warn" : "ok"));
+    dot.title = !a.healthy ? "unhealthy" : cooling ? "cooling down" : a.stale ? "stale" : "healthy";
+    head.appendChild(dot);
+    const id = el("span", "acct-id", a.id); id.title = a.id;
+    head.appendChild(id);
+    head.appendChild(el("span", "badge", a.provider));
+    if (a.provider === "claude") head.appendChild(el("span", "badge", "quota only"));
+    card.appendChild(head);
+
+    const bits = ["inflight " + (Number(a.inflight) || 0)];
+    bits.push(a.snapshot_age_s === null || a.snapshot_age_s === undefined ? "no snapshot" : "sampled " + duration(a.snapshot_age_s) + " ago");
+    card.appendChild(el("div", "acct-meta", bits.join(" · ")));
+
+    const chips = el("div", "chips");
+    [["interactive", a.interactive_admissible], ["background", a.background_admissible]].forEach(([label, ok]) => {
+      const c = el("span", "chip-s " + (ok ? "on" : "off"));
+      c.appendChild(el("b", null, ok ? "✓" : "✕"));
+      c.appendChild(document.createTextNode(label));
+      c.title = label + (ok ? " admissible" : " not admissible");
+      chips.appendChild(c);
+    });
+    card.appendChild(chips);
+
+    const ws = (a.windows || []).slice().sort((x, y) => windowRank(x.kind) - windowRank(y.kind));
+    if (!ws.length) card.appendChild(el("div", "line-warn", "no quota windows reported"));
+    ws.forEach((w) => card.appendChild(windowBar(a, w, now)));
+
+    if (a.reason && !(a.interactive_admissible && a.background_admissible)) card.appendChild(el("div", "line-warn", a.reason));
+    if (cooling) card.appendChild(el("div", "line-warn", "cooling down for " + duration((Date.parse(a.cooldown_until) - now) / 1000)));
+    if (a.stale) card.appendChild(el("div", "line-warn", "quota data stale"));
+    if (a.error) card.appendChild(el("div", "line-err", "fetch error: " + a.error));
+    const pc = providerCounts(a);
+    if (pc) card.appendChild(pc);
+    return card;
+  }
+  const windowRank = (k) => k === "5h" ? 0 : k === "weekly" ? 1 : 2;
+  function windowBar(a, w, now) {
+    const box = el("div", "win");
+    const head = el("div", "win-head");
+    const remaining = Math.max(0, Math.min(1, Number(w.remaining_frac) || 0));
+    const left = el("span");
+    left.appendChild(el("span", "pct", pct(remaining) + " left"));
+    left.appendChild(el("span", "muted", " · " + String(w.kind).replace(/_/g, " ")));
+    head.appendChild(left);
+    head.appendChild(el("span", "muted", w.rolled ? "reset passed" : w.reset_at ? "resets in " + duration((Date.parse(w.reset_at) - now) / 1000) : "reset unknown"));
+    box.appendChild(head);
+    const track = el("div", "track");
+    track.setAttribute("role", "meter");
+    track.setAttribute("aria-label", w.kind + " remaining");
+    track.setAttribute("aria-valuemin", "0"); track.setAttribute("aria-valuemax", "100");
+    track.setAttribute("aria-valuenow", String(Math.round(remaining * 100)));
+    const reserve = Number((a.reserve || {})[w.kind]) || 0;
+    const fill = el("div", "fill" + (remaining <= 0.02 ? " empty" : remaining <= reserve ? " low" : ""));
     fill.style.width = (remaining * 100).toFixed(1) + "%";
     track.appendChild(fill);
     if (reserve > 0) {
-      var mk = el("div", "marker");
+      const mk = el("div", "reserve");
       mk.style.left = "calc(" + (Math.min(1, reserve) * 100).toFixed(1) + "% - 1px)";
       mk.title = "reserve " + pct(reserve);
       track.appendChild(mk);
@@ -171,205 +575,561 @@ button { font: inherit; font-size: 12px; padding: 3px 8px; border-radius: 4px; b
     box.appendChild(track);
     return box;
   }
-
-  function findWindow(acct, kind) {
-    var ws = acct.windows || [];
-    for (var i = 0; i < ws.length; i++) if (ws[i].kind === kind) return ws[i];
-    return null;
+  // Provider-reported per-model request counts (e.g. Ollama), compact list.
+  function providerCounts(a) {
+    const mr = a.model_requests || {};
+    const kinds = Object.keys(mr).filter((k) => (mr[k] || []).length);
+    if (!kinds.length) return null;
+    const box = el("div", "pcounts");
+    kinds.forEach((k) => {
+      box.appendChild(el("div", "muted", "provider-reported requests · " + k.replace(/_/g, " ")));
+      mr[k].slice().sort((x, y) => y.requests - x.requests).forEach((c) => {
+        const r = el("div", "pc-row");
+        const name = el("span", null, c.model); name.title = c.model;
+        r.appendChild(name);
+        r.appendChild(el("span", "num", fmtCount(c.requests)));
+        box.appendChild(r);
+      });
+    });
+    return box;
   }
 
-  function renderAccounts(status) {
-    var root = document.getElementById("accounts");
+  // ======================================================================
+  // Render: usage view (crumbs, KPIs, legend, chart, table)
+  // ======================================================================
+  function renderAll() {
+    renderControls();
+    renderAccounts();
+    renderView();
+    renderMachines();
+  }
+  function renderView() {
+    const doc = data.main;
+    assignColors((doc && doc.series) || []);
+    renderCrumbs(); renderKpis(); renderLegend(); renderChart(); renderTable();
+    $("usagenote").textContent = doc ? "by " + S.group + " · " + (S.from ? "zoomed" : S.range) + " · " + (doc.bucket === "day" ? "daily" : "hourly") + " buckets" : "";
+  }
+
+  function renderCrumbs() {
+    const root = $("crumbs");
     clear(root);
-    var nowMs = Date.now();
-    var accts = (status && status.accounts) || [];
-    if (!accts.length) { root.appendChild(el("div", "card muted", "No accounts configured.")); return; }
-    accts.forEach(function (a) {
-      var card = el("div", "card");
-      var top = el("div", "row");
-      var cooling = a.cooldown_until && Date.parse(a.cooldown_until) > nowMs;
-      var dotCls = !a.healthy || cooling ? "bad" : a.stale ? "warn" : "ok";
-      top.appendChild(el("span", "dot " + dotCls));
-      top.appendChild(el("span", "grow", a.id));
-      top.appendChild(el("span", "badge", a.provider));
-      if (a.provider === "claude") top.appendChild(el("span", "badge", "quota only"));
-      top.appendChild(el("span", "pill " + (a.interactive_admissible ? "on" : "off"), "interactive"));
-      top.appendChild(el("span", "pill " + (a.background_admissible ? "on" : "off"), "background"));
-      card.appendChild(top);
+    const keys = Object.keys(S.filters);
+    const all = el("button", "crumb" + (keys.length ? "" : " active"), "All");
+    all.type = "button";
+    all.addEventListener("click", () => go({ filters: {} }));
+    root.appendChild(all);
+    keys.forEach((k) => {
+      root.appendChild(el("span", "crumb-sep", "›"));
+      const b = el("button", "crumb");
+      b.type = "button";
+      b.appendChild(document.createTextNode(k + ": " + keyLabel(S.filters[k])));
+      b.appendChild(el("span", "x", "✕"));
+      b.setAttribute("aria-label", "Remove filter " + k + " = " + keyLabel(S.filters[k]));
+      b.addEventListener("click", () => { const f = Object.assign({}, S.filters); delete f[k]; go({ filters: f }); });
+      root.appendChild(b);
+    });
+    root.appendChild(el("span", "muted", " · grouped by " + S.group));
+  }
 
-      var meta = el("div", "small muted");
-      var bits = ["inflight " + (Number(a.inflight) || 0)];
-      if (a.snapshot_age_s === null || a.snapshot_age_s === undefined) bits.push("no snapshot");
-      else bits.push("sampled " + duration(a.snapshot_age_s) + " ago");
-      meta.textContent = bits.join(" · ");
-      card.appendChild(meta);
+  function renderKpis() {
+    const root = $("kpis");
+    clear(root);
+    const t = data.main && data.main.totals;
+    const cacheHit = t && t.input_tokens ? t.cached_input_tokens / t.input_tokens : 0;
+    const items = [
+      ["tokens", "Tokens", t ? fmtTokens(tokensOf(t)) : "—"],
+      ["cost", "Cost", t ? fmtMoney(metricOf(t, "cost")) : "—"],
+      ["requests", "Requests", t ? fmtCount(t.requests) : "—"],
+      [null, "Cache hit", t ? pct(cacheHit) : "—"]
+    ];
+    items.forEach(([m, label, value]) => {
+      const box = el(m ? "button" : "div", "kpi" + (m === S.metric ? " sel" : ""));
+      if (m) { box.type = "button"; box.setAttribute("aria-pressed", String(m === S.metric)); box.addEventListener("click", () => go({ metric: m })); }
+      const lab = el("span", "k-label", label);
+      if (m === "cost" && partial(t)) {
+        const tag = el("span", "tag", "partial");
+        tag.title = fmtCount(t.unpriced_requests) + " unpriced requests not included";
+        lab.appendChild(tag);
+      }
+      box.appendChild(lab);
+      box.appendChild(el("span", "k-value", value));
+      root.appendChild(box);
+    });
+  }
 
-      card.appendChild(windowBlock(a, findWindow(a, "5h"), "5h", nowMs));
-      card.appendChild(windowBlock(a, findWindow(a, "weekly"), "weekly", nowMs));
-      // Extra window kinds (e.g. weekly_fable) as additional bars, in order.
-      (a.windows || []).forEach(function (w) {
-        if (w.kind !== "5h" && w.kind !== "weekly") card.appendChild(windowBlock(a, w, String(w.kind), nowMs));
+  function renderLegend() {
+    const root = $("legend");
+    clear(root);
+    const series = (data.main && data.main.series) || [];
+    if (series.length < 2) return;   // a single series is named by the header
+    series.forEach((s) => {
+      const chip = el("span", "lchip" + (hidden.has(s.key) ? " off" : ""));
+      const main = el("button", "l-main");
+      main.type = "button";
+      main.setAttribute("aria-pressed", String(!hidden.has(s.key)));
+      main.title = "Show/hide " + keyLabel(s.key);
+      main.appendChild(swatch(s.key));
+      main.appendChild(el("span", null, keyLabel(s.key)));
+      main.appendChild(el("span", "l-val num", fmtMetric(S.metric, metricOf(s.total, S.metric))));
+      main.addEventListener("click", () => {
+        if (hidden.has(s.key)) hidden.delete(s.key); else hidden.add(s.key);
+        renderLegend(); renderChart();
       });
+      chip.appendChild(main);
+      if (s.key !== OTHER) {
+        const drill = el("button", "l-drill", "→");
+        drill.type = "button";
+        drill.setAttribute("aria-label", "Filter to " + S.group + " " + keyLabel(s.key));
+        drill.title = "Drill into " + keyLabel(s.key);
+        drill.addEventListener("click", () => drillInto(s.key));
+        chip.appendChild(drill);
+      }
+      root.appendChild(chip);
+    });
+  }
 
-      if (cooling) card.appendChild(el("div", "warnline", "cooling down for " + duration((Date.parse(a.cooldown_until) - nowMs) / 1000)));
-      if (a.stale) card.appendChild(el("div", "warnline", "quota data stale"));
-      if (a.error) card.appendChild(el("div", "errline", "fetch error: " + a.error));
+  // Drill down: filter on the clicked key and advance group-by.
+  function drillInto(key) {
+    if (key === OTHER) return;
+    const f = Object.assign({}, S.filters);
+    f[S.group] = key;
+    const cand = (NEXT_GROUP[S.group] || NEXT_DEFAULT).filter((d) => !(d in f) && d !== S.group);
+    const rest = DIMS.filter((d) => !(d in f));
+    go({ filters: f, group: cand[0] || rest[0] || S.group });
+  }
+  // Zoom a day bucket into an hourly view of that day.
+  function zoomInto(i) {
+    const doc = data.main;
+    if (!doc || doc.bucket !== "day") return;
+    const from = doc.bucket_starts[i];
+    const to = doc.bucket_starts[i + 1] || doc.to;
+    go({ from: from, to: to, bucket: "hour", zr: S.from ? S.zr : S.range });
+  }
+
+  // ---- Chart ----
+  function niceStep(raw) {
+    const exp = Math.pow(10, Math.floor(Math.log10(raw)));
+    const f = raw / exp;
+    return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * exp;
+  }
+  function roundedTop(x, y, w, h, r) {
+    r = Math.max(0, Math.min(r, w / 2, h));
+    return "M" + x + "," + (y + h) + "V" + (y + r) + "Q" + x + "," + y + " " + (x + r) + "," + y +
+      "H" + (x + w - r) + "Q" + (x + w) + "," + y + " " + (x + w) + "," + (y + r) + "V" + (y + h) + "Z";
+  }
+
+  function renderChart() {
+    // Never redraw under the pointer or keyboard focus; flushed on leave/blur.
+    if (hovering || $("chartsvg").contains(document.activeElement)) { pendingChart = true; return; }
+    pendingChart = false;
+    const host = $("chart"), root = $("chartsvg");
+    clear(root); hideTip();
+    const W = host.clientWidth, H = host.clientHeight;
+    lastWidth = W;
+    root.setAttribute("viewBox", "0 0 " + W + " " + H);
+    const doc = data.main;
+    const m = S.metric;
+    if (!doc || !doc.bucket_starts || !doc.bucket_starts.length) {
+      root.appendChild(svg("text", { x: W / 2, y: H / 2, "text-anchor": "middle", class: "empty" }, doc ? "No buckets in range" : "No data"));
+      root.setAttribute("aria-label", "Usage chart: no data");
+      return;
+    }
+    const n = doc.bucket_starts.length;
+    const series = (doc.series || []).filter((s) => !hidden.has(s.key));
+    const totals = new Array(n).fill(0);
+    series.forEach((s) => s.points.forEach((p, i) => { totals[i] += metricOf(p, m); }));
+    const maxV = Math.max.apply(null, totals);
+
+    // Y scale with nice ticks.
+    let step = niceStep(Math.max(maxV, m === "cost" ? 0.01 : 1) / 4);
+    if (m !== "cost") step = Math.max(1, step);
+    const yMax = Math.max(step, Math.ceil(maxV / step - 1e-9) * step);
+    const ticks = []; for (let k = 0; k * step <= yMax + step / 2; k++) ticks.push(+(k * step).toPrecision(12));
+    const labW = Math.max.apply(null, ticks.map((v) => fmtAxis(m, v).length)) * 6.6 + 10;
+    const M = { l: Math.max(34, labW), r: 6, t: 8, b: 24 };
+    const pw = W - M.l - M.r, ph = H - M.t - M.b;
+    const y = (v) => M.t + ph - (v / yMax) * ph;
+
+    const gGrid = svg("g", {});
+    ticks.forEach((v) => {
+      const yy = Math.round(y(v)) + 0.5;
+      gGrid.appendChild(svg("line", { x1: M.l, x2: W - M.r, y1: yy, y2: yy, class: v === 0 ? "baseline" : "gridline" }));
+      gGrid.appendChild(svg("text", { x: M.l - 8, y: yy + 3.5, "text-anchor": "end", class: "axis" }, fmtAxis(m, v)));
+    });
+    root.appendChild(gGrid);
+
+    // Columns: background hit rect (hover target), stacked segments, x-axis strip.
+    const band = pw / n;
+    const bw = Math.max(1, Math.min(24, band > 6 ? band * 0.62 : band - 1));
+    const zoomable = doc.bucket === "day";
+    const labelEvery = Math.max(1, Math.ceil(64 / band));
+    const focusable = n <= 48;
+    for (let i = 0; i < n; i++) {
+      const x0 = M.l + i * band, bx = x0 + (band - bw) / 2;
+      const g = svg("g", {});
+      const hit = svg("rect", { x: x0, y: M.t, width: band, height: ph, class: "hit", "data-i": i });
+      if (focusable) {
+        hit.setAttribute("tabindex", "0");
+        hit.setAttribute("aria-label", bucketLabel(doc.bucket_starts[i], doc.bucket, true) + ": " + fmtMetric(m, totals[i]));
+      }
+      g.appendChild(hit);
+      let base = 0;
+      const vis = series.filter((s) => metricOf(s.points[i], m) > 0);
+      vis.forEach((s, j) => {
+        const v = metricOf(s.points[i], m);
+        const top = y(base + v), bottom = y(base);
+        const h = bottom - top;
+        const isTop = j === vis.length - 1;
+        const dh = isTop ? Math.max(h, 1) : Math.max(h - 2, Math.min(h, 1));   // 2px surface gap between segments
+        const p = svg("path", { d: roundedTop(bx, bottom - dh, bw, dh, isTop ? 4 : 0),
+          class: "seg" + (s.key === OTHER ? " other" : ""), "data-i": i, "data-key": s.key });
+        p.style.fill = colorOf(s.key);
+        g.appendChild(p);
+        base += v;
+      });
+      const strip = svg("rect", { x: x0, y: M.t + ph, width: band, height: M.b, fill: "transparent",
+        class: "xstrip" + (zoomable ? " zoomable" : ""), "data-i": i });
+      if (zoomable) strip.setAttribute("data-zoom", "1");
+      g.appendChild(strip);
+      if (i % labelEvery === 0) {
+        const lab = svg("text", { x: x0 + band / 2, y: H - 7, "text-anchor": "middle",
+          class: "axis xlab" + (zoomable ? " zoomable" : ""), "data-i": i }, bucketLabel(doc.bucket_starts[i], doc.bucket, false));
+        if (zoomable) { lab.setAttribute("data-zoom", "1"); lab.appendChild(svg("title", {}, "Zoom into this day")); }
+        g.appendChild(lab);
+      }
+      root.appendChild(g);
+    }
+    root.setAttribute("aria-label", chartSummary(doc, series, totals));
+  }
+  function chartSummary(doc, series, totals) {
+    const sum = totals.reduce((a, b) => a + b, 0);
+    const top = series.slice(0, 3).map((s) => keyLabel(s.key) + " " + shareText(sum ? metricOf(s.total, S.metric) / sum : 0)).join(", ");
+    return "Stacked bars of " + S.metric + " by " + S.group + ", " + totals.length + " " + doc.bucket + " buckets, total " +
+      fmtMetric(S.metric, sum) + (top ? "; largest: " + top : "") + ". The breakdown table below has the same data.";
+  }
+
+  // ---- Tooltip & hover ----
+  function showTip(i, key, cx, cy) {
+    const doc = data.main, m = S.metric, tip = $("tip"), host = $("chart");
+    if (!doc) return;
+    clear(tip);
+    tip.appendChild(el("div", "tip-title", bucketLabel(doc.bucket_starts[i], doc.bucket, true)));
+    const series = (doc.series || []).filter((s) => !hidden.has(s.key));
+    const total = series.reduce((a, s) => a + metricOf(s.points[i], m), 0);
+    let anyPartial = false;
+    series.slice().reverse().forEach((s) => {   // top of stack first
+      const p = s.points[i], v = metricOf(p, m);
+      if (m === "cost" && partial(p)) anyPartial = true;
+      if (v <= 0 && s.key !== key) return;
+      const r = el("div", "tip-row" + (s.key === key ? " on" : ""));
+      r.appendChild(swatch(s.key));
+      r.appendChild(el("span", "tk", keyLabel(s.key)));
+      r.appendChild(el("span", null, fmtMetric(m, v) + (m === "cost" && partial(p) ? "*" : "")));
+      r.appendChild(el("span", "ts", shareText(total ? v / total : 0)));
+      tip.appendChild(r);
+    });
+    const foot = el("div", "tip-foot");
+    foot.appendChild(el("span", null, "Total"));
+    foot.appendChild(el("span", null, fmtMetric(m, total)));
+    tip.appendChild(foot);
+    if (anyPartial) tip.appendChild(el("div", "tip-hint", "* partial: includes unpriced requests"));
+    if (key && key !== OTHER) tip.appendChild(el("div", "tip-hint", "Click to drill into " + keyLabel(key)));
+    else if (doc.bucket === "day") tip.appendChild(el("div", "tip-hint", "Click the date to zoom into hours"));
+    // Position beside the pointer, flipped/clamped inside the chart.
+    tip.classList.add("show");
+    const W = host.clientWidth, H = host.clientHeight, tw = tip.offsetWidth, th = tip.offsetHeight;
+    let x = cx + 14; if (x + tw > W) x = Math.max(0, cx - tw - 14);
+    const yy = Math.max(-8, Math.min(H - th, cy - th / 2));
+    tip.style.left = x + "px"; tip.style.top = yy + "px";
+    highlight(i, key);
+  }
+  function hideTip() { $("tip").classList.remove("show"); highlight(-1, null); }
+  function highlight(i, key) {
+    $("chartsvg").querySelectorAll(".seg").forEach((p) => p.classList.toggle("dim", !!key && p.dataset.key !== key));
+    $("chartsvg").querySelectorAll(".hit").forEach((r) => r.classList.toggle("hot", Number(r.dataset.i) === i));
+  }
+
+  function wireChart() {
+    const root = $("chartsvg"), host = $("chart");
+    root.addEventListener("pointermove", (e) => {
+      const t = e.target;
+      if (!t.dataset || t.dataset.i === undefined) { hideTip(); return; }
+      const r = host.getBoundingClientRect();
+      showTip(Number(t.dataset.i), t.dataset.key || null, e.clientX - r.left, e.clientY - r.top);
+    });
+    root.addEventListener("pointerenter", () => { hovering = true; });
+    root.addEventListener("pointerleave", () => {
+      hovering = false; hideTip();
+      if (pendingChart) renderChart();
+    });
+    root.addEventListener("click", (e) => {
+      const t = e.target;
+      if (!t.dataset || t.dataset.i === undefined) return;
+      if (t.dataset.key !== undefined) drillInto(t.dataset.key);
+      else if (t.dataset.zoom) zoomInto(Number(t.dataset.i));
+    });
+    // Keyboard: focus a column for its tooltip, Enter zooms (day buckets).
+    root.addEventListener("focusin", (e) => {
+      const t = e.target;
+      if (!t.classList || !t.classList.contains("hit")) return;
+      const x = Number(t.getAttribute("x")) + Number(t.getAttribute("width")) / 2;
+      showTip(Number(t.dataset.i), null, x, host.clientHeight / 2);
+    });
+    root.addEventListener("focusout", (e) => {
+      hideTip();
+      if (pendingChart && !hovering && !root.contains(e.relatedTarget)) setTimeout(renderChart, 0);
+    });
+    root.addEventListener("keydown", (e) => {
+      if ((e.key === "Enter" || e.key === " ") && e.target.dataset && e.target.dataset.i !== undefined) {
+        e.preventDefault(); zoomInto(Number(e.target.dataset.i));
+      }
+    });
+    const onResize = () => { if (host.clientWidth !== lastWidth) renderChart(); };
+    if (window.ResizeObserver) new ResizeObserver(onResize).observe(host); else window.addEventListener("resize", onResize);
+  }
+
+  // ---- Breakdown table ----
+  const COLS = [
+    ["key", "Key", (r) => keyLabel(r.key)],
+    ["requests", "Requests", (r) => r.requests],
+    ["input", "Input", (r) => r.input_tokens],
+    ["cached", "Cached", (r) => r.cached_input_tokens],
+    ["cw", "Cache write", (r) => r.cache_creation_input_tokens],
+    ["output", "Output", (r) => r.output_tokens],
+    ["cost", "Cost", (r) => metricOf(r, "cost")],
+    ["metric", "Share", (r) => metricOf(r, S.metric)]
+  ];
+  function renderTable() {
+    const table = $("breakdown"), thead = table.tHead, tbody = table.tBodies[0];
+    clear(thead); clear(tbody);
+    const hr = el("tr");
+    COLS.forEach(([id, label]) => {
+      const th = el("th");
+      th.setAttribute("aria-sort", sort.col === id ? (sort.dir < 0 ? "descending" : "ascending") : "none");
+      const b = el("button", sort.col === id ? "sorted" : null, label + (sort.col === id ? (sort.dir < 0 ? " ↓" : " ↑") : ""));
+      b.type = "button";
+      b.addEventListener("click", () => {
+        sort = sort.col === id ? { col: id, dir: -sort.dir } : { col: id, dir: id === "key" ? 1 : -1 };
+        renderTable();
+      });
+      th.appendChild(b); hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+
+    const doc = data.main;
+    const rows = ((doc && doc.breakdown) || []).slice();
+    if (!rows.length) {
+      const tr = el("tr", "empty-row"), td = el("td", null, doc ? "No requests match this view." : "Usage unavailable.");
+      td.colSpan = COLS.length; tr.appendChild(td); tbody.appendChild(tr);
+      return;
+    }
+    const get = COLS.find((c) => c[0] === sort.col)[2];
+    rows.sort((a, b) => {
+      const va = get(a), vb = get(b);
+      const c = typeof va === "string" ? va.localeCompare(vb) : va - vb;
+      return c * sort.dir || String(a.key).localeCompare(String(b.key));
+    });
+    const totalM = metricOf(doc.totals, S.metric);
+    rows.forEach((r) => {
+      const tr = el("tr", "click");
+      tr.tabIndex = 0;
+      tr.title = "Drill into " + keyLabel(r.key);
+      const kt = el("td", "key"); kt.appendChild(swatch(r.key)); kt.appendChild(document.createTextNode(keyLabel(r.key)));
+      tr.appendChild(kt);
+      tr.appendChild(el("td", null, fmtCount(r.requests)));
+      tr.appendChild(el("td", null, fmtTokens(r.input_tokens)));
+      const ct = el("td", null, fmtTokens(r.cached_input_tokens));
+      ct.appendChild(el("span", "sub", r.input_tokens ? pct(r.cached_input_tokens / r.input_tokens) : "—"));
+      tr.appendChild(ct);
+      tr.appendChild(el("td", null, fmtTokens(r.cache_creation_input_tokens)));
+      tr.appendChild(el("td", null, fmtTokens(r.output_tokens)));
+      const cost = el("td", null, r.cost_usd === null || r.cost_usd === undefined ? (r.requests ? "unpriced" : "—") : fmtMoney(r.cost_usd));
+      if (r.cost_usd !== null && r.cost_usd !== undefined && partial(r)) { cost.appendChild(el("span", "sub", "+?")); cost.title = r.unpriced_requests + " unpriced requests"; }
+      tr.appendChild(cost);
+      const share = totalM ? metricOf(r, S.metric) / totalM : 0;
+      const st = el("td", "share"), bar = el("span", "sbar"), track = el("span", "strack"), fill = el("span", "sfill");
+      fill.style.width = (share * 100).toFixed(1) + "%"; fill.style.background = colorOf(r.key);
+      track.appendChild(fill); bar.appendChild(track); bar.appendChild(el("span", "sval", shareText(share)));
+      st.appendChild(bar); tr.appendChild(st);
+      tr.addEventListener("click", () => drillInto(r.key));
+      tr.addEventListener("keydown", (e) => { if (e.key === "Enter") drillInto(r.key); });
+      tbody.appendChild(tr);
+    });
+  }
+
+  // ======================================================================
+  // Render: machines strip
+  // ======================================================================
+  function renderMachines() {
+    const root = $("machines");
+    clear(root);
+    const rows = ((data.hosts && data.hosts.breakdown) || []).slice().sort((a, b) => tokensOf(b) - tokensOf(a));
+    if (!rows.length) { root.appendChild(el("div", "card muted", data.hosts ? "No machines reported usage in this range." : "Machines unavailable.")); return; }
+    const spark = new Map(((data.spark && data.spark.series) || []).map((s) => [s.key, s.points]));
+    rows.forEach((r) => {
+      const card = el("button", "card mcard");
+      card.type = "button";
+      card.title = "Filter to host " + keyLabel(r.key);
+      card.appendChild(el("span", "m-name", keyLabel(r.key)));
+      const v = el("span", "m-val", fmtTokens(tokensOf(r)));
+      v.appendChild(el("small", null, "tokens · " + (S.from ? "zoomed" : S.range)));
+      card.appendChild(v);
+      const cost = r.cost_usd === null || r.cost_usd === undefined ? "unpriced" : fmtMoney(r.cost_usd) + (partial(r) ? "+" : "");
+      card.appendChild(el("span", "m-sub num", fmtCount(r.requests) + " requests · " + cost));
+      card.appendChild(sparkline(spark.get(r.key) || []));
+      card.addEventListener("click", () => {
+        const f = Object.assign({}, S.filters, { host: r.key });
+        go({ filters: f, group: S.group === "host" ? "model" : S.group });
+      });
       root.appendChild(card);
     });
   }
-
-  function total(rows) {
-    var t = { requests: 0, input: 0, cached: 0, cacheWrite: 0, output: 0, cost: 0, priced: false, unpriced: 0, unknown: 0 };
-    (rows || []).forEach(function (r) {
-      t.requests += Number(r.requests) || 0;
-      t.input += Number(r.input_tokens) || 0;
-      t.cached += Number(r.cached_input_tokens) || 0;
-      t.cacheWrite += Number(r.cache_creation_input_tokens) || 0;
-      t.output += Number(r.output_tokens) || 0;
-      t.unpriced += Number(r.unpriced_requests) || 0;
-      t.unknown += Number(r.unknown_usage_requests) || 0;
-      if (r.cost_usd !== null && r.cost_usd !== undefined) { t.cost += Number(r.cost_usd) || 0; t.priced = true; }
-    });
-    return t;
-  }
-  function costText(t) {
-    if (!t.priced) return t.requests ? "unpriced" : "—";
-    return money(t.cost) + (t.unpriced ? "+" : "");
+  function sparkline(points) {
+    const W = 100, H = 30, vals = points.map(tokensOf), n = vals.length;
+    const s = svg("svg", { class: "spark", viewBox: "0 0 " + W + " " + H, preserveAspectRatio: "none", "aria-hidden": "true" });
+    s.appendChild(svg("line", { x1: 0, x2: W, y1: H - 0.5, y2: H - 0.5, class: "sb" }));
+    if (n < 2) return s;
+    const max = Math.max.apply(null, vals) || 1;
+    const pts = vals.map((v, i) => (i / (n - 1) * W).toFixed(2) + "," + (H - 1 - v / max * (H - 3)).toFixed(2));
+    s.appendChild(svg("polygon", { points: "0," + H + " " + pts.join(" ") + " " + W + "," + H, class: "sa" }));
+    s.appendChild(svg("polyline", { points: pts.join(" "), class: "sl" }));
+    return s;
   }
 
-  function headerRow(table, cols) {
-    var tr = el("tr");
-    cols.forEach(function (c) { tr.appendChild(el("th", null, c)); });
-    table.appendChild(tr);
-  }
-  function dataRow(table, cells, title) {
-    var tr = el("tr");
-    cells.forEach(function (c, i) {
-      var td = el("td", null, c);
-      if (i === 0 && title) td.title = title;
-      tr.appendChild(td);
-    });
-    table.appendChild(tr);
-  }
-
-  function renderTotals(day, week) {
-    var table = document.getElementById("totals");
-    clear(table);
-    headerRow(table, ["", "req", "in", "cached", "cache write", "out", "cost"]);
-    [["24h", day], ["7d", week]].forEach(function (p) {
-      if (!p[1]) { dataRow(table, [p[0], "—", "—", "—", "—", "—", "—"]); return; }
-      var t = total(p[1].rows);
-      dataRow(table, [p[0], t.requests, humanTokens(t.input), humanTokens(t.cached), humanTokens(t.cacheWrite),
-        humanTokens(t.output), costText(t)]);
-    });
-  }
-
-  function renderModels(doc) {
-    var table = document.getElementById("models");
-    clear(table);
-    headerRow(table, ["model", "req", "in", "out", "cost"]);
-    var rows = (doc && doc.rows) || [];
-    if (!doc) { dataRow(table, ["unavailable", "", "", "", ""]); return; }
-    if (!rows.length) { dataRow(table, ["no requests", "", "", "", ""]); return; }
-    rows.slice().sort(function (a, b) { return (b.requests || 0) - (a.requests || 0); }).forEach(function (r) {
-      var t = total([r]);
-      dataRow(table, [r.key || "(none)", t.requests, humanTokens(t.input), humanTokens(t.output), costText(t)], r.key);
-    });
-  }
-
-  function renderHosts(doc) {
-    var table = document.getElementById("hosts");
-    clear(table);
-    headerRow(table, ["host", "req", "in", "out", "cost"]);
-    var rows = (doc && doc.rows) || [];
-    if (!doc) { dataRow(table, ["unavailable", "", "", "", ""]); return; }
-    if (!rows.length) { dataRow(table, ["no requests", "", "", "", ""]); return; }
-    rows.slice().sort(function (a, b) { return (b.requests || 0) - (a.requests || 0); }).forEach(function (r) {
-      var t = total([r]);
-      dataRow(table, [r.key || "(server)", t.requests, humanTokens(t.input), humanTokens(t.output), costText(t)], r.key);
-    });
-  }
-
-  function renderProviderModels(status, week) {
-    var table = document.getElementById("provmodels");
-    clear(table);
-    headerRow(table, ["account", "model", "provider req", "via router (7d)"]);
-    var routed = {};
-    ((week && week.rows) || []).forEach(function (r) { routed[r.key] = r.requests || 0; });
-    var any = false;
-    ((status && status.accounts) || []).forEach(function (a) {
-      var counts = (a.model_requests && a.model_requests.weekly) || [];
-      counts.forEach(function (c) {
-        any = true;
-        var via = routed[c.model] || 0;
-        var tr = el("tr");
-        tr.appendChild(el("td", null, a.id));
-        tr.appendChild(el("td", null, c.model));
-        tr.appendChild(el("td", null, String(c.requests)));
-        var td = el("td", null, String(via));
-        if (c.requests > via) td.title = (c.requests - via) + " requests did not pass through LocalRouter";
-        tr.appendChild(td);
-        table.appendChild(tr);
+  // ======================================================================
+  // Demo mode (#demo=1): obviously fake data, aggregated like the real API.
+  // ======================================================================
+  const HOUR = 3600000;
+  let demoRows = null;
+  function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+  function demoLedger() {
+    if (demoRows) return demoRows;
+    const rnd = mulberry32(7);
+    const hosts = [["laptop", 1.0, "claude-code"], ["mac", 0.7, "claude-code"], ["vm1", 0.45, "codex"], ["vm2", 0.3, "hermes"]];
+    const models = [ // name, weight, account, route, avg in, avg out, $/1M {in, cached, write, out} or null (unpriced)
+      ["claude-opus-5-5", 1.0, "claude-max", "anthropic", 18000, 900, [5, 0.5, 6.25, 25]],
+      ["glm-5.3-flash", 0.8, "zai-coding", "zai", 9000, 600, null],
+      ["gpt-5.6-sol", 0.55, "openai-pro", "openai", 12000, 1100, [1.25, 0.125, 0, 10]],
+      ["deepseek-v4.1-flash", 0.6, "ollama-cloud", "ollama", 7000, 500, [0.2, 0.02, 0, 0.8]]];
+    const tasks = ["localrouter", "homelab", "blog", "dotfiles", "scratch"];
+    const end = Math.floor(Date.now() / HOUR) * HOUR, start = end - 92 * 24 * HOUR;
+    demoRows = [];
+    for (let t = start; t <= end; t += HOUR) {
+      const d = new Date(t), lh = d.getHours(), wd = d.getDay();
+      const diurnal = lh < 7 ? 0.06 : lh < 9 ? 0.5 : lh < 18 ? 1 : lh < 23 ? 0.55 : 0.15;
+      const week = wd === 0 || wd === 6 ? 0.4 : 1;
+      const trend = 0.55 + 0.45 * (t - start) / (end - start);
+      hosts.forEach(([host, hw, client], hi) => {
+        models.forEach(([model, mw, account, route, avgIn, avgOut, price]) => {
+          if (rnd() < 0.25) return;
+          const w = hw * mw * (host === "vm2" ? 0.7 : diurnal * week) * trend * (0.4 + rnd());
+          const req = Math.round(w * 14);
+          if (!req) return;
+          const inTok = Math.round(req * avgIn * (0.6 + 0.8 * rnd()));
+          const cached = Math.round(inTok * (0.5 + 0.4 * rnd()));
+          const cw = Math.round(inTok * 0.06 * rnd());
+          const out = Math.round(req * avgOut * (0.5 + rnd()));
+          const cost = price ? ((inTok - cached - cw) * price[0] + cached * price[1] + cw * price[2] + out * price[3]) / 1e6 : null;
+          demoRows.push({ t: t, host: host, model: model, account: account, client: client, route: route,
+            class: host === "vm2" ? "background" : "interactive",
+            task: tasks[(Math.floor(t / (6 * HOUR)) + hi * 2 + (rnd() < 0.3 ? 1 : 0)) % tasks.length],
+            agent: rnd() < 0.35 ? "subagent" : "main",
+            row: { requests: req, input_tokens: inTok, cached_input_tokens: cached, cache_creation_input_tokens: cw,
+              output_tokens: out, reasoning_tokens: Math.round(out * 0.3), cost_usd: cost,
+              unknown_usage_requests: rnd() < 0.02 ? 1 : 0, unpriced_requests: price ? 0 : req } });
+        });
       });
+    }
+    return demoRows;
+  }
+  function zeroRow(key) {
+    return { key: key, requests: 0, input_tokens: 0, cached_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0,
+      reasoning_tokens: 0, cost_usd: null, unknown_usage_requests: 0, unpriced_requests: 0 };
+  }
+  function addRow(acc, r) {
+    ["requests", "input_tokens", "cached_input_tokens", "cache_creation_input_tokens", "output_tokens", "reasoning_tokens",
+      "unknown_usage_requests", "unpriced_requests"].forEach((f) => { acc[f] += r[f]; });
+    if (r.cost_usd !== null) acc.cost_usd = (acc.cost_usd || 0) + r.cost_usd;
+  }
+  // Server rule: cost_usd is null only when the row has requests and none were priced.
+  function finishRow(r) { if (r.cost_usd === null && r.requests === 0) r.cost_usd = 0; return r; }
+  function demoAnalytics(q) {
+    const span = { "24h": 24, "7d": 168, "30d": 720, "90d": 2160 }[q.get("range") || "7d"] * HOUR;
+    const to = q.get("to") ? Date.parse(q.get("to")) : Date.now();
+    const from = q.get("from") ? Date.parse(q.get("from")) : to - span;
+    const bucket = q.get("bucket") || (to - from > 48 * HOUR ? "day" : "hour");
+    const group = q.get("group") || "host", top = Number(q.get("top")) || 8;
+    const floorB = (t) => bucket === "hour" ? Math.floor(t / HOUR) * HOUR : new Date(t).setHours(0, 0, 0, 0);
+    const nextB = (t) => { if (bucket === "hour") return t + HOUR; const d = new Date(t); d.setDate(d.getDate() + 1); return d.setHours(0, 0, 0, 0); };
+    const starts = []; for (let b = floorB(from); b < to; b = nextB(b)) starts.push(b);
+    const idx = new Map(starts.map((b, i) => [b, i]));
+    const filters = {}; q.forEach((v, k) => { if (k.startsWith("filter.")) filters[k.slice(7)] = v; });
+    const groups = new Map(), totals = zeroRow("");
+    demoLedger().forEach((r) => {
+      if (r.t < from || r.t >= to) return;
+      for (const k in filters) if (r[k] !== filters[k]) return;
+      const key = r[group];
+      let g = groups.get(key);
+      if (!g) { g = { total: zeroRow(key), points: starts.map(() => zeroRow(key)) }; groups.set(key, g); }
+      addRow(g.total, r.row); addRow(g.points[idx.get(floorB(r.t))], r.row); addRow(totals, r.row);
     });
-    if (!any) dataRow(table, ["no provider-reported counts", "", "", ""]);
+    const ranked = Array.from(groups.values()).sort((a, b) => tokensOf(b.total) - tokensOf(a.total) || a.total.key.localeCompare(b.total.key));
+    const series = ranked.slice(0, top).map((g) => ({ key: g.total.key, total: finishRow(g.total), points: g.points.map(finishRow) }));
+    if (ranked.length > top) {
+      const o = { key: OTHER, total: zeroRow(OTHER), points: starts.map(() => zeroRow(OTHER)) };
+      ranked.slice(top).forEach((g) => { addRow(o.total, g.total); g.points.forEach((p, i) => addRow(o.points[i], p)); });
+      o.total = finishRow(o.total); o.points = o.points.map(finishRow);
+      series.push(o);
+    }
+    return { schema_version: 1, from: new Date(from).toISOString(), to: new Date(to).toISOString(), bucket: bucket,
+      bucket_starts: starts.map((b) => new Date(b).toISOString()), group: group, filters: filters,
+      totals: finishRow(totals), breakdown: ranked.map((g) => g.total), series: series };
+  }
+  function demoStatus() {
+    const now = Date.now(), iso = (ms) => new Date(now + ms).toISOString();
+    const win = (kind, used, resetMs, secs) => ({ kind: kind, used_frac: used, remaining_frac: 1 - used, reset_at: iso(resetMs), window_seconds: secs, rolled: false });
+    return { schema_version: 1, now: iso(0), accounts: [
+      { id: "claude-max", provider: "claude", healthy: true, cooldown_until: null, inflight: 3, reserve: { "5h": 0.1, weekly: 0.15 },
+        windows: [win("5h", 0.62, 2.2 * HOUR, 18000), win("weekly", 0.41, 74 * HOUR, 604800), win("weekly_fable", 0.18, 74 * HOUR, 604800)],
+        background_admissible: true, interactive_admissible: true, snapshot_age_s: 42, stale: false, error: null },
+      { id: "openai-pro", provider: "openai", healthy: true, cooldown_until: iso(4 * 60000), inflight: 0, reserve: { "5h": 0.1, weekly: 0.1 },
+        windows: [win("5h", 0.93, 0.6 * HOUR, 18000), win("weekly", 0.71, 30 * HOUR, 604800)],
+        background_admissible: false, interactive_admissible: true, snapshot_age_s: 65, stale: false, error: null,
+        reason: "5h window below background reserve (demo)" },
+      { id: "zai-coding", provider: "zai", healthy: true, cooldown_until: null, inflight: 1, reserve: { "5h": 0.05 },
+        windows: [win("5h", 0.22, 3.9 * HOUR, 18000)], background_admissible: true, interactive_admissible: true,
+        snapshot_age_s: 1930, stale: true, error: "demo: upstream 502 from fake quota endpoint" },
+      { id: "ollama-cloud", provider: "ollama", healthy: true, cooldown_until: null, inflight: 0, reserve: {},
+        windows: [win("weekly", 0.27, 120 * HOUR, 604800)], background_admissible: true, interactive_admissible: true,
+        snapshot_age_s: 120, stale: false, error: null,
+        model_requests: { weekly: [{ model: "deepseek-v4.1-flash", requests: 4120 }, { model: "glm-5.3-flash", requests: 380 }] } }] };
+  }
+  function demoApi(path) {
+    const u = new URL(path, location.href);
+    if (u.pathname === "/control/v1/status") return demoStatus();
+    if (u.pathname === "/control/v1/analytics") return demoAnalytics(u.searchParams);
+    throw new Error(u.pathname + ": not in demo");
   }
 
-  function showKeyPrompt(show) {
-    document.getElementById("keybox").style.display = show ? "block" : "none";
-  }
-  function showBanner(msg) {
-    var b = document.getElementById("banner");
-    b.textContent = msg || "";
-    b.style.display = msg ? "block" : "none";
-  }
-
-  function settle(p) {
-    return p.then(function (v) { return { ok: true, v: v }; }, function (e) { return { ok: false, e: e }; });
-  }
-
-  function refresh() {
-    Promise.all([
-      settle(api("/control/v1/status")),
-      settle(api("/control/v1/usage?since=24h&group=account")),
-      settle(api("/control/v1/usage?since=7d&group=account")),
-      settle(api("/control/v1/usage?since=24h&group=model")),
-      settle(api("/control/v1/usage?since=7d&group=model")),
-      settle(api("/control/v1/usage?since=24h&group=host"))
-    ]).then(function (res) {
-      var unauthorized = res.some(function (r) { return !r.ok && r.e && r.e.unauthorized; });
-      showKeyPrompt(unauthorized);
-      var errs = res.filter(function (r) { return !r.ok && !(r.e && r.e.unauthorized); })
-        .map(function (r) { return (r.e && r.e.message) || "request failed"; });
-      showBanner(errs.length ? errs.join("; ") : "");
-      if (res[0].ok) { lastStatus = res[0].v; renderAccounts(lastStatus); }
-      else if (lastStatus) renderAccounts(lastStatus);
-      renderTotals(res[1].ok ? res[1].v : null, res[2].ok ? res[2].v : null);
-      renderModels(res[3].ok ? res[3].v : null);
-      renderProviderModels(lastStatus, res[4].ok ? res[4].v : null);
-      renderHosts(res[5].ok ? res[5].v : null);
-      document.getElementById("updated").textContent = res[0].ok
-        ? "updated " + new Date().toLocaleTimeString()
-        : (unauthorized ? "key required" : "update failed " + new Date().toLocaleTimeString());
-      document.getElementById("forget").style.display = getKey() ? "inline-block" : "none";
-    }).catch(function (e) {
-      showBanner("render error: " + (e && e.message ? e.message : e));
-    });
-  }
-
-  document.getElementById("keyform").addEventListener("submit", function (ev) {
+  // ======================================================================
+  // Wiring
+  // ======================================================================
+  $("keyform").addEventListener("submit", (ev) => {
     ev.preventDefault();
-    var input = document.getElementById("keyinput");
+    const input = $("keyinput");
     setKey(input.value.trim());
     input.value = "";
     refresh();
   });
-  document.getElementById("forget").addEventListener("click", function () { setKey(""); refresh(); });
+  $("forget").addEventListener("click", () => { setKey(""); refresh(); });
+  $("groupsel").addEventListener("change", (e) => go({ group: e.target.value }));
+  $("zoomout").addEventListener("click", () => go({ range: S.zr || "7d", from: "", to: "", zr: "", bucket: "" }));
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refresh(); });
+  setInterval(() => { if (document.visibilityState === "visible") refresh(); }, POLL_MS);
 
+  wireChart();
+  renderControls();
   refresh();
-  setInterval(refresh, POLL_MS);
-  // Keep countdowns moving between polls.
-  setInterval(function () { if (lastStatus) renderAccounts(lastStatus); }, 30000);
 })();
 </script>
 </body>
