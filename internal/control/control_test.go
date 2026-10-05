@@ -499,8 +499,8 @@ func TestWidget(t *testing.T) {
 	if strings.Contains(body, "innerHTML") {
 		t.Errorf("widget must not use innerHTML")
 	}
-	for _, want := range []string{"/control/v1/status", "/control/v1/usage?since=24h&group=account", "15000", "localStorage", "prefers-color-scheme",
-		"quota only", "cache write", "cache_creation_input_tokens"} {
+	for _, want := range []string{"/control/v1/status", "/control/v1/analytics", "localStorage", "prefers-color-scheme",
+		"quota only", "Cache write", "cache_creation_input_tokens"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("widget missing %q", want)
 		}

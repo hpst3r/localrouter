@@ -314,6 +314,8 @@ var groupColumns = map[string]string{
 	"client":  "client",
 	"route":   "route",
 	"host":    "host",
+	"task":    "task",
+	"agent":   "agent",
 }
 
 // aggCols sums token columns with TOTAL() (REAL) rather than SUM(), which
