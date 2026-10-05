@@ -22,8 +22,6 @@ const (
 	maxRecordAge     = 400 * 24 * time.Hour
 	// maxTokens caps each usage field so ledger sums stay far from int64.
 	maxTokens = 1_000_000_000_000
-	// ingestClient is forced on every ingested record.
-	ingestClient = "claude-code"
 	// QuotaSourceAgent marks claude accounts whose snapshots come from agents.
 	QuotaSourceAgent = "agent"
 )
@@ -76,7 +74,7 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 			"message": "body must be a single JSON ingest request", "code": CodeInvalidRequest}})
 		return
 	}
-	if err := s.validateIngest(&req); err != nil {
+	if err := s.validateIngest(&req, client.Name); err != nil {
 		code := CodeInvalidRequest
 		var ie *ingestError
 		if errors.As(err, &ie) {
@@ -146,7 +144,9 @@ func recErr(format string, a ...any) error {
 
 // validateIngest checks req and normalizes it in place: record Host,
 // Client, Provider are overwritten and snapshot FetchedAt is capped at now.
-func (s *Server) validateIngest(req *core.IngestRequest) error {
+// client is the registered client whose key pushed the request; ingested
+// usage is attributed to it (Route/Provider still mark it as Claude Code).
+func (s *Server) validateIngest(req *core.IngestRequest, client string) error {
 	if req.SchemaVersion != 1 {
 		return reqErr("schema_version must be 1")
 	}
@@ -192,8 +192,9 @@ func (s *Server) validateIngest(req *core.IngestRequest) error {
 			return recErr("records[%d]: finished_at is before started_at", i)
 		}
 		rec.Host = req.Host
-		rec.Client = ingestClient
+		rec.Client = client
 		rec.Provider = core.ProviderClaude
+		rec.Route = "claude"
 	}
 	limit := now.Add(maxSnapshotSkew)
 	for i := range req.Snapshots {

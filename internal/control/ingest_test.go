@@ -235,7 +235,7 @@ func TestIngestOverwritesAndValidates(t *testing.T) {
 			t.Fatalf("rows %d", len(rows))
 		}
 		for id, row := range rows {
-			if row.Host != "vm1" || row.Client != "claude-code" || row.Provider != core.ProviderClaude {
+			if row.Host != "vm1" || row.Client != "agent-vm1" || row.Provider != core.ProviderClaude || row.Route != "claude" {
 				t.Fatalf("row %s not normalized: %+v", id, row)
 			}
 		}

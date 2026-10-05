@@ -185,6 +185,9 @@ td.share { width: 150px; }
 .m-val small { font-size: 11.5px; font-weight: 400; color: var(--muted); margin-left: 4px; }
 .m-sub { display: block; font-size: 11.5px; color: var(--muted); }
 .spark { display: block; width: 100%; height: 34px; margin-top: 8px; overflow: visible; }
+.mcard.idle { opacity: .55; }
+.mcard .m-tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.mcard .m-tags .badge { font-size: 10px; }
 .spark .sl { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
 .spark .sa { fill: var(--accent); opacity: .1; }
 .spark .sb { stroke: var(--grid); stroke-width: 1; vector-effect: non-scaling-stroke; }
@@ -248,6 +251,9 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
 <h2>Machines <span class="h2note">24h sparkline of tokens</span></h2>
 <div class="machines" id="machines"></div>
 
+<h2>Clients <span class="h2note">registered client keys · 24h sparkline</span></h2>
+<div class="machines" id="clients"></div>
+
 <footer>
   <span>Provider-reported counts include traffic that bypassed LocalRouter; tokens and cost only exist for routed traffic.</span>
   <button class="btn hidden" id="forget" type="button">Forget key</button>
@@ -277,7 +283,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   // View state; mirrored in location.hash so reload/back work.
   let S = readHash();
   // Last fetched documents.
-  const data = { status: null, main: null, hosts: null, spark: null };
+  const data = { status: null, main: null, hosts: null, spark: null, clients: null };
   let hidden = new Set();          // series keys toggled off in the legend
   let colors = new Map();          // key -> palette slot for the current result
   let sort = { col: "metric", dir: -1 };
@@ -405,9 +411,16 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     const h = hashOf(next);
     if (h === location.hash) return;
     if (next.group !== S.group || JSON.stringify(next.filters) !== JSON.stringify(S.filters)) hidden = new Set();
+    // A navigation is an explicit user action: the next chart render must not
+    // be deferred just because the pointer is still over the chart (it is,
+    // after clicking a bar), or the view would keep showing the old series.
+    hovering = false;
     location.hash = h;
   }
   window.addEventListener("hashchange", () => {
+    // Every navigation (click drill-down, breadcrumb, back/forward) must
+    // redraw even if the pointer is still over the chart.
+    hovering = false;
     const prev = S; S = readHash();
     if (prev.metric !== S.metric && hashOf(Object.assign({}, prev, { metric: S.metric })) === location.hash) { renderControls(); renderView(); return; }
     renderControls(); refresh();
@@ -439,7 +452,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   }
   function analyticsPath(p) { return "/control/v1/analytics?" + p.toString(); }
 
-  // Four fetches per refresh: status, main view, machines (host totals), machines (24h sparkline).
+  // Five fetches per refresh: status, main view, machines (range totals), machines (24h), clients (24h).
   function refresh() {
     const my = ++seq;
     const main = timeParams(new URLSearchParams());
@@ -447,7 +460,11 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     Object.keys(S.filters).forEach((k) => main.set("filter." + k, S.filters[k]));
     const hosts = timeParams(new URLSearchParams()); hosts.set("group", "host"); hosts.set("top", "50");
     const spark = new URLSearchParams({ range: "24h", bucket: "hour", group: "host", top: "50" });
-    Promise.all([api("/control/v1/status"), api(analyticsPath(main)), api(analyticsPath(hosts)), api(analyticsPath(spark))].map(settle))
+    const cl = new URLSearchParams({ range: "24h", bucket: "hour", group: "client", top: "50" });
+    // Machines: range totals + 24h host sparkline. Clients: 24h client series
+    // (totals for the card are the 24h sums; a client query for other ranges
+    // would exceed the fetch budget).
+    Promise.all([api("/control/v1/status"), api(analyticsPath(main)), api(analyticsPath(hosts)), api(analyticsPath(spark)), api(analyticsPath(cl))].map(settle))
       .then((res) => {
         if (my !== seq) return;   // a newer refresh superseded this one
         const unauthorized = res.some((r) => !r.ok && r.e && r.e.unauthorized);
@@ -458,6 +475,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
         data.main = res[1].ok ? res[1].v : (unauthorized ? null : data.main);
         if (res[2].ok) data.hosts = res[2].v;
         if (res[3].ok) data.spark = res[3].v;
+        if (res[4].ok) data.clients = res[4].v;
         renderAll();
         $("updated").textContent = res[0].ok ? "updated " + new Date().toLocaleTimeString()
           : unauthorized ? "key required" : "update failed " + new Date().toLocaleTimeString();
@@ -602,6 +620,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     renderAccounts();
     renderView();
     renderMachines();
+    renderClients();
   }
   function renderView() {
     const doc = data.main;
@@ -725,6 +744,9 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     const host = $("chart"), root = $("chartsvg");
     clear(root); hideTip();
     const W = host.clientWidth, H = host.clientHeight;
+    // Not laid out yet (hidden tab, first paint): retry on the next frame
+    // instead of drawing negative-width geometry.
+    if (W < 80 || H < 60) { pendingChart = true; requestAnimationFrame(() => { if (pendingChart) renderChart(); }); return; }
     lastWidth = W;
     root.setAttribute("viewBox", "0 0 " + W + " " + H);
     const doc = data.main;
@@ -984,6 +1006,47 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
       root.appendChild(card);
     });
   }
+  // Clients: every registered client (idle ones greyed), plus unregistered
+  // client names that appear in the data (e.g. "claude-code").
+  function renderClients() {
+    const root = $("clients");
+    clear(root);
+    const reg = ((data.status && data.status.clients) || []);
+    const series = new Map(((data.clients && data.clients.series) || []).map((s) => [s.key, s]));
+    const totals = new Map(((data.clients && data.clients.breakdown) || []).map((r) => [r.key, r]));
+    const names = reg.map((c) => c.name);
+    totals.forEach((_, k) => { if (k !== OTHER && !names.includes(k)) names.push(k); });
+    if (!names.length) { root.appendChild(el("div", "card muted", data.status ? "No clients configured." : "Clients unavailable.")); return; }
+    const info = new Map(reg.map((c) => [c.name, c]));
+    names.sort((a, b) => tokensOf(totals.get(b) || {}) - tokensOf(totals.get(a) || {}) || a.localeCompare(b));
+    names.forEach((name) => {
+      const r = totals.get(name), c = info.get(name);
+      const card = el("button", "card mcard" + (r && r.requests ? "" : " idle"));
+      card.type = "button";
+      card.title = "Filter to client " + keyLabel(name);
+      card.appendChild(el("span", "m-name", keyLabel(name)));
+      const tags = el("span", "m-tags");
+      if (c) {
+        tags.appendChild(el("span", "badge", c.class));
+        if (c.host) tags.appendChild(el("span", "badge", "@" + c.host));
+        if (c.ingest) tags.appendChild(el("span", "badge", "agent"));
+      } else {
+        tags.appendChild(el("span", "badge", "unregistered"));
+      }
+      card.appendChild(tags);
+      const v = el("span", "m-val", fmtTokens(r ? tokensOf(r) : 0));
+      v.appendChild(el("small", null, "tokens · 24h"));
+      card.appendChild(v);
+      const cost = !r ? "$0.00" : (r.cost_usd === null || r.cost_usd === undefined ? "unpriced" : fmtMoney(r.cost_usd) + (partial(r) ? "+" : ""));
+      card.appendChild(el("span", "m-sub num", fmtCount(r ? r.requests : 0) + " requests · " + cost));
+      card.appendChild(sparkline(series.has(name) ? series.get(name).points : []));
+      card.addEventListener("click", () => {
+        const f = Object.assign({}, S.filters, { client: name });
+        go({ filters: f, group: S.group === "client" ? "model" : S.group });
+      });
+      root.appendChild(card);
+    });
+  }
   function sparkline(points) {
     const W = 100, H = 30, vals = points.map(tokensOf), n = vals.length;
     const s = svg("svg", { class: "spark", viewBox: "0 0 " + W + " " + H, preserveAspectRatio: "none", "aria-hidden": "true" });
@@ -1102,7 +1165,12 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
       { id: "ollama-cloud", provider: "ollama", healthy: true, cooldown_until: null, inflight: 0, reserve: {},
         windows: [win("weekly", 0.27, 120 * HOUR, 604800)], background_admissible: true, interactive_admissible: true,
         snapshot_age_s: 120, stale: false, error: null,
-        model_requests: { weekly: [{ model: "deepseek-v4.1-flash", requests: 4120 }, { model: "glm-5.3-flash", requests: 380 }] } }] };
+        model_requests: { weekly: [{ model: "deepseek-v4.1-flash", requests: 4120 }, { model: "glm-5.3-flash", requests: 380 }] } }],
+      clients: [
+        { name: "claude-code", class: "interactive", host: "laptop", ingest: true },
+        { name: "codex", class: "interactive", host: "vm1", ingest: false },
+        { name: "hermes", class: "background", host: "vm2", ingest: false },
+        { name: "mac-bg", class: "background", host: "mac", ingest: false }] };
   }
   function demoApi(path) {
     const u = new URL(path, location.href);

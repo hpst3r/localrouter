@@ -167,7 +167,7 @@ func TestMHIngestAndHostUsage(t *testing.T) {
 		t.Fatalf("by host: %+v", hosts)
 	}
 	clients := e.summary(t, "client")
-	if clients["claude-code"].Requests != 1 || clients["x"].Requests != 0 {
+	if clients["vm1"].Requests != 1 || clients["claude-code"].Requests != 0 {
 		t.Fatalf("by client: %+v", clients)
 	}
 	code, out = e.do(t, "GET", "/control/v1/usage?group=host", "router.tail", e.laptopKey, "")

@@ -40,6 +40,8 @@ type Deps struct {
 	Policy   core.Policy
 	Ledger   core.Ledger
 	Routes   []core.Route
+	// Clients are the registered clients in config order (status only).
+	Clients []ClientInfo
 	// Authenticate validates a client bearer key. Required when RequireAuth
 	// and always for POST /control/v1/ingest (which also needs Client.Ingest).
 	Authenticate func(bearer string) (core.Client, bool)
@@ -143,6 +145,17 @@ type statusDoc struct {
 	SchemaVersion int             `json:"schema_version"`
 	Now           time.Time       `json:"now"`
 	Accounts      []accountStatus `json:"accounts"`
+	// Clients lists every registered client (never key material) so the
+	// dashboard can show per-client analytics including unused clients.
+	Clients []ClientInfo `json:"clients"`
+}
+
+// ClientInfo describes a registered client for the status document.
+type ClientInfo struct {
+	Name   string `json:"name"`
+	Class  string `json:"class"`
+	Host   string `json:"host,omitempty"`
+	Ingest bool   `json:"ingest"`
 }
 
 type accountStatus struct {
@@ -177,7 +190,8 @@ type windowStatus struct {
 
 func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 	now := s.deps.Clock.Now()
-	doc := statusDoc{SchemaVersion: SchemaVersion, Now: now.UTC(), Accounts: make([]accountStatus, 0, len(s.deps.Accounts))}
+	doc := statusDoc{SchemaVersion: SchemaVersion, Now: now.UTC(), Accounts: make([]accountStatus, 0, len(s.deps.Accounts)),
+		Clients: append([]ClientInfo{}, s.deps.Clients...)}
 	for _, a := range s.deps.Accounts {
 		doc.Accounts = append(doc.Accounts, s.accountStatus(a, now))
 	}

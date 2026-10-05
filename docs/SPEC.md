@@ -567,7 +567,7 @@ and wide (browser). Sections:
    tokens instead from an hourly host-grouped query).
 - Accessibility: buttons are real <button>s, focus styles, chart has
   aria-label summary and the table is the accessible equivalent.
-- Performance: at most 4 fetches per refresh; auto-refresh every 30s only
+- Performance: at most 5 fetches per refresh (status, view, host totals, host 24h, client 24h); auto-refresh every 30s only
   when the tab is visible; never re-render the chart while hovering (defer).
 - Security: all text via textContent; no innerHTML with data; key in
   localStorage as today.

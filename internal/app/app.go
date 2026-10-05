@@ -154,6 +154,9 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		Accounts: accounts, Quota: qm, Policy: pol, Ledger: led, Routes: routes,
 		Authenticate: authenticate, Clock: clock,
 	}
+	for _, c := range cfg.Clients {
+		ctlDeps.Clients = append(ctlDeps.Clients, control.ClientInfo{Name: c.Name, Class: c.Class, Host: clients[c.Name].Host, Ingest: c.Ingest})
+	}
 	if ing, ok := any(qm).(core.SnapshotIngester); ok {
 		ctlDeps.Ingester = ing
 		ctlDeps.IsSnapshotStale = func(err error) bool { return errors.Is(err, quota.ErrSnapshotStale) }
