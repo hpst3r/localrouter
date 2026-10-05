@@ -35,6 +35,7 @@ Usage:
   localrouter check   [-config PATH]
   localrouter admit   [--class background] (--account ID | --model NAME) [--url URL] [--json]
                       exit 0 = allow, 1 = deny, 2 = error
+  localrouter agent   [-config ~/.config/localrouter/agent.yaml] [--once]
 
 Default config: ~/.config/localrouter/config.yaml
 `
@@ -58,6 +59,8 @@ func main() {
 		err = cmdCheck(os.Args[2:])
 	case "admit":
 		err = cmdAdmit(os.Args[2:])
+	case "agent":
+		err = cmdAgent(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return
