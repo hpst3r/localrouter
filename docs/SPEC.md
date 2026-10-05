@@ -411,6 +411,9 @@ credentials:                         # how to read the Claude Code token (read-o
   source: auto        # auto | file | keychain
   file: ~/.claude/.credentials.json  # default
   keychain_service: "Claude Code-credentials"  # macOS; default
+  # keychain_account: defaults to $USER (Claude Code uses `-a $USER`; an
+  # invalid username maps to "claude-code-user"). With CLAUDE_CONFIG_DIR set,
+  # Claude Code appends "-<sha256(dir)[:8]>" to the service name.
 push_interval: 1m                    # default
 quota_interval: 5m                   # default; 0 disables quota push
 state_dir: ~/.local/state/localrouter-agent   # default (darwin: ~/Library/Application Support/localrouter-agent)
@@ -428,8 +431,9 @@ state_dir: ~/.local/state/localrouter-agent   # default (darwin: ~/Library/Appli
   subscriptionType, accountID, now) (core.Snapshot, error)`), then push it.
   Token expired -> push nothing (server keeps last snapshot, which goes stale).
 - Credentials source `auto`: on darwin try keychain then file; elsewhere file.
-  Keychain read = `security find-generic-password -s <service> -w` (stdout is
-  the same JSON as the file). Never write; never print the token; errors are
+  Keychain read = `security find-generic-password -a <account> -s <service> -w`
+  (account default $USER, matching Claude Code; stdout is the same JSON as
+  the file). Never write; never print the token; errors are
   sanitized.
 - Exponential backoff (cap 5m) on server errors; logs never contain tokens,
   prompts, or file paths beyond the project dir name.

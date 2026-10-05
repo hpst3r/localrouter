@@ -1,0 +1,15 @@
+# LocalRouter AGENT example. Copy to ~/.config/localrouter/agent.yaml on each
+# host that runs Claude Code (laptop, Mac, worker VMs). Run: localrouter agent
+server: http://100.64.0.10:8787       # central router (mesh)
+host: laptop                          # this machine's name in reports
+key_file: ~/.config/localrouter/agent.key   # a server client key with ingest: true
+account: claude-max                   # claude account id on the server
+
+# claude_projects_dir: ~/.claude/projects
+credentials:
+  source: auto                        # auto: macOS Keychain then file; Linux: file
+  # file: ~/.claude/.credentials.json
+  # keychain_service: "Claude Code-credentials"
+
+# push_interval: 1m
+# quota_interval: 5m                  # 0 disables quota push from this host

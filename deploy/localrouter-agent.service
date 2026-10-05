@@ -1,0 +1,32 @@
+[Unit]
+Description=LocalRouter agent - push Claude Code usage + quota to the central router
+Documentation=file://%h/projects/localrouter/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p %h/.local/state/localrouter-agent
+ExecStart=%h/.local/bin/localrouter agent -config %h/.config/localrouter/agent.yaml
+Restart=on-failure
+RestartSec=10
+Nice=10
+StandardOutput=journal
+StandardError=journal
+
+# Reads Claude transcripts/credentials read-only; writes only its state dir.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-%h/.local/state/localrouter-agent
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+UMask=0077
+
+[Install]
+WantedBy=default.target

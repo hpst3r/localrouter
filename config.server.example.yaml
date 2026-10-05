@@ -1,0 +1,63 @@
+# LocalRouter CENTRAL SERVER example (multi-host). Copy to
+# ~/.config/localrouter/config.yaml on the always-on router box.
+# Every host runs `localrouter agent` (see agent.example.yaml) for Claude Code
+# usage + quota, and points its Hermes/clients at http://<router>:8787/v1.
+
+listen: 100.64.0.10:8787          # mesh IP (Tailscale/NetBird); never a public IP
+allow_non_loopback: true
+allowed_hosts: [router, router.tail.example.ts.net, 100.64.0.10]   # Host headers accepted
+# tls_cert_file: tls/cert.pem     # optional; WireGuard already encrypts mesh traffic
+# tls_key_file: tls/key.pem
+data_dir: ~/.config/localrouter
+
+control:
+  require_auth: true              # mandatory in network mode
+
+quota:
+  poll_interval: 5m
+
+policy:
+  stale_after: 10m
+  safety_margin: 0.02
+  inflight_estimate: 0.01
+  max_failovers: 2
+
+clients:
+  # Interactive (people at keyboards)
+  - { name: laptop,    class: interactive, host: laptop, key_file: keys/laptop.key, ingest: true }
+  - { name: mac,       class: interactive, host: mac,    key_file: keys/mac.key,    ingest: true }
+  # Background (worker VMs, subagents, cron)
+  - { name: vm1,       class: background,  host: vm1,    key_file: keys/vm1.key,    ingest: true }
+  - { name: vm2,       class: background,  host: vm2,    key_file: keys/vm2.key,    ingest: true }
+  - { name: laptop-bg, class: background,  host: laptop, key_file: keys/laptop-bg.key }
+  - { name: mac-bg,    class: background,  host: mac,    key_file: keys/mac-bg.key }
+
+accounts:
+  - id: codex-primary
+    provider: codex
+    reserve: { 5h: 0.10, weekly: 0.10 }
+  - id: codex-secondary
+    provider: codex
+    reserve: {}
+  - id: claude-max
+    provider: claude
+    quota_source: agent           # server never reads Claude creds; agents push snapshots
+    reserve: { 5h: 0.10, weekly: 0.10 }
+  - id: ollama-cloud
+    provider: ollama
+    base_url: https://ollama.com/v1
+    api_key_file: keys/ollama.key
+    reserve: { 5h: 0.10, weekly: 0.10 }
+
+routes:
+  - name: gpt
+    models: [gpt-5.6-sol, gpt-5.6-luna]
+    interactive: [codex-primary, codex-secondary]
+    background:  [codex-secondary, codex-primary]
+  - name: ollama
+    models: [deepseek-v4.1-flash, deepseek-v4-pro:0813, kimi-k3, kimi-k2.7-code, glm-5.3, glm-5.3-flash, gpt-oss:120b, gpt-oss:20b, minimax-m3]
+    interactive: [ollama-cloud]
+    background:  [ollama-cloud]
+
+claude_logs:
+  enabled: false                  # the server box doesn't run Claude Code; agents push usage
