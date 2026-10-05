@@ -195,7 +195,7 @@ func (p *Policy) admitLocked(acct core.Account, class core.Class, now time.Time)
 		// A fully exhausted (unrolled) window refuses every class: the
 		// upstream will 429, so admitting only burns a failover attempt.
 		if used >= exhaustedFrac {
-			return false, fmt.Sprintf("%s window exhausted (used %.2f)", w.Kind, used)
+			return false, fmt.Sprintf("%s window exhausted (0%% left)", w.Kind)
 		}
 		floor := 0.0
 		if background {
@@ -203,11 +203,13 @@ func (p *Policy) admitLocked(acct core.Account, class core.Class, now time.Time)
 		}
 		limit := 1 - floor - margin - load
 		if used > limit+epsilon {
-			what := "interactive limit"
+			left := pct(1 - used)
 			if background {
-				what = "background reserve"
+				// e.g. "5h: 8% left; background stops at 12% (reserve 10% + margin 2%)"
+				return false, fmt.Sprintf("%s: %s left; background stops at %s (reserve %s + margin %s + in-flight %s)",
+					w.Kind, left, pct(1-limit), pct(floor), pct(margin), pct(load))
 			}
-			return false, fmt.Sprintf("%s %s (used %.2f > %.2f)", what, w.Kind, used, limit)
+			return false, fmt.Sprintf("%s: %s left; interactive stops at %s (in-flight %s)", w.Kind, left, pct(1-limit), pct(load))
 		}
 	}
 	return true, ""
