@@ -10,6 +10,8 @@
 //	l.Record(ctx, rec)                                           // computes cost_usd/cost_basis; no-op on existing rec.ID
 //	l.RecordBatch(ctx, recs)                                     // core.BatchLedger: one tx, <= MaxBatch, idempotent
 //	rows, err := l.Summary(ctx, since, "account")                // account|model|class|client|route|host|day
+//	res, err := l.Analytics(ctx, core.AnalyticsQuery{...})       // core.AnalyticsLedger; validation errors start "analytics: "
+//	n, err := l.RelabelHost(ctx, "", cfg.HostName)               // `ledger relabel-host`; validation errors start "relabel: "
 //
 // Pricing import (`localrouter pricing import <litellm json>`):
 //
