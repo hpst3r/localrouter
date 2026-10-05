@@ -33,6 +33,7 @@ Usage:
   localrouter pricing import [-config PATH] <litellm-prices.json>
   localrouter pricing reprice [-config PATH]
   localrouter check   [-config PATH]
+  localrouter ledger relabel-host [--from ""] --to NAME [-config PATH]
   localrouter admit   [--class background] (--account ID | --model NAME) [--url URL] [--json]
                       exit 0 = allow, 1 = deny, 2 = error
   localrouter agent   [-config ~/.config/localrouter/agent.yaml] [--once]
@@ -55,6 +56,8 @@ func main() {
 		err = cmdKeygen(os.Args[2:])
 	case "pricing":
 		err = cmdPricing(os.Args[2:])
+	case "ledger":
+		err = cmdLedger(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
 	case "admit":
