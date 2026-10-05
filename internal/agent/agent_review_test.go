@@ -57,7 +57,6 @@ func (l *memBatchLedger) Close() error { return nil }
 // skip. Expected: permanent 4xx rejections are isolated (e.g. drop/skip the
 // offending record client-side, or have ingest report per-record rejects).
 func TestReviewPoisonRecordStallsFile(t *testing.T) {
-	reviewBug(t, "a single record rejected with 400 stalls its transcript forever (infinite retry, later usage never sent)")
 	led := &memBatchLedger{rows: map[string]core.RequestRecord{}}
 	h := control.New(control.Deps{
 		Accounts: []core.Account{{ID: "claude-max", Provider: core.ProviderClaude, QuotaSource: "agent"}},

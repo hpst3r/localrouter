@@ -20,7 +20,12 @@
 // core.BatchLedger (e.g. the agent's remote ledger), each file's final
 // messages are sent via RecordBatch in chunks of at most MaxBatch, and the
 // file's offset is persisted only after every chunk succeeded; on error the
-// file is re-read next scan and IDs dedupe.
+// file is re-read next scan and IDs dedupe. An error implementing
+// PermanentError with Permanent() == true (e.g. *agent.HTTPError for
+// 400/413/422) instead bisects the chunk, records the accepted records, and
+// drops only the rejected ones (Stats.Dropped), so the file still advances.
+// Lines the server would reject (negative or >1e12 usage, no timestamp) are
+// skipped at parse time.
 //
 // Each API message is recorded once its usage is final, under the ID
 // "claude:" + hex(sha256(message.id + ":" + requestId))[:32], so re-ingestion

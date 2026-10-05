@@ -27,7 +27,6 @@ func reviewBug(t *testing.T, msg string) {
 // "path" outright). An unreadable transcript leaks /home/<user>/... and the
 // session file name into agent and server logs.
 func TestReviewScanErrorLogsNoPath(t *testing.T) {
-	reviewBug(t, "scan-file / walk warnings log the full transcript path via err / path attrs")
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores file permissions")
 	}
@@ -63,7 +62,6 @@ func TestReviewScanErrorLogsNoPath(t *testing.T) {
 // validation rejects with 400 — permanently, see agent
 // TestReviewPoisonRecordStallsFile.
 func TestReviewParseRejectsNegativeUsage(t *testing.T) {
-	reviewBug(t, "parse emits records with negative usage; ingest 400s them forever")
 	e := newEnv(t)
 	e.write(t, "p/s.jsonl", line("m1", "r1", -5), t0.Add(-time.Hour))
 	st := e.scan(t, e.collector(t))
