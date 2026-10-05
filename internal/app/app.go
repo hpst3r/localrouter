@@ -176,6 +176,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 			Dir:          cfg.ClaudeLogs.Dir,
 			AccountID:    cfg.ClaudeLogs.Account,
 			Host:         cfg.HostName,
+			Client:       cfg.ClaudeLogs.Client,
 			StatePath:    filepath.Join(cfg.DataDir, "claudelog-state.json"),
 			ScanInterval: cfg.ClaudeLogs.ScanInterval.D(),
 			Clock:        clock,

@@ -58,6 +58,10 @@ type Options struct {
 	// Host is set on every produced RequestRecord.Host. The per-host agent
 	// sets it; the server-local collector leaves it "".
 	Host string
+	// Client names the ledger client on produced records (default
+	// "claude-code"). The server overrides it on ingest with the registered
+	// client that pushed the records.
+	Client string
 	// StatePath is the JSON file persisting per-file offsets; empty disables
 	// persistence (every restart rescans, which is safe but slower).
 	StatePath string
@@ -471,6 +475,13 @@ type entry struct {
 
 // parse extracts the dedupe key and ledger record from one line; ok=false if
 // the line carries no recordable usage.
+func (c *Collector) clientName() string {
+	if c.opts.Client != "" {
+		return c.opts.Client
+	}
+	return "claude-code"
+}
+
 func (c *Collector) parse(line []byte, task string) (key string, rec core.RequestRecord, ok bool) {
 	var e entry
 	if err := json.Unmarshal(line, &e); err != nil || e.Message == nil || e.Message.Usage == nil {
@@ -508,7 +519,7 @@ func (c *Collector) parse(line []byte, task string) (key string, rec core.Reques
 		ID:         "claude:" + hex.EncodeToString(sum[:])[:32],
 		StartedAt:  ts,
 		FinishedAt: ts,
-		Client:     "claude-code",
+		Client:     c.clientName(),
 		Class:      core.ClassInteractive,
 		Route:      "claude",
 		Model:      m.Model,

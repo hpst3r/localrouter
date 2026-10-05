@@ -572,6 +572,22 @@ and wide (browser). Sections:
 - Security: all text via textContent; no innerHTML with data; key in
   localStorage as today.
 
+### Per registered client
+
+- `/control/v1/status` adds `clients: [{name, class, host, ingest}]` listing
+  every configured client in config order (never key material).
+- Ingested Claude transcript records are attributed to the REGISTERED client
+  whose key pushed them: `Client = <ingesting client name>` (was the generic
+  "claude-code"); `Route = "claude"` and `Provider = "claude"` still identify
+  them as Claude Code usage. The local `claude_logs` collector uses
+  `claude_logs.client` (default "claude-code") so a single-host setup can
+  name it after a registered client too.
+- Widget: a **Clients** panel beside Machines: one row/card per registered
+  client (zero-usage clients shown greyed), plus any unregistered client keys
+  seen in data (e.g. "claude-code"), each with class badge, host, tokens, cost,
+  requests for the current range and a 24h sparkline; click = drill down
+  `client=<name>`.
+
 ## Engineering constraints
 
 - Go 1.26, module `github.com/hpst3r/localrouter`.

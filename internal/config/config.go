@@ -45,6 +45,9 @@ type ClaudeLogsConfig struct {
 	Dir          string   `yaml:"dir"`           // default ~/.claude/projects
 	Account      string   `yaml:"account"`       // claude account id rows are attributed to
 	ScanInterval Duration `yaml:"scan_interval"` // default 1m
+	// Client names the ledger client for locally collected Claude Code usage
+	// (default "claude-code"); set it to a registered client to attribute it.
+	Client string `yaml:"client"`
 }
 
 type QuotaConfig struct {
@@ -174,6 +177,9 @@ func (c *Config) applyDefaults(baseDir string) {
 	c.ClaudeLogs.Dir = expand(c.ClaudeLogs.Dir, baseDir)
 	if c.ClaudeLogs.ScanInterval == 0 {
 		c.ClaudeLogs.ScanInterval = Duration(time.Minute)
+	}
+	if c.ClaudeLogs.Client == "" {
+		c.ClaudeLogs.Client = "claude-code"
 	}
 	for i := range c.Accounts {
 		a := &c.Accounts[i]
