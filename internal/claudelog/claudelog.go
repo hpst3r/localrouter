@@ -182,7 +182,8 @@ func (c *Collector) ScanOnce(ctx context.Context) (Stats, error) {
 			dirty = true
 		}
 		if err != nil {
-			c.opts.Logger.Warn("claudelog: scan file", "file", rel, "err", err)
+			// Log only the project dir slug, never the session file path.
+			c.opts.Logger.Warn("claudelog: scan file", "project", projectName(rel), "err", err)
 			if firstErr == nil {
 				firstErr = err
 			}

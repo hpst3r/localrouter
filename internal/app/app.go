@@ -5,6 +5,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -151,6 +152,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 	}
 	if ing, ok := any(qm).(core.SnapshotIngester); ok {
 		ctlDeps.Ingester = ing
+		ctlDeps.IsSnapshotStale = func(err error) bool { return errors.Is(err, quota.ErrSnapshotStale) }
 	}
 	ctl := control.New(ctlDeps, control.Options{RequireAuth: cfg.Control.RequireAuth, StaleAfter: cfg.Policy.StaleAfter.D()})
 
