@@ -26,6 +26,20 @@
 // and limits[] weekly_scoped models → weekly_<lowercase display name>.
 // ObserveHeaders is a no-op for claude accounts.
 //
+// Claude accounts with QuotaSource == QuotaSourceAgent ("agent") are never
+// polled (Start, RequestRefresh and refresh skip them: no credential read, no
+// HTTP). Their snapshots arrive only through IngestSnapshot (core.SnapshotIngester),
+// which stores a deep copy if FetchedAt is newer than the stored one and
+// otherwise returns ErrSnapshotStale; unknown or non-claude+agent accounts
+// are rejected. Latest reports ok=false until the first ingest.
+//
+// The per-host agent reuses the server's fetch path:
+//
+//	cred, err := quota.ParseClaudeCredentials(fileOrKeychainJSON)
+//	snap, err := quota.FetchClaudeSnapshot(ctx, httpClient, quota.DefaultClaudeUsageURL,
+//		quota.DefaultClaudeUserAgent, cred, accountID, time.Now())
+//	// errors.Is(err, quota.ErrClaudeTokenExpired): no request was made; push nothing.
+//
 // openai_compat accounts have no quota source: Latest reports ok=false and
 // the poller skips them.
 //

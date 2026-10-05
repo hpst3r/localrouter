@@ -126,8 +126,10 @@ func (m *Manager) Start(ctx context.Context) {
 	m.mu.Lock()
 	m.baseCtx = ctx
 	ids := make([]string, 0, len(m.state))
-	for id := range m.state {
-		ids = append(ids, id)
+	for id, st := range m.state {
+		if !agentSourced(st.acct) {
+			ids = append(ids, id)
+		}
 	}
 	m.mu.Unlock()
 	for _, id := range ids {
@@ -165,10 +167,10 @@ func (m *Manager) Latest(accountID string) (core.Snapshot, bool) {
 // ago. Requests arriving while a fetch is in flight are coalesced into it.
 func (m *Manager) RequestRefresh(accountID string, urgent bool) {
 	m.mu.Lock()
-	_, ok := m.state[accountID]
+	st, ok := m.state[accountID]
 	ctx := m.baseCtx
 	m.mu.Unlock()
-	if !ok {
+	if !ok || agentSourced(st.acct) {
 		return
 	}
 	m.wg.Add(1)
@@ -183,7 +185,7 @@ func (m *Manager) RequestRefresh(accountID string, urgent bool) {
 func (m *Manager) refresh(ctx context.Context, id string, urgent bool) {
 	m.mu.Lock()
 	st := m.state[id]
-	if st == nil {
+	if st == nil || agentSourced(st.acct) {
 		m.mu.Unlock()
 		return
 	}

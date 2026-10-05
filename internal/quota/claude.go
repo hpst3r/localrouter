@@ -18,11 +18,25 @@ import (
 // Sanitized Claude errors. The token is read from the Claude Code credentials
 // file, which LocalRouter never writes; refreshing is left to the claude CLI.
 var (
-	errClaudeExpired     = errors.New("claude token expired; run claude to refresh")
-	errClaudeRejected    = errors.New("claude token rejected; run claude to refresh")
+	// ErrClaudeTokenExpired is returned by FetchClaudeSnapshot, without any
+	// request, when the credential's expiresAt has passed.
+	ErrClaudeTokenExpired = errors.New("claude token expired; run claude to refresh")
+	// ErrClaudeTokenRejected is returned when the usage API answers 401.
+	ErrClaudeTokenRejected = errors.New("claude token rejected; run claude to refresh")
+	// ErrClaudeCredentialsMalformed is returned by ParseClaudeCredentials for
+	// unparseable JSON or a missing access token.
+	ErrClaudeCredentialsMalformed = errors.New("claude credentials: malformed")
+
 	errClaudeCredMissing = errors.New("claude credentials: unavailable")
-	errClaudeCredBad     = errors.New("claude credentials: malformed")
 )
+
+// ClaudeCredential is the part of a Claude Code OAuth credential that the
+// usage fetch needs. ExpiresAt is unix milliseconds (0 = unknown).
+type ClaudeCredential struct {
+	AccessToken      string
+	ExpiresAt        int64
+	SubscriptionType string
+}
 
 // claudeCreds is the subset of ~/.claude/.credentials.json that we read.
 type claudeCreds struct {
@@ -33,51 +47,64 @@ type claudeCreds struct {
 	} `json:"claudeAiOauth"`
 }
 
+// ParseClaudeCredentials parses Claude Code credentials JSON: the contents of
+// ~/.claude/.credentials.json, or the macOS keychain item's password, which
+// holds the same JSON. It returns ErrClaudeCredentialsMalformed if data is not
+// valid JSON or has no access token; the error never includes data.
+func ParseClaudeCredentials(data []byte) (ClaudeCredential, error) {
+	var cr claudeCreds
+	if err := json.Unmarshal(data, &cr); err != nil || cr.ClaudeAiOauth == nil || cr.ClaudeAiOauth.AccessToken == "" {
+		return ClaudeCredential{}, ErrClaudeCredentialsMalformed
+	}
+	oa := cr.ClaudeAiOauth
+	return ClaudeCredential{AccessToken: oa.AccessToken, ExpiresAt: oa.ExpiresAt, SubscriptionType: oa.SubscriptionType}, nil
+}
+
 // claudeCredCache caches the parsed credentials file by (mtime, size).
 type claudeCredCache struct {
 	path  string
 	mtime time.Time
 	size  int64
-	creds claudeCreds
+	cred  ClaudeCredential
 }
 
 // loadClaudeCreds reads the account's credentials file, reusing the cached
 // parse while its mtime and size are unchanged. Read-only.
-func (m *Manager) loadClaudeCreds(id string) (claudeCreds, error) {
+func (m *Manager) loadClaudeCreds(id string) (ClaudeCredential, error) {
 	if m.opts.ClaudeCredentialsFile == nil {
-		return claudeCreds{}, errClaudeCredMissing
+		return ClaudeCredential{}, errClaudeCredMissing
 	}
 	path := m.opts.ClaudeCredentialsFile(id)
 	if path == "" {
-		return claudeCreds{}, errClaudeCredMissing
+		return ClaudeCredential{}, errClaudeCredMissing
 	}
 	fi, err := os.Stat(path)
 	if err != nil || !fi.Mode().IsRegular() {
-		return claudeCreds{}, errClaudeCredMissing
+		return ClaudeCredential{}, errClaudeCredMissing
 	}
 	m.claudeMu.Lock()
 	c := m.claudeCache[id]
 	m.claudeMu.Unlock()
 	if c != nil && c.path == path && c.mtime.Equal(fi.ModTime()) && c.size == fi.Size() {
-		return c.creds, nil
+		return c.cred, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return claudeCreds{}, errClaudeCredMissing
+		return ClaudeCredential{}, errClaudeCredMissing
 	}
 	defer f.Close()
 	data, err := io.ReadAll(io.LimitReader(f, maxBodyBytes))
 	if err != nil {
-		return claudeCreds{}, errClaudeCredMissing
+		return ClaudeCredential{}, errClaudeCredMissing
 	}
-	var cr claudeCreds
-	if err := json.Unmarshal(data, &cr); err != nil || cr.ClaudeAiOauth == nil || cr.ClaudeAiOauth.AccessToken == "" {
-		return claudeCreds{}, errClaudeCredBad
+	cred, err := ParseClaudeCredentials(data)
+	if err != nil {
+		return ClaudeCredential{}, err
 	}
 	m.claudeMu.Lock()
-	m.claudeCache[id] = &claudeCredCache{path: path, mtime: fi.ModTime(), size: fi.Size(), creds: cr}
+	m.claudeCache[id] = &claudeCredCache{path: path, mtime: fi.ModTime(), size: fi.Size(), cred: cred}
 	m.claudeMu.Unlock()
-	return cr, nil
+	return cred, nil
 }
 
 type claudeWindow struct {
@@ -98,23 +125,36 @@ type claudeLimit struct {
 
 func (m *Manager) fetchClaude(ctx context.Context, id string) (core.Snapshot, error) {
 	now := m.opts.Clock.Now()
-	cr, err := m.loadClaudeCreds(id)
+	cred, err := m.loadClaudeCreds(id)
 	if err != nil {
 		return core.Snapshot{}, err
 	}
-	oa := cr.ClaudeAiOauth
-	if oa.ExpiresAt > 0 && !now.Before(time.UnixMilli(oa.ExpiresAt)) {
-		return core.Snapshot{}, errClaudeExpired
+	return FetchClaudeSnapshot(ctx, m.opts.HTTPClient, m.opts.ClaudeUsageURL, m.opts.ClaudeUserAgent, cred, id, now)
+}
+
+// FetchClaudeSnapshot fetches the Claude usage API at url (normally
+// DefaultClaudeUsageURL) with cred's access token and returns a snapshot for
+// accountID with FetchedAt=now and Source=SourceUsageAPI. An expired cred
+// returns ErrClaudeTokenExpired without any request; a 401 returns
+// ErrClaudeTokenRejected. Errors are sanitized: never the token or the body.
+// A nil client uses a 30s-timeout client. The Manager polls through this same
+// function; it is exported for the per-host agent.
+func FetchClaudeSnapshot(ctx context.Context, client *http.Client, url, userAgent string, cred ClaudeCredential, accountID string, now time.Time) (core.Snapshot, error) {
+	if cred.ExpiresAt > 0 && !now.Before(time.UnixMilli(cred.ExpiresAt)) {
+		return core.Snapshot{}, ErrClaudeTokenExpired
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.opts.ClaudeUsageURL, nil)
+	if client == nil {
+		client = &http.Client{Timeout: defaultHTTPTimeout}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return core.Snapshot{}, errTransport
 	}
-	req.Header.Set("Authorization", "Bearer "+oa.AccessToken)
+	req.Header.Set("Authorization", "Bearer "+cred.AccessToken)
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", m.opts.ClaudeUserAgent)
-	resp, err := m.opts.HTTPClient.Do(req)
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := client.Do(req)
 	if err != nil {
 		return core.Snapshot{}, classifyTransport(ctx, err)
 	}
@@ -122,7 +162,7 @@ func (m *Manager) fetchClaude(ctx context.Context, id string) (core.Snapshot, er
 	resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusUnauthorized:
-		return core.Snapshot{}, errClaudeRejected
+		return core.Snapshot{}, ErrClaudeTokenRejected
 	case resp.StatusCode != http.StatusOK:
 		return core.Snapshot{}, fmt.Errorf("usage api: http %d", resp.StatusCode)
 	case err != nil:
@@ -132,7 +172,7 @@ func (m *Manager) fetchClaude(ctx context.Context, id string) (core.Snapshot, er
 	if err != nil {
 		return core.Snapshot{}, err
 	}
-	return core.Snapshot{AccountID: id, FetchedAt: now, Source: SourceUsageAPI, Plan: oa.SubscriptionType, Windows: windows}, nil
+	return core.Snapshot{AccountID: accountID, FetchedAt: now, Source: SourceUsageAPI, Plan: cred.SubscriptionType, Windows: windows}, nil
 }
 
 // parseClaudeUsage maps an /api/oauth/usage body to windows. Utilization
