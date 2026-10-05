@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"regexp"
 	"strings"
@@ -17,13 +19,20 @@ const (
 	maxIngestBody    = 4 << 20
 	maxIngestRecords = 1000
 	maxSnapshotSkew  = 5 * time.Minute
+	maxRecordAge     = 400 * 24 * time.Hour
+	// maxTokens caps each usage field so ledger sums stay far from int64.
+	maxTokens = 1_000_000_000_000
 	// ingestClient is forced on every ingested record.
 	ingestClient = "claude-code"
 	// QuotaSourceAgent marks claude accounts whose snapshots come from agents.
 	QuotaSourceAgent = "agent"
 )
 
-var hostRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+var (
+	hostRE       = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+	recordIDRE   = regexp.MustCompile(`^[A-Za-z0-9:._-]{1,128}$`)
+	windowKindRE = regexp.MustCompile(`^[a-z0-9_]{1,32}$`)
+)
 
 // ingest handles POST /control/v1/ingest (SPEC "Multi-host"). It always
 // requires a client key with Ingest permission, independent of RequireAuth.
@@ -45,14 +54,25 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Unknown fields are accepted for forward compatibility; trailing data
+	// after the JSON value is not.
 	var req core.IngestRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxIngestBody)).Decode(&req); err != nil {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxIngestBody))
+	err := dec.Decode(&req)
+	if err == nil {
+		if err = dec.Decode(&struct{}{}); err == io.EOF {
+			err = nil
+		} else if err == nil {
+			err = errors.New("trailing data")
+		}
+	}
+	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
 			writeError(w, http.StatusRequestEntityTooLarge, "ingest body exceeds 4 MiB")
 			return
 		}
-		writeError(w, http.StatusBadRequest, "body must be a JSON ingest request")
+		writeError(w, http.StatusBadRequest, "body must be a single JSON ingest request")
 		return
 	}
 	if err := s.validateIngest(&req); err != nil {
@@ -93,8 +113,8 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// validateIngest checks req and normalizes its records in place (Host,
-// Client, Provider are overwritten).
+// validateIngest checks req and normalizes it in place: record Host,
+// Client, Provider are overwritten and snapshot FetchedAt is capped at now.
 func (s *Server) validateIngest(req *core.IngestRequest) error {
 	if req.SchemaVersion != 1 {
 		return errors.New("schema_version must be 1")
@@ -111,10 +131,11 @@ func (s *Server) validateIngest(req *core.IngestRequest) error {
 			claude[a.ID] = a
 		}
 	}
+	now := s.deps.Clock.Now()
 	for i := range req.Records {
 		rec := &req.Records[i]
-		if rec.ID == "" {
-			return fmt.Errorf("records[%d]: id is required", i)
+		if !recordIDRE.MatchString(rec.ID) {
+			return fmt.Errorf("records[%d]: id must match [A-Za-z0-9:._-]{1,128}", i)
 		}
 		if _, ok := claude[rec.AccountID]; !ok {
 			return fmt.Errorf("records[%d]: account_id %q is not a configured claude account", i, rec.AccountID)
@@ -123,16 +144,29 @@ func (s *Server) validateIngest(req *core.IngestRequest) error {
 			return fmt.Errorf("records[%d]: usage_known must be true", i)
 		}
 		u := rec.Usage
-		if u.InputTokens < 0 || u.CachedInputTokens < 0 || u.CacheCreationInputTokens < 0 ||
-			u.OutputTokens < 0 || u.ReasoningTokens < 0 {
-			return fmt.Errorf("records[%d]: usage must be non-negative", i)
+		for _, n := range []int64{u.InputTokens, u.CachedInputTokens, u.CacheCreationInputTokens,
+			u.OutputTokens, u.ReasoningTokens} {
+			if n < 0 || n > maxTokens {
+				return fmt.Errorf("records[%d]: usage token counts must be between 0 and %d", i, int64(maxTokens))
+			}
+		}
+		switch {
+		case rec.StartedAt.IsZero():
+			return fmt.Errorf("records[%d]: started_at is required", i)
+		case rec.StartedAt.After(now.Add(maxSnapshotSkew)):
+			return fmt.Errorf("records[%d]: started_at is more than 5 minutes in the future", i)
+		case rec.StartedAt.Before(now.Add(-maxRecordAge)):
+			return fmt.Errorf("records[%d]: started_at is more than 400 days old", i)
+		case !rec.FinishedAt.IsZero() && rec.FinishedAt.Before(rec.StartedAt):
+			return fmt.Errorf("records[%d]: finished_at is before started_at", i)
 		}
 		rec.Host = req.Host
 		rec.Client = ingestClient
 		rec.Provider = core.ProviderClaude
 	}
-	limit := s.deps.Clock.Now().Add(maxSnapshotSkew)
-	for i, snap := range req.Snapshots {
+	limit := now.Add(maxSnapshotSkew)
+	for i := range req.Snapshots {
+		snap := &req.Snapshots[i]
 		a, ok := claude[snap.AccountID]
 		if !ok || a.QuotaSource != QuotaSourceAgent {
 			return fmt.Errorf("snapshots[%d]: account_id %q is not a claude account with quota_source agent", i, snap.AccountID)
@@ -142,6 +176,22 @@ func (s *Server) validateIngest(req *core.IngestRequest) error {
 		}
 		if snap.FetchedAt.After(limit) {
 			return fmt.Errorf("snapshots[%d]: fetched_at is more than 5 minutes in the future", i)
+		}
+		for j, win := range snap.Windows {
+			if !windowKindRE.MatchString(win.Kind) {
+				return fmt.Errorf("snapshots[%d].windows[%d]: kind must match [a-z0-9_]{1,32}", i, j)
+			}
+			if math.IsNaN(win.UsedFrac) || win.UsedFrac < 0 || win.UsedFrac > 1 {
+				return fmt.Errorf("snapshots[%d].windows[%d]: used_frac must be between 0 and 1", i, j)
+			}
+			if win.WindowSeconds < 0 {
+				return fmt.Errorf("snapshots[%d].windows[%d]: window_seconds must be non-negative", i, j)
+			}
+		}
+		// Store at most server now: a skewed future FetchedAt would make
+		// every genuine snapshot until then look stale.
+		if snap.FetchedAt.After(now) {
+			snap.FetchedAt = now
 		}
 	}
 	return nil

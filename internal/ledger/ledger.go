@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -315,8 +316,10 @@ var groupColumns = map[string]string{
 	"host":    "host",
 }
 
-const aggCols = `COUNT(*), SUM(input_tokens), SUM(cached_input_tokens),
-	SUM(cache_creation_input_tokens), SUM(output_tokens), SUM(reasoning_tokens), SUM(cost_usd),
+// aggCols sums token columns with TOTAL() (REAL) rather than SUM(), which
+// raises "integer overflow" past int64 and would fail the whole summary.
+const aggCols = `COUNT(*), TOTAL(input_tokens), TOTAL(cached_input_tokens),
+	TOTAL(cache_creation_input_tokens), TOTAL(output_tokens), TOTAL(reasoning_tokens), SUM(cost_usd),
 	SUM(CASE WHEN usage_known = 0 THEN 1 ELSE 0 END),
 	SUM(CASE WHEN usage_known = 1 AND cost_usd IS NULL THEN 1 ELSE 0 END)`
 
@@ -342,10 +345,13 @@ func (l *Ledger) Summary(ctx context.Context, since time.Time, group string) ([]
 	for rows.Next() {
 		var u core.UsageRow
 		var cost sql.NullFloat64
-		if err := rows.Scan(&u.Key, &u.Requests, &u.InputTokens, &u.CachedInputTokens,
-			&u.CacheCreationInputTokens, &u.OutputTokens, &u.ReasoningTokens, &cost, &u.UnknownUsageRequests, &u.UnpricedRequests); err != nil {
+		var in, cached, creation, outTok, reasoning float64
+		if err := rows.Scan(&u.Key, &u.Requests, &in, &cached,
+			&creation, &outTok, &reasoning, &cost, &u.UnknownUsageRequests, &u.UnpricedRequests); err != nil {
 			return nil, fmt.Errorf("ledger: summary: %w", err)
 		}
+		u.InputTokens, u.CachedInputTokens = satInt(in), satInt(cached)
+		u.CacheCreationInputTokens, u.OutputTokens, u.ReasoningTokens = satInt(creation), satInt(outTok), satInt(reasoning)
 		if cost.Valid {
 			c := cost.Float64
 			u.CostUSD = &c
@@ -382,11 +388,11 @@ func (l *Ledger) summaryByDay(ctx context.Context, since time.Time) ([]core.Usag
 			byDay[key] = u
 		}
 		u.Requests++
-		u.InputTokens += in
-		u.CachedInputTokens += cached
-		u.CacheCreationInputTokens += creation
-		u.OutputTokens += outTok
-		u.ReasoningTokens += reasoning
+		u.InputTokens = satAdd(u.InputTokens, in)
+		u.CachedInputTokens = satAdd(u.CachedInputTokens, cached)
+		u.CacheCreationInputTokens = satAdd(u.CacheCreationInputTokens, creation)
+		u.OutputTokens = satAdd(u.OutputTokens, outTok)
+		u.ReasoningTokens = satAdd(u.ReasoningTokens, reasoning)
 		switch {
 		case cost.Valid:
 			c := cost.Float64
@@ -409,4 +415,29 @@ func (l *Ledger) summaryByDay(ctx context.Context, since time.Time) ([]core.Usag
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out, nil
+}
+
+// satInt converts a REAL token total to int64, saturating at the int64 range.
+func satInt(f float64) int64 {
+	switch {
+	case f != f:
+		return 0
+	case f >= math.MaxInt64:
+		return math.MaxInt64
+	case f <= math.MinInt64:
+		return math.MinInt64
+	}
+	return int64(f)
+}
+
+// satAdd returns a+b, saturating instead of wrapping on overflow.
+func satAdd(a, b int64) int64 {
+	s := a + b
+	if a > 0 && b > 0 && s < 0 {
+		return math.MaxInt64
+	}
+	if a < 0 && b < 0 && s >= 0 {
+		return math.MinInt64
+	}
+	return s
 }

@@ -24,7 +24,6 @@ func reviewBug(t *testing.T, msg string) {
 // headroom than exists (background admitted on a reserved account), and 7
 // shows as -600% remaining in status.
 func TestReviewIngestSnapshotClampsFractions(t *testing.T) {
-	reviewBug(t, "IngestSnapshot stores UsedFrac outside [0,1] unclamped")
 	m := New([]core.Account{{ID: "cl", Provider: core.ProviderClaude, QuotaSource: QuotaSourceAgent}}, nil, Options{})
 	err := m.IngestSnapshot(core.Snapshot{AccountID: "cl", FetchedAt: t0, Windows: []core.Window{
 		{Kind: core.Window5h, UsedFrac: -3}, {Kind: core.WindowWeekly, UsedFrac: 7},

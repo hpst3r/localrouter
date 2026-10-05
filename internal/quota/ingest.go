@@ -27,7 +27,8 @@ func agentSourced(a core.Account) bool {
 // with quota_source "agent". It returns an error for unknown accounts or
 // accounts that are not claude+agent, and ErrSnapshotStale (nothing stored)
 // if s.FetchedAt is not after the stored snapshot's FetchedAt. The stored
-// value is a deep copy of s, including any Err the agent set.
+// value is a deep copy of s, including any Err the agent set, with FetchedAt
+// capped at the manager's clock and each UsedFrac clamped to [0,1].
 func (m *Manager) IngestSnapshot(s core.Snapshot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -38,10 +39,18 @@ func (m *Manager) IngestSnapshot(s core.Snapshot) error {
 	if !agentSourced(st.acct) {
 		return fmt.Errorf("quota: account %q is not an agent-sourced claude account", s.AccountID)
 	}
+	// A pushed FetchedAt ahead of our clock would make every genuine
+	// snapshot until then look stale, so cap it at now.
+	if now := m.opts.Clock.Now(); s.FetchedAt.After(now) {
+		s.FetchedAt = now
+	}
 	if st.snap != nil && !s.FetchedAt.After(st.snap.FetchedAt) {
 		return ErrSnapshotStale
 	}
 	c := copySnapshot(s)
+	for i := range c.Windows {
+		c.Windows[i].UsedFrac = clampFrac(c.Windows[i].UsedFrac)
+	}
 	st.snap = &c
 	return nil
 }
