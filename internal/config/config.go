@@ -16,17 +16,22 @@ import (
 )
 
 type Config struct {
-	Listen           string           `yaml:"listen"`
-	AllowNonLoopback bool             `yaml:"allow_non_loopback"`
-	DataDir          string           `yaml:"data_dir"`
-	PricingFile      string           `yaml:"pricing_file"`
-	Quota            QuotaConfig      `yaml:"quota"`
-	Policy           PolicyConfig     `yaml:"policy"`
-	Control          ControlConfig    `yaml:"control"`
-	Clients          []ClientConfig   `yaml:"clients"`
-	Accounts         []AccountConfig  `yaml:"accounts"`
-	Routes           []RouteConfig    `yaml:"routes"`
-	ClaudeLogs       ClaudeLogsConfig `yaml:"claude_logs"`
+	Listen           string `yaml:"listen"`
+	AllowNonLoopback bool   `yaml:"allow_non_loopback"`
+	// AllowedHosts are extra Host-header names/IPs accepted when
+	// allow_non_loopback is true (loopback names are always accepted).
+	AllowedHosts []string         `yaml:"allowed_hosts"`
+	TLSCertFile  string           `yaml:"tls_cert_file"`
+	TLSKeyFile   string           `yaml:"tls_key_file"`
+	DataDir      string           `yaml:"data_dir"`
+	PricingFile  string           `yaml:"pricing_file"`
+	Quota        QuotaConfig      `yaml:"quota"`
+	Policy       PolicyConfig     `yaml:"policy"`
+	Control      ControlConfig    `yaml:"control"`
+	Clients      []ClientConfig   `yaml:"clients"`
+	Accounts     []AccountConfig  `yaml:"accounts"`
+	Routes       []RouteConfig    `yaml:"routes"`
+	ClaudeLogs   ClaudeLogsConfig `yaml:"claude_logs"`
 }
 
 // ClaudeLogsConfig controls ingestion of Claude Code transcript token usage.
@@ -56,6 +61,10 @@ type ClientConfig struct {
 	Name    string `yaml:"name"`
 	Class   string `yaml:"class"`
 	KeyFile string `yaml:"key_file"`
+	// Host attributes this client's proxied requests to a machine.
+	Host string `yaml:"host"`
+	// Ingest lets this client's key push agent data to /control/v1/ingest.
+	Ingest bool `yaml:"ingest"`
 }
 
 type AccountConfig struct {
@@ -66,9 +75,11 @@ type AccountConfig struct {
 	APIKeyEnv  string `yaml:"api_key_env"`
 	// CredentialsFile is the Claude Code credentials file read (never
 	// written) for provider claude. Default ~/.claude/.credentials.json.
-	CredentialsFile string             `yaml:"credentials_file"`
-	Reserve         map[string]float64 `yaml:"reserve"`
-	CostBasis       string             `yaml:"cost_basis"`
+	CredentialsFile string `yaml:"credentials_file"`
+	// QuotaSource (claude only): "local" (default) or "agent".
+	QuotaSource string             `yaml:"quota_source"`
+	Reserve     map[string]float64 `yaml:"reserve"`
+	CostBasis   string             `yaml:"cost_basis"`
 }
 
 type RouteConfig struct {
@@ -143,6 +154,12 @@ func (c *Config) applyDefaults(baseDir string) {
 	for i := range c.Clients {
 		c.Clients[i].KeyFile = expand(c.Clients[i].KeyFile, baseDir)
 	}
+	if c.TLSCertFile != "" {
+		c.TLSCertFile = expand(c.TLSCertFile, baseDir)
+	}
+	if c.TLSKeyFile != "" {
+		c.TLSKeyFile = expand(c.TLSKeyFile, baseDir)
+	}
 	if c.ClaudeLogs.Dir == "" {
 		c.ClaudeLogs.Dir = "~/.claude/projects"
 	}
@@ -160,6 +177,9 @@ func (c *Config) applyDefaults(baseDir string) {
 			a.CredentialsFile = expand(a.CredentialsFile, baseDir)
 			if a.BaseURL == "" {
 				a.BaseURL = "https://api.anthropic.com"
+			}
+			if a.QuotaSource == "" {
+				a.QuotaSource = "local"
 			}
 		}
 		if a.BaseURL == "" {
@@ -215,6 +235,20 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("listen %q is not loopback; set allow_non_loopback: true to override", c.Listen))
 		}
 	}
+	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
+		errs = append(errs, errors.New("tls_cert_file and tls_key_file must be set together"))
+	}
+	if c.AllowNonLoopback && !c.Control.RequireAuth {
+		errs = append(errs, errors.New("allow_non_loopback requires control.require_auth: true (the control API would otherwise be open to the network)"))
+	}
+	if len(c.AllowedHosts) > 0 && !c.AllowNonLoopback {
+		errs = append(errs, errors.New("allowed_hosts requires allow_non_loopback: true"))
+	}
+	for _, h := range c.AllowedHosts {
+		if h == "" || strings.ContainsAny(h, " /") {
+			errs = append(errs, fmt.Errorf("allowed_hosts entry %q invalid", h))
+		}
+	}
 	if c.Policy.SafetyMargin < 0 || c.Policy.SafetyMargin >= 1 {
 		errs = append(errs, errors.New("policy.safety_margin must be in [0,1)"))
 	}
@@ -235,6 +269,9 @@ func (c *Config) Validate() error {
 		}
 		if cl.KeyFile == "" {
 			errs = append(errs, fmt.Errorf("client %s: key_file required", cl.Name))
+		}
+		if strings.ContainsAny(cl.Host, " /\\") {
+			errs = append(errs, fmt.Errorf("client %s: host %q invalid", cl.Name, cl.Host))
 		}
 	}
 	accts := map[string]bool{}
@@ -264,6 +301,12 @@ func (c *Config) Validate() error {
 			if v < 0 || v >= 1 {
 				errs = append(errs, fmt.Errorf("account %s: reserve %s must be in [0,1)", a.ID, k))
 			}
+		}
+		if a.Provider == core.ProviderClaude && a.QuotaSource != "local" && a.QuotaSource != "agent" {
+			errs = append(errs, fmt.Errorf("account %s: quota_source must be local or agent", a.ID))
+		}
+		if a.Provider != core.ProviderClaude && a.QuotaSource != "" {
+			errs = append(errs, fmt.Errorf("account %s: quota_source applies only to claude accounts", a.ID))
 		}
 		if a.CostBasis != "api_equivalent" && a.CostBasis != "metered" {
 			errs = append(errs, fmt.Errorf("account %s: cost_basis must be api_equivalent or metered", a.ID))
@@ -309,7 +352,7 @@ func (c *Config) CoreAccounts() []core.Account {
 		for k, v := range a.Reserve {
 			r[k] = v
 		}
-		out = append(out, core.Account{ID: a.ID, Provider: a.Provider, BaseURL: a.BaseURL, Reserve: r, CostBasis: a.CostBasis})
+		out = append(out, core.Account{ID: a.ID, Provider: a.Provider, BaseURL: a.BaseURL, Reserve: r, CostBasis: a.CostBasis, QuotaSource: a.QuotaSource})
 	}
 	return out
 }

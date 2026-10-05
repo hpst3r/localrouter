@@ -75,6 +75,10 @@ type Account struct {
 	Reserve map[string]float64
 	// Price basis for ledger cost: "api_equivalent" or "metered".
 	CostBasis string
+	// QuotaSource for claude accounts: "local" (poll using the local Claude
+	// Code credentials; default) or "agent" (never poll; snapshots arrive via
+	// SnapshotIngester from agents on the hosts where Claude Code runs).
+	QuotaSource string
 }
 
 // Credential is the material the proxy attaches upstream.
@@ -150,37 +154,41 @@ type Usage struct {
 	// InputTokens is the TOTAL prompt tokens, including CachedInputTokens and
 	// CacheCreationInputTokens (OpenAI convention). Producers whose provider
 	// reports these separately (Anthropic) must sum them into InputTokens.
-	InputTokens       int64
-	CachedInputTokens int64 // cache reads
+	InputTokens       int64 `json:"input_tokens"`
+	CachedInputTokens int64 `json:"cached_input_tokens"` // cache reads
 	// CacheCreationInputTokens are prompt tokens written to the cache
 	// (Anthropic cache_creation_input_tokens); 0 for providers without it.
-	CacheCreationInputTokens int64
-	OutputTokens             int64
-	ReasoningTokens          int64
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	OutputTokens             int64 `json:"output_tokens"`
+	ReasoningTokens          int64 `json:"reasoning_tokens"`
 }
 
 // RequestRecord is one ledger row. Never contains prompt/response content.
+// JSON tags define the ingest wire format (agents -> server).
 type RequestRecord struct {
-	ID               string
-	StartedAt        time.Time
-	FinishedAt       time.Time
-	Client           string
-	Class            Class
-	Route            string
-	Model            string
-	Provider         string
-	AccountID        string
-	UpstreamIdentity string
-	Status           int
-	FailoverOf       string
-	Usage            Usage
-	UsageKnown       bool
-	LatencyMS        int64
-	BytesOut         int64
-	Session          string
-	Task             string
-	Agent            string
-	Error            string
+	ID               string    `json:"id"`
+	StartedAt        time.Time `json:"started_at"`
+	FinishedAt       time.Time `json:"finished_at"`
+	Client           string    `json:"client"`
+	Class            Class     `json:"class"`
+	Route            string    `json:"route"`
+	Model            string    `json:"model"`
+	Provider         string    `json:"provider"`
+	AccountID        string    `json:"account_id"`
+	UpstreamIdentity string    `json:"upstream_identity,omitempty"`
+	Status           int       `json:"status"`
+	FailoverOf       string    `json:"failover_of,omitempty"`
+	Usage            Usage     `json:"usage"`
+	UsageKnown       bool      `json:"usage_known"`
+	LatencyMS        int64     `json:"latency_ms"`
+	BytesOut         int64     `json:"bytes_out"`
+	Session          string    `json:"session,omitempty"`
+	Task             string    `json:"task,omitempty"`
+	Agent            string    `json:"agent,omitempty"`
+	Error            string    `json:"error,omitempty"`
+	// Host is the machine the usage happened on ("" = the server itself for
+	// proxied requests from clients without a configured host).
+	Host string `json:"host,omitempty"`
 	// CostUSD/CostBasis are computed by the ledger from pricing; callers leave zero.
 }
 
@@ -198,6 +206,38 @@ type UsageRow struct {
 	UnpricedRequests         int64    `json:"unpriced_requests"`
 }
 
+// BatchLedger is optionally implemented by ledgers that can record many rows
+// in one round trip (e.g. the agent's remote ledger). Producers such as the
+// Claude transcript collector use it when available and must only advance
+// their persisted progress after RecordBatch returns nil. Like Record, it is
+// idempotent on non-empty IDs.
+type BatchLedger interface {
+	RecordBatch(ctx context.Context, rs []RequestRecord) error
+}
+
+// SnapshotIngester accepts quota snapshots pushed from elsewhere (agents) for
+// accounts whose quota_source is "agent". Implementations keep the snapshot
+// with the newest FetchedAt and ignore older ones.
+type SnapshotIngester interface {
+	IngestSnapshot(s Snapshot) error
+}
+
+// IngestRequest is the POST /control/v1/ingest body sent by agents.
+type IngestRequest struct {
+	SchemaVersion int             `json:"schema_version"` // 1
+	Host          string          `json:"host"`
+	Records       []RequestRecord `json:"records,omitempty"`
+	Snapshots     []Snapshot      `json:"snapshots,omitempty"`
+}
+
+// IngestResponse is the POST /control/v1/ingest reply.
+type IngestResponse struct {
+	SchemaVersion     int `json:"schema_version"`
+	RecordsAccepted   int `json:"records_accepted"`
+	SnapshotsAccepted int `json:"snapshots_accepted"`
+	SnapshotsIgnored  int `json:"snapshots_ignored"` // older than what the server has
+}
+
 // Ledger persists request records and answers summaries.
 type Ledger interface {
 	// Record inserts r. It is idempotent on a non-empty r.ID: re-recording an
@@ -211,6 +251,10 @@ type Ledger interface {
 type Client struct {
 	Name  string
 	Class Class
+	// Host attributes this client's proxied requests to a machine (optional).
+	Host string
+	// Ingest permits POST /control/v1/ingest with this client's key.
+	Ingest bool
 }
 
 // Route maps a model name to ordered candidate accounts per class, and the

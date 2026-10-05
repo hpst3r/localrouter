@@ -1,0 +1,6 @@
+Package: internal/claudelog only.
+Read docs/SPEC.md section 'Multi-host (central server + per-host agents)' FIRST; it is authoritative. core and config are frozen (already contain the new fields/types: RequestRecord.Host + JSON tags, BatchLedger, SnapshotIngester, IngestRequest/Response, Client.Host/Ingest, Account.QuotaSource; config allowed_hosts/tls_*/clients[].host/ingest/accounts[].quota_source).
+
+Change ingestion so that when the ledger implements core.BatchLedger, all records finalized during one file scan (or one ScanOnce) are sent with RecordBatch in chunks of <= 500, and the file's persisted offset/state advances ONLY after every chunk for that file succeeded. On error: return the error from ScanOnce, keep the file's old offset (next scan re-reads; IDs dedupe). Keep the existing per-record Record path for ledgers without RecordBatch (current behaviour + tests unchanged).
+Also add Options.Host string: set on every produced RequestRecord.Host (agent sets it; server-local collector leaves "").
+Tests: fake BatchLedger that fails the first N calls -> offsets not advanced, retried later, final rows exactly once (dedupe by ID in fake); chunking at 500 (generate 1200 synthetic keys in a temp dir); Host propagated; existing tests still pass.

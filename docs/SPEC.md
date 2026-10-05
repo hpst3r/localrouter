@@ -331,6 +331,151 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
   1 = deny (prints reason), 2 = error/unreachable. Clients use it as a gate,
   e.g. before launching background Claude workers.
 
+## Multi-host (central server + per-host agents)
+
+One `localrouter serve` runs centrally (mesh-reachable). Each host that runs
+Claude Code runs `localrouter agent`, which pushes Claude transcript usage and
+Claude quota snapshots to the server. Hosts' Hermes/other clients use the
+server's `/v1` with their own client keys.
+
+### Server network mode (config)
+
+- `allow_non_loopback: true` permits a non-loopback `listen`, and REQUIRES
+  `control.require_auth: true` (validated).
+- Host-header guard stays ON in network mode: accept loopback names plus
+  `allowed_hosts` entries (case-insensitive exact match on the host part;
+  IP literals compared as IPs). Unknown Host -> 403. (Blocks DNS rebinding.)
+- Optional TLS: `tls_cert_file` + `tls_key_file` (both or neither) ->
+  `ListenAndServeTLS`. Mesh (WireGuard) traffic is already encrypted, so TLS
+  is optional.
+- The widget (`GET /`) stays unauthenticated but its data endpoints require a
+  key (it already prompts for one and stores it in localStorage).
+
+### Clients: host + ingest
+
+- `clients[].host` attributes the client's proxied requests: proxy sets
+  `RequestRecord.Host = client.Host` (empty -> "").
+- `clients[].ingest: true` allows that key to call `POST /control/v1/ingest`.
+  Other keys -> 403. (Ingest keys may also be normal inference keys.)
+
+### Ledger: host column
+
+- Migration v3: `host TEXT NOT NULL DEFAULT ''`; Record stores
+  `RequestRecord.Host`; Summary supports `group=host` (key "" shown as
+  "(server)" by the widget, NOT renamed in the API).
+- `RecordBatch(ctx, []RequestRecord)` in one transaction, idempotent per ID
+  (ON CONFLICT DO NOTHING); returns nil on duplicates. Max 1000 records.
+
+### POST /control/v1/ingest
+
+- Auth: bearer key of a client with `ingest: true`; body
+  `core.IngestRequest` (max 4 MiB, `schema_version` must be 1, `host`
+  non-empty, `[A-Za-z0-9._-]{1,64}`).
+- The server OVERWRITES each record's `Host` with the request's `host`
+  (agents cannot attribute to another host... except via their own `host`
+  string; trust model: ingest keys are trusted hosts) and FORCES
+  `Client="claude-code"`, `Provider="claude"`; records whose `AccountID` is
+  not a configured claude account -> whole request 400 (no partial writes).
+  Records must have non-empty ID, `UsageKnown=true`, non-negative usage;
+  otherwise 400.
+- Snapshots: each must name a configured claude account with
+  `quota_source: agent`, else 400. Passed to `SnapshotIngester`; a snapshot
+  with `FetchedAt` <= the stored one is ignored (counted in
+  `snapshots_ignored`). Snapshots with `FetchedAt` more than 5 minutes in the
+  future -> 400.
+- Response 200 `core.IngestResponse`. Ingest is idempotent: re-sending the
+  same batch yields 200 with records_accepted counting submitted records (the
+  ledger dedupes silently).
+
+### Quota: agent-sourced claude accounts
+
+- Claude accounts with `quota_source: agent` are NEVER polled by the server
+  (no credentials read, no HTTP). Their snapshot comes only from
+  `IngestSnapshot`. Before any ingest, `Latest` returns ok=false (status shows
+  stale/null, policy treats as missing -> background denied if reserved).
+- `quota.Manager` implements `core.SnapshotIngester`: validates the account
+  is claude+agent, stores a deep copy if newer, clears `Err` from the pushed
+  snapshot unless the agent set it (agent-reported errors are preserved).
+
+### `localrouter agent`
+
+Runs on each host. Config file (default `~/.config/localrouter/agent.yaml`):
+
+```yaml
+server: https://router.tail:8787     # or http:// on the mesh
+host: vm1                            # [A-Za-z0-9._-]{1,64}
+key_file: ~/.config/localrouter/agent.key   # client key with ingest: true
+account: claude-max                  # claude account id on the server
+claude_projects_dir: ~/.claude/projects     # default
+credentials:                         # how to read the Claude Code token (read-only)
+  source: auto        # auto | file | keychain
+  file: ~/.claude/.credentials.json  # default
+  keychain_service: "Claude Code-credentials"  # macOS; default
+push_interval: 1m                    # default
+quota_interval: 5m                   # default; 0 disables quota push
+state_dir: ~/.local/state/localrouter-agent   # default (darwin: ~/Library/Application Support/localrouter-agent)
+```
+
+- Usage: reuses `internal/claudelog.Collector` with a ledger implementation
+  that buffers records and POSTs them via ingest (batches <= 500). claudelog
+  must use `core.BatchLedger` when the ledger implements it and only persist
+  file offsets after the batch succeeds (so a server outage never loses
+  usage; records are re-sent later and deduped by ID).
+- Quota: every `quota_interval`, read the token (read-only) and fetch
+  `/api/oauth/usage` using the SAME parsing code as the server
+  (export a function from internal/quota, e.g.
+  `quota.FetchClaudeSnapshot(ctx, client, url, userAgent, token, expiresAt,
+  subscriptionType, accountID, now) (core.Snapshot, error)`), then push it.
+  Token expired -> push nothing (server keeps last snapshot, which goes stale).
+- Credentials source `auto`: on darwin try keychain then file; elsewhere file.
+  Keychain read = `security find-generic-password -s <service> -w` (stdout is
+  the same JSON as the file). Never write; never print the token; errors are
+  sanitized.
+- Exponential backoff (cap 5m) on server errors; logs never contain tokens,
+  prompts, or file paths beyond the project dir name.
+- `localrouter agent -config PATH [--once]`: `--once` = one scan + one quota
+  push then exit (for testing/cron).
+
+### Acceptance tests (multi-host)
+
+- MH1 network mode without require_auth fails validation (config, DONE).
+- MH2 Host guard: allowed_hosts entry accepted, unknown host 403, loopback ok.
+- MH3 ingest with non-ingest key -> 403; no key -> 401.
+- MH4 ingest overwrites Host/Client/Provider; unknown account -> 400, nothing written.
+- MH5 ingest idempotent: same batch twice -> ledger rows unchanged.
+- MH6 agent-sourced claude account never polled (fake usage server sees 0 hits);
+  ingested snapshot appears in status; older snapshot ignored.
+- MH7 agent end-to-end: real Collector over a fixture dir -> fake server via
+  real HTTP handler -> rows in a real ledger with host set; server down ->
+  offsets not advanced -> retried after recovery with no duplicates.
+- MH8 proxy records Host from client config; usage?group=host aggregates.
+
+## Hermes plugin (separate repo: ~/projects/hermes-localrouter)
+
+Standalone Hermes user plugin (Python, stdlib only; installed into
+`~/.hermes/plugins/localrouter/` or via `hermes plugins install`). It talks
+to LocalRouter only through the documented control API.
+
+- Config (plugin reads env/`config.yaml`-provided values via its own small
+  JSON/YAML file `~/.config/localrouter/hermes-plugin.json`, never Hermes
+  `.env`): `url` (default http://127.0.0.1:8787), `key_file`, `account_for_delegation`
+  (optional, e.g. ollama-cloud), `model_for_delegation` (optional; used for
+  admit by model), `fail_open` (default true), `timeout_s` (default 3).
+- Tool `localrouter_status` (toolset `localrouter`): returns a compact
+  JSON summary of every account: windows remaining %, reset times, reserve,
+  background/interactive admissible, stale; plus 24h usage totals by model
+  (tokens, cost, cost basis note). Read-only.
+- Tool `localrouter_usage` (args: since=24h|7d, group=model|account|client|host).
+- Hook `pre_tool_call` for `delegate_task`: POST /control/v1/admit
+  `{class: background, model|account}`; deny -> `{"action":"block",
+  "message": "LocalRouter: background quota reserve reached for <acct> (<reason>). Do this work yourself or wait until <reset>."}`;
+  router unreachable -> allow if fail_open else block with a clear message.
+  Never blocks other tools.
+- Slash command `/quota`: prints the status summary for the human.
+- No `pre_llm_call` injection (prompt-cache safety). No outbound calls except
+  to the configured LocalRouter URL. Tests with `unittest` + a stdlib
+  `http.server` fake; no network.
+
 ## Engineering constraints
 
 - Go 1.26, module `github.com/hpst3r/localrouter`.

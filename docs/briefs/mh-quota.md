@@ -1,0 +1,8 @@
+Package: internal/quota only.
+Read docs/SPEC.md section 'Multi-host (central server + per-host agents)' FIRST; it is authoritative. core and config are frozen (already contain the new fields/types: RequestRecord.Host + JSON tags, BatchLedger, SnapshotIngester, IngestRequest/Response, Client.Host/Ingest, Account.QuotaSource; config allowed_hosts/tls_*/clients[].host/ingest/accounts[].quota_source).
+
+Implement:
+1. Claude accounts with Account.QuotaSource == "agent": never polled (Start/refresh/RequestRefresh skip them; no credential read, no HTTP). Latest returns ok=false until ingested.
+2. (*Manager).IngestSnapshot(s core.Snapshot) error implementing core.SnapshotIngester per SPEC (unknown account / not claude+agent -> error; FetchedAt <= stored -> return ErrSnapshotStale (exported sentinel) so callers can count ignored; store deep copy (copySnapshot)). Add `var _ core.SnapshotIngester = (*Manager)(nil)`.
+3. Export a reusable fetch: `func FetchClaudeSnapshot(ctx context.Context, client *http.Client, url, userAgent string, cred ClaudeCredential, accountID string, now time.Time) (core.Snapshot, error)` with `type ClaudeCredential struct { AccessToken string; ExpiresAt int64; SubscriptionType string }` and `func ParseClaudeCredentials(data []byte) (ClaudeCredential, error)` (same JSON as ~/.claude/.credentials.json; macOS keychain returns the same JSON). Refactor fetchClaude to use them (behaviour unchanged; existing tests must pass). Errors stay sanitized; token never in errors.
+Tests: MH6 (fake usage server sees 0 hits for agent account even after Start + RequestRefresh; ingest -> Latest returns it; older ignored with ErrSnapshotStale; non-agent account ingest rejected), FetchClaudeSnapshot happy/expired/401, ParseClaudeCredentials good/bad.
