@@ -26,7 +26,7 @@ exec systemd-run --user --scope -q -p MemoryMax=6G -p MemorySwapMax=0 \
   nice -n 10 claude -p "$prompt" \
   --model opus \
   --permission-mode acceptEdits \
-  --allowedTools "Read Edit Write Glob Grep Bash(go:*) Bash(env:*) Bash(gofmt:*) Bash(python3:*) Bash(curl -s 127.0.0.1:*) Bash(curl -s http://127.0.0.1:*) Bash(git add:*) Bash(git commit:*) Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(ls:*) Bash(mkdir:*)" \
+  --allowedTools "Read Edit Write Glob Grep Bash(go:*) Bash(env:*) Bash(gofmt:*) Bash(python3:*) Bash(curl -s 127.0.0.1:*) Bash(curl -s http://127.0.0.1:*) Bash(git add:*) Bash(git commit:*) Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(ls:*) Bash(mkdir:*) Bash(git -C:*)" \
   --add-dir "$root" \
   --output-format json \
   --json-schema "$schema" \

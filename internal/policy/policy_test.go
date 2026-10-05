@@ -118,7 +118,7 @@ func TestAdmission(t *testing.T) {
 			opts:    Options{InflightEstimate: 0.01},
 			class:   core.ClassBackground,
 			allow:   false,
-			reason:  "codex-primary: 5h: 9% left; background stops at 11% (reserve 10% + margin 0% + in-flight 1%)",
+			reason:  "codex-primary: 5h: 91% used, 9% left; background needs more than 11% left (reserve 10% + margin 0% + in-flight 1%)",
 		},
 		{
 			name:    "AT1 background allowed below reserve",
@@ -170,7 +170,7 @@ func TestAdmission(t *testing.T) {
 				core.Window{Kind: core.WindowWeekly, UsedFrac: 0.85, ResetAt: t0.Add(72 * time.Hour)})),
 			class:  core.ClassBackground,
 			allow:  false,
-			reason: "weekly: 15% left; background stops at 20%",
+			reason: "weekly: 85% used, 15% left; background needs more than 20% left",
 		},
 		{
 			name:    "AT6 reset boundary: rolled window admissible",
@@ -337,7 +337,7 @@ func TestSelectionPicksSecondary(t *testing.T) {
 	if !dec.Allow || lease.AccountID() != "codex-secondary" || dec.AccountID != "codex-secondary" {
 		t.Fatalf("got %+v", dec)
 	}
-	for _, want := range []string{"ghost: unknown account", "codex-primary: 5h: 9% left; background stops at 11%"} {
+	for _, want := range []string{"ghost: unknown account", "codex-primary: 5h: 91% used, 9% left; background needs more than 11% left"} {
 		if !strings.Contains(dec.Reason, want) {
 			t.Errorf("reason %q missing %q", dec.Reason, want)
 		}
@@ -364,7 +364,7 @@ func TestDenyReasonNamesEachCandidate(t *testing.T) {
 	if dec.Allow {
 		t.Fatal("expected deny")
 	}
-	for _, want := range []string{"p: 5h: 5% left; background stops at 10% (reserve 10%", "s: quota snapshot stale", "x: unknown account"} {
+	for _, want := range []string{"p: 5h: 95% used, 5% left; background needs more than 10% left (reserve 10%", "s: quota snapshot stale", "x: unknown account"} {
 		if !strings.Contains(dec.Reason, want) {
 			t.Errorf("reason %q missing %q", dec.Reason, want)
 		}
@@ -526,7 +526,7 @@ func TestStatus(t *testing.T) {
 	h.q.Set(snap("a", t0, w5h(0.95)))
 
 	st := h.p.Status("a")
-	if st.Stale || st.BackgroundAdmissible || !st.InteractiveAdmissible || !strings.Contains(st.Reason, "5h: 5% left; background stops at 11%") {
+	if st.Stale || st.BackgroundAdmissible || !st.InteractiveAdmissible || !strings.Contains(st.Reason, "5h: 95% used, 5% left; background needs more than 11% left") {
 		t.Fatalf("a=%+v", st)
 	}
 	st = h.p.Status("b")

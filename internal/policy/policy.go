@@ -203,13 +203,13 @@ func (p *Policy) admitLocked(acct core.Account, class core.Class, now time.Time)
 		}
 		limit := 1 - floor - margin - load
 		if used > limit+epsilon {
-			left := pct(1 - used)
 			if background {
-				// e.g. "5h: 8% left; background stops at 12% (reserve 10% + margin 2%)"
-				return false, fmt.Sprintf("%s: %s left; background stops at %s (reserve %s + margin %s + in-flight %s)",
-					w.Kind, left, pct(1-limit), pct(floor), pct(margin), pct(load))
+				// e.g. "5h: 91% used, 9% left; background needs more than 11% left (reserve 10% + margin 0% + in-flight 1%)"
+				return false, fmt.Sprintf("%s: %s used, %s left; background needs more than %s left (reserve %s + margin %s + in-flight %s)",
+					w.Kind, pct(used), pct(1-used), pct(1-limit), pct(floor), pct(margin), pct(load))
 			}
-			return false, fmt.Sprintf("%s: %s left; interactive stops at %s (in-flight %s)", w.Kind, left, pct(1-limit), pct(load))
+			return false, fmt.Sprintf("%s: %s used, %s left; interactive needs more than %s left (in-flight %s)",
+				w.Kind, pct(used), pct(1-used), pct(1-limit), pct(load))
 		}
 	}
 	return true, ""
