@@ -27,7 +27,6 @@ func reviewBug(t *testing.T, msg string) {
 //
 //	"5h: 0% used; background capped at 0% (reserve 99.9%, margin+in-flight 1%)"
 func TestReviewDenyReasonReadable(t *testing.T) {
-	reviewBug(t, "deny reason prints a negative limit as raw fractions ('used 0.00 > -0.01')")
 	a := core.Account{ID: "cl", Provider: core.ProviderCodex, Reserve: map[string]float64{core.Window5h: 0.999}}
 	h := newHarness([]core.Account{a}, Options{InflightEstimate: 0.01})
 	h.q.Set(snap("cl", t0, w5h(0)))

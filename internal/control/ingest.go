@@ -72,11 +72,17 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusRequestEntityTooLarge, "ingest body exceeds 4 MiB")
 			return
 		}
-		writeError(w, http.StatusBadRequest, "body must be a single JSON ingest request")
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{
+			"message": "body must be a single JSON ingest request", "code": CodeInvalidRequest}})
 		return
 	}
 	if err := s.validateIngest(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		code := CodeInvalidRequest
+		var ie *ingestError
+		if errors.As(err, &ie) {
+			code = ie.code
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": err.Error(), "code": code}})
 		return
 	}
 	if len(req.Records) > 0 && s.deps.Ledger == nil {
@@ -113,17 +119,42 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// IngestErrorCode values sent in 400 bodies as error.code. Agents may drop
+// (after isolating) only records rejected with CodeInvalidRecord; any other
+// 400 is request-wide (schema, host, server configuration) and must be
+// retried later without dropping data.
+const (
+	CodeInvalidRecord  = "invalid_record"
+	CodeInvalidRequest = "invalid_request"
+)
+
+// ingestError is a validation failure with its scope.
+type ingestError struct {
+	code string
+	msg  string
+}
+
+func (e *ingestError) Error() string { return e.msg }
+
+func reqErr(format string, a ...any) error {
+	return &ingestError{code: CodeInvalidRequest, msg: fmt.Sprintf(format, a...)}
+}
+
+func recErr(format string, a ...any) error {
+	return &ingestError{code: CodeInvalidRecord, msg: fmt.Sprintf(format, a...)}
+}
+
 // validateIngest checks req and normalizes it in place: record Host,
 // Client, Provider are overwritten and snapshot FetchedAt is capped at now.
 func (s *Server) validateIngest(req *core.IngestRequest) error {
 	if req.SchemaVersion != 1 {
-		return errors.New("schema_version must be 1")
+		return reqErr("schema_version must be 1")
 	}
 	if !hostRE.MatchString(req.Host) {
-		return errors.New("host must match [A-Za-z0-9._-]{1,64}")
+		return reqErr("host must match [A-Za-z0-9._-]{1,64}")
 	}
 	if len(req.Records) > maxIngestRecords {
-		return fmt.Errorf("at most %d records per request", maxIngestRecords)
+		return reqErr("at most %d records per request", maxIngestRecords)
 	}
 	claude := map[string]core.Account{}
 	for _, a := range s.deps.Accounts {
@@ -135,30 +166,30 @@ func (s *Server) validateIngest(req *core.IngestRequest) error {
 	for i := range req.Records {
 		rec := &req.Records[i]
 		if !recordIDRE.MatchString(rec.ID) {
-			return fmt.Errorf("records[%d]: id must match [A-Za-z0-9:._-]{1,128}", i)
+			return recErr("records[%d]: id must match [A-Za-z0-9:._-]{1,128}", i)
 		}
 		if _, ok := claude[rec.AccountID]; !ok {
-			return fmt.Errorf("records[%d]: account_id %q is not a configured claude account", i, rec.AccountID)
+			return reqErr("records[%d]: account_id %q is not a configured claude account", i, rec.AccountID)
 		}
 		if !rec.UsageKnown {
-			return fmt.Errorf("records[%d]: usage_known must be true", i)
+			return recErr("records[%d]: usage_known must be true", i)
 		}
 		u := rec.Usage
 		for _, n := range []int64{u.InputTokens, u.CachedInputTokens, u.CacheCreationInputTokens,
 			u.OutputTokens, u.ReasoningTokens} {
 			if n < 0 || n > maxTokens {
-				return fmt.Errorf("records[%d]: usage token counts must be between 0 and %d", i, int64(maxTokens))
+				return recErr("records[%d]: usage token counts must be between 0 and %d", i, int64(maxTokens))
 			}
 		}
 		switch {
 		case rec.StartedAt.IsZero():
-			return fmt.Errorf("records[%d]: started_at is required", i)
+			return recErr("records[%d]: started_at is required", i)
 		case rec.StartedAt.After(now.Add(maxSnapshotSkew)):
-			return fmt.Errorf("records[%d]: started_at is more than 5 minutes in the future", i)
+			return recErr("records[%d]: started_at is more than 5 minutes in the future", i)
 		case rec.StartedAt.Before(now.Add(-maxRecordAge)):
-			return fmt.Errorf("records[%d]: started_at is more than 400 days old", i)
+			return recErr("records[%d]: started_at is more than 400 days old", i)
 		case !rec.FinishedAt.IsZero() && rec.FinishedAt.Before(rec.StartedAt):
-			return fmt.Errorf("records[%d]: finished_at is before started_at", i)
+			return recErr("records[%d]: finished_at is before started_at", i)
 		}
 		rec.Host = req.Host
 		rec.Client = ingestClient
@@ -169,23 +200,23 @@ func (s *Server) validateIngest(req *core.IngestRequest) error {
 		snap := &req.Snapshots[i]
 		a, ok := claude[snap.AccountID]
 		if !ok || a.QuotaSource != QuotaSourceAgent {
-			return fmt.Errorf("snapshots[%d]: account_id %q is not a claude account with quota_source agent", i, snap.AccountID)
+			return reqErr("snapshots[%d]: account_id %q is not a claude account with quota_source agent", i, snap.AccountID)
 		}
 		if snap.FetchedAt.IsZero() {
-			return fmt.Errorf("snapshots[%d]: fetched_at is required", i)
+			return reqErr("snapshots[%d]: fetched_at is required", i)
 		}
 		if snap.FetchedAt.After(limit) {
-			return fmt.Errorf("snapshots[%d]: fetched_at is more than 5 minutes in the future", i)
+			return reqErr("snapshots[%d]: fetched_at is more than 5 minutes in the future", i)
 		}
 		for j, win := range snap.Windows {
 			if !windowKindRE.MatchString(win.Kind) {
-				return fmt.Errorf("snapshots[%d].windows[%d]: kind must match [a-z0-9_]{1,32}", i, j)
+				return reqErr("snapshots[%d].windows[%d]: kind must match [a-z0-9_]{1,32}", i, j)
 			}
 			if math.IsNaN(win.UsedFrac) || win.UsedFrac < 0 || win.UsedFrac > 1 {
-				return fmt.Errorf("snapshots[%d].windows[%d]: used_frac must be between 0 and 1", i, j)
+				return reqErr("snapshots[%d].windows[%d]: used_frac must be between 0 and 1", i, j)
 			}
 			if win.WindowSeconds < 0 {
-				return fmt.Errorf("snapshots[%d].windows[%d]: window_seconds must be non-negative", i, j)
+				return reqErr("snapshots[%d].windows[%d]: window_seconds must be non-negative", i, j)
 			}
 		}
 		// Store at most server now: a skewed future FetchedAt would make

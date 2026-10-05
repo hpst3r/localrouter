@@ -28,6 +28,9 @@ const IngestPath = "/control/v1/ingest"
 type HTTPError struct {
 	Status int
 	Body   string
+	// Code is the server's error.code ("invalid_record", "invalid_request"),
+	// "" if absent.
+	Code string
 }
 
 func (e *HTTPError) Error() string {
@@ -37,16 +40,37 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("ingest: http %d: %s", e.Status, e.Body)
 }
 
-// Permanent reports whether the server rejected the request content itself
-// (400, 413, 422), so resending it unchanged cannot succeed. Other statuses
-// (401/403, 429, 5xx) are transient. Callers such as claudelog detect this
-// via errors.As with interface{ Permanent() bool }.
+// Permanent reports whether specific records in the request are invalid, so
+// the caller may isolate (bisect) and drop them. Only a 400 whose error.code
+// is "invalid_record", or a 413 (too large: bisecting shrinks it), qualifies.
+// A request-wide 400 (bad host/schema, account not configured on the server)
+// is NOT permanent: bisecting would drop every valid record, so it is
+// retried later instead. Other statuses (401/403, 429, 5xx) are transient.
+// Callers such as claudelog detect this via errors.As with
+// interface{ Permanent() bool }.
 func (e *HTTPError) Permanent() bool {
 	switch e.Status {
-	case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
+	case http.StatusRequestEntityTooLarge:
 		return true
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+		return e.Code == codeInvalidRecord
 	}
 	return false
+}
+
+const codeInvalidRecord = "invalid_record"
+
+// errorCode extracts error.code from a server error body, "" if absent.
+func errorCode(b []byte) string {
+	var e struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(b, &e) != nil {
+		return ""
+	}
+	return e.Error.Code
 }
 
 // Client posts ingest requests to the central server.
@@ -90,7 +114,7 @@ func (c *Client) Ingest(ctx context.Context, req core.IngestRequest) (core.Inges
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return core.IngestResponse{}, &HTTPError{Status: resp.StatusCode, Body: c.sanitize(b)}
+		return core.IngestResponse{}, &HTTPError{Status: resp.StatusCode, Body: c.sanitize(b), Code: errorCode(b)}
 	}
 	var out core.IngestResponse
 	if err := json.Unmarshal(b, &out); err != nil {
