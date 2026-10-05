@@ -28,7 +28,6 @@ func reviewBug(t *testing.T, msg string) {
 // valid request (a second object, garbage, a truncated concatenation) are
 // silently ignored and the request is written.
 func TestReviewIngestRejectsTrailingGarbage(t *testing.T) {
-	reviewBug(t, "ingest accepts trailing data after the JSON body (Decoder.Decode without EOF check)")
 	f := newIngestFixture(t, true, true)
 	body := `{"schema_version":1,"host":"vm1","records":[{"id":"a","account_id":"claude-max","usage_known":true,"usage":{"input_tokens":1}}]}` +
 		`{"schema_version":1,"host":"vm2"} trailing-garbage`
@@ -42,7 +41,6 @@ func TestReviewIngestRejectsTrailingGarbage(t *testing.T) {
 // fails (see ledger TestReviewSummaryOverflowFromHugeUsage). One bad record
 // from any ingest host poisons usage reporting for all accounts.
 func TestReviewIngestRejectsImplausibleUsage(t *testing.T) {
-	reviewBug(t, "ingest accepts token counts up to MaxInt64; ledger SUM overflows and breaks /usage")
 	f := newIngestFixture(t, true, true)
 	r := goodRecord("huge")
 	r.Usage.InputTokens = math.MaxInt64
@@ -55,7 +53,6 @@ func TestReviewIngestRejectsImplausibleUsage(t *testing.T) {
 // IDs are only checked for non-empty: a 1 MiB ID (or one containing control
 // characters) is stored as a primary key.
 func TestReviewIngestBoundsRecordID(t *testing.T) {
-	reviewBug(t, "ingest record ID has no length/charset limit")
 	f := newIngestFixture(t, true, true)
 	for _, id := range []string{strings.Repeat("x", 1<<20), "a\x00b\nc"} {
 		r := goodRecord(id)
@@ -70,7 +67,6 @@ func TestReviewIngestBoundsRecordID(t *testing.T) {
 // and silently excluded from every since-window; a far-future one is counted
 // in every "last 24h" summary until that date.
 func TestReviewIngestValidatesTimestamps(t *testing.T) {
-	reviewBug(t, "ingest accepts zero / far-future started_at")
 	f := newIngestFixture(t, true, true)
 	zero := goodRecord("zero")
 	zero.StartedAt, zero.FinishedAt = time.Time{}, time.Time{}
@@ -95,7 +91,6 @@ func (c stepClock) Now() time.Time { return *c.t }
 // client — freezes the account's quota view (e.g. at used 0%) for ~5 min.
 // Fix: store min(FetchedAt, server now) or compare against receive time.
 func TestReviewFutureSnapshotFreezesAccount(t *testing.T) {
-	reviewBug(t, "future-dated snapshot (<5m skew) is stored as-is and masks newer real snapshots")
 	now := t0
 	ing := &fakeIngester{snaps: map[string]core.Snapshot{}}
 	h := New(Deps{
@@ -123,7 +118,6 @@ func TestReviewFutureSnapshotFreezesAccount(t *testing.T) {
 // admits background work on a reserved account. The poll path clamps via
 // clampFrac; the ingest path does not.
 func TestReviewIngestValidatesSnapshotWindows(t *testing.T) {
-	reviewBug(t, "ingest accepts snapshot windows with used_frac outside [0,1] / empty kind")
 	f := newIngestFixture(t, true, true)
 	snap := core.Snapshot{AccountID: "claude-max", FetchedAt: t0, Source: "usage_api",
 		Windows: []core.Window{{Kind: core.Window5h, UsedFrac: -5}, {Kind: "", UsedFrac: 42}}}

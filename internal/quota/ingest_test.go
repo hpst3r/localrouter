@@ -23,11 +23,12 @@ func TestAgentSourcedClaudeNeverPolled(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 	var credReads atomic.Int32
+	clk := &fakeClock{t: t0}
 	m := New([]core.Account{
 		{ID: "cl-agent", Provider: core.ProviderClaude, QuotaSource: QuotaSourceAgent},
 		{ID: "cl-local", Provider: core.ProviderClaude, QuotaSource: "local"},
 	}, nil, Options{
-		Clock:          &fakeClock{t: t0},
+		Clock:          clk,
 		HTTPClient:     srv.Client(),
 		ClaudeUsageURL: srv.URL,
 		ClaudeCredentialsFile: func(id string) string {
@@ -83,6 +84,7 @@ func TestAgentSourcedClaudeNeverPolled(t *testing.T) {
 		t.Fatalf("stale snapshot replaced stored one: %+v", got)
 	}
 
+	clk.Advance(time.Minute) // FetchedAt is capped at the manager's clock
 	newer := core.Snapshot{AccountID: "cl-agent", FetchedAt: t0.Add(time.Minute), Err: "claude token expired; run claude to refresh"}
 	if err := m.IngestSnapshot(newer); err != nil {
 		t.Fatal(err)
@@ -184,5 +186,22 @@ func TestParseClaudeCredentials(t *testing.T) {
 		if !errors.Is(err, ErrClaudeCredentialsMalformed) || strings.Contains(err.Error(), claudeToken) {
 			t.Fatalf("%q: err=%v", bad, err)
 		}
+	}
+}
+
+// A pushed FetchedAt ahead of the manager's clock is capped at now, so a
+// host with a fast clock cannot make later genuine snapshots look stale.
+func TestIngestSnapshotCapsFutureFetchedAt(t *testing.T) {
+	clk := &fakeClock{t: t0}
+	m := New([]core.Account{{ID: "cl", Provider: core.ProviderClaude, QuotaSource: QuotaSourceAgent}}, nil, Options{Clock: clk})
+	if err := m.IngestSnapshot(core.Snapshot{AccountID: "cl", FetchedAt: t0.Add(4 * time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := m.Latest("cl"); !got.FetchedAt.Equal(t0) {
+		t.Fatalf("FetchedAt %v, want %v", got.FetchedAt, t0)
+	}
+	clk.Advance(time.Minute)
+	if err := m.IngestSnapshot(core.Snapshot{AccountID: "cl", FetchedAt: t0.Add(time.Minute)}); err != nil {
+		t.Fatalf("later genuine snapshot: %v", err)
 	}
 }

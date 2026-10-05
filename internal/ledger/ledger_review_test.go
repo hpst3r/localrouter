@@ -26,7 +26,6 @@ func reviewBug(t *testing.T, msg string) {
 // overflow" and every Summary over that range errors — for all groups and
 // all accounts, not just the poisoned one.
 func TestReviewSummaryOverflowFromHugeUsage(t *testing.T) {
-	reviewBug(t, "SUM(input_tokens) overflows on ingested MaxInt64 usage; Summary fails for every group")
 	l, err := Open(filepath.Join(t.TempDir(), "l.db"), nil, nil)
 	if err != nil {
 		t.Fatal(err)

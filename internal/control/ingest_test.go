@@ -251,7 +251,19 @@ func TestIngestRejectsInvalid(t *testing.T) {
 	unknown := goodRecord("u")
 	unknown.UsageKnown = false
 	noID := goodRecord("")
+	old := goodRecord("old")
+	old.StartedAt = t0.AddDate(0, 0, -401)
+	backwards := goodRecord("back")
+	backwards.FinishedAt = backwards.StartedAt.Add(-time.Second)
 	cases := map[string]any{
+		"old record":       core.IngestRequest{SchemaVersion: 1, Host: "vm1", Records: []core.RequestRecord{old}},
+		"finished<started": core.IngestRequest{SchemaVersion: 1, Host: "vm1", Records: []core.RequestRecord{backwards}},
+		"negative window_seconds": core.IngestRequest{SchemaVersion: 1, Host: "vm1",
+			Snapshots: []core.Snapshot{{AccountID: "claude-max", FetchedAt: t0,
+				Windows: []core.Window{{Kind: core.Window5h, WindowSeconds: -1}}}}},
+		"bad window kind": core.IngestRequest{SchemaVersion: 1, Host: "vm1",
+			Snapshots: []core.Snapshot{{AccountID: "claude-max", FetchedAt: t0,
+				Windows: []core.Window{{Kind: "5H"}}}}},
 		"not json":       "{",
 		"schema":         core.IngestRequest{SchemaVersion: 2, Host: "vm1"},
 		"empty host":     core.IngestRequest{SchemaVersion: 1},
@@ -332,7 +344,8 @@ func TestIngestSnapshots(t *testing.T) {
 		if r.SnapshotsAccepted != 1 || r.SnapshotsIgnored != 2 {
 			t.Fatalf("precheck=%v second: %+v", precheck, r)
 		}
-		if got, _ := f.ing.Latest("claude-max"); !got.FetchedAt.Equal(newer.FetchedAt) {
+		// The skewed FetchedAt is stored capped at server now.
+		if got, _ := f.ing.Latest("claude-max"); !got.FetchedAt.Equal(t0) {
 			t.Fatalf("stored %v", got.FetchedAt)
 		}
 	}
