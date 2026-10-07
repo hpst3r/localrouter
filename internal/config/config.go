@@ -37,6 +37,7 @@ type Config struct {
 	Accounts    []AccountConfig  `yaml:"accounts"`
 	Routes      []RouteConfig    `yaml:"routes"`
 	ClaudeLogs  ClaudeLogsConfig `yaml:"claude_logs"`
+	HermesLogs  HermesLogsConfig `yaml:"hermes_logs"`
 }
 
 // ClaudeLogsConfig controls ingestion of Claude Code transcript token usage.
@@ -48,6 +49,23 @@ type ClaudeLogsConfig struct {
 	// Client names the ledger client for locally collected Claude Code usage
 	// (default "claude-code"); set it to a registered client to attribute it.
 	Client string `yaml:"client"`
+}
+
+// HermesLogsConfig imports Hermes Agent's own per-session, per-model token
+// accounting (state.db session_model_usage, read-only) so traffic Hermes
+// sends directly to providers is counted. Rows whose billing_base_url points
+// at this router are skipped (already in the ledger).
+type HermesLogsConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Home    string `yaml:"home"` // default ~/.hermes (profiles/*/state.db included)
+	// Accounts maps a Hermes billing_provider (e.g. "anthropic",
+	// "openai-codex", "ollama-cloud") to a LocalRouter account id. Unmapped
+	// providers are recorded with an empty account. Rows with an empty
+	// billing_provider (auxiliary tasks) use model prefixes: claude-* ->
+	// Accounts["anthropic"].
+	Accounts     map[string]string `yaml:"accounts"`
+	Client       string            `yaml:"client"`        // default "hermes"
+	ScanInterval Duration          `yaml:"scan_interval"` // default 1m
 }
 
 type QuotaConfig struct {
@@ -180,6 +198,19 @@ func (c *Config) applyDefaults(baseDir string) {
 	}
 	if c.ClaudeLogs.Client == "" {
 		c.ClaudeLogs.Client = "claude-code"
+	}
+	if c.HermesLogs.Home == "" {
+		if h, err := os.UserHomeDir(); err == nil {
+			c.HermesLogs.Home = filepath.Join(h, ".hermes")
+		}
+	} else {
+		c.HermesLogs.Home = expand(c.HermesLogs.Home, baseDir)
+	}
+	if c.HermesLogs.Client == "" {
+		c.HermesLogs.Client = "hermes"
+	}
+	if c.HermesLogs.ScanInterval == 0 {
+		c.HermesLogs.ScanInterval = Duration(time.Minute)
 	}
 	for i := range c.Accounts {
 		a := &c.Accounts[i]

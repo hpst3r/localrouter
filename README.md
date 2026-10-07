@@ -49,6 +49,25 @@ the home directory is read-only except `~/.config/localrouter`. To upgrade,
 rebuild, re-run `install`, then `systemctl --user restart localrouter`. With
 lingering enabled (`loginctl enable-linger`), it runs without a login session.
 
+## Hermes usage import
+
+Hermes Agent sends some traffic directly to providers (e.g. its Anthropic
+provider, direct Codex/Ollama). `hermes_logs` imports Hermes's own per-session
+token accounting read-only from `~/.hermes/state.db` and
+`~/.hermes/profiles/*/state.db` (`session_model_usage`), every minute, as
+usage increases only. Rows Hermes already sent through this router are
+skipped. Records use route `hermes`, client `hermes` (or `hermes/<profile>`),
+and agent `main`, `subagent` or `aux:<task>`.
+
+```yaml
+hermes_logs:
+  enabled: true
+  accounts:            # Hermes billing_provider -> LocalRouter account
+    anthropic: claude-max
+    openai-codex: codex-primary
+    ollama-cloud: ollama-cloud
+```
+
 ## Multi-host (central router + agents)
 
 One router serves every machine on the mesh (Tailscale/NetBird). Each machine

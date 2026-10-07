@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/hpst3r/localrouter/internal/config"
 	"github.com/hpst3r/localrouter/internal/control"
 	"github.com/hpst3r/localrouter/internal/core"
+	"github.com/hpst3r/localrouter/internal/hermeslog"
 	"github.com/hpst3r/localrouter/internal/ledger"
 	"github.com/hpst3r/localrouter/internal/policy"
 	"github.com/hpst3r/localrouter/internal/proxy"
@@ -42,6 +44,8 @@ type App struct {
 	Auth    *auth.Manager
 	// ClaudeLog is nil unless claude_logs.enabled.
 	ClaudeLog *claudelog.Collector
+	// HermesLog is nil unless hermes_logs.enabled.
+	HermesLog *hermeslog.Collector
 }
 
 // StaticKeys maps non-codex accounts to their key sources.
@@ -186,7 +190,35 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 			Logger:       logger,
 		})
 	}
+	if cfg.HermesLogs.Enabled {
+		a.HermesLog = hermeslog.New(led, hermeslog.Options{
+			Home:         cfg.HermesLogs.Home,
+			Accounts:     cfg.HermesLogs.Accounts,
+			Client:       cfg.HermesLogs.Client,
+			Host:         cfg.HostName,
+			SelfHosts:    selfHosts(cfg.Listen),
+			StatePath:    filepath.Join(cfg.DataDir, "hermeslog-state.json"),
+			ScanInterval: cfg.HermesLogs.ScanInterval.D(),
+			Logger:       logger,
+		})
+	}
 	return a, nil
+}
+
+// selfHosts lists host:port spellings of this router as clients might write
+// them in a base URL (so Hermes rows already proxied here are skipped).
+func selfHosts(listen string) []string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return nil
+	}
+	out := []string{net.JoinHostPort(host, port)}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() || host == "" || host == "0.0.0.0" || host == "::" {
+		for _, h := range []string{"127.0.0.1", "localhost", "::1"} {
+			out = append(out, net.JoinHostPort(h, port))
+		}
+	}
+	return out
 }
 
 // Start begins background quota polling until ctx is cancelled.
@@ -194,6 +226,9 @@ func (a *App) Start(ctx context.Context) {
 	a.Quota.Start(ctx)
 	if a.ClaudeLog != nil {
 		a.ClaudeLog.Start(ctx)
+	}
+	if a.HermesLog != nil {
+		a.HermesLog.Start(ctx)
 	}
 }
 
