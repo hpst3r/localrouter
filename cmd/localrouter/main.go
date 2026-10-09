@@ -98,10 +98,21 @@ func loadConfig(fs *flag.FlagSet, args []string) (*config.Config, error) {
 	return config.Load(*path)
 }
 
+// checkFiles runs cfg.CheckFiles against the -config path parsed into fs.
+func checkFiles(fs *flag.FlagSet, cfg *config.Config) error {
+	if err := cfg.CheckFiles(fs.Lookup("config").Value.String()); err != nil {
+		return fmt.Errorf("file permissions:\n%w", err)
+	}
+	return nil
+}
+
 func cmdCheck(args []string) error {
 	fs := flag.NewFlagSet("check", flag.ExitOnError)
 	cfg, err := loadConfig(fs, args)
 	if err != nil {
+		return err
+	}
+	if err := checkFiles(fs, cfg); err != nil {
 		return err
 	}
 	keyFiles := map[string][]string{}
@@ -251,6 +262,10 @@ func cmdServe(args []string) error {
 	// parse failure never leaves a half-resolved path behind. The path is
 	// passed to Reload explicitly, so the app need not retain it.
 	cfgPath := fs.Lookup("config").Value.String()
+	// Fail closed on loose secret-file or config/data_dir permissions.
+	if err := checkFiles(fs, cfg); err != nil {
+		return err
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	a, err := app.Build(cfg, logger, app.Overrides{})
 	if err != nil {
