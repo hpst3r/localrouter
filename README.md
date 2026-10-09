@@ -41,6 +41,15 @@ bin/localrouter serve
 ```
 
 Widget: <http://127.0.0.1:8787/>. JSON: `/control/v1/status`, `/control/v1/usage?since=7d&group=model`.
+Liveness: `/healthz`. Local readiness (willing to serve + storage healthy, never
+a statement about upstream providers): `/readyz`. Authenticated diagnostics,
+including inference concurrency: `/control/v1/diagnostics`.
+
+Optional `limits.max_concurrent` / `limits.max_concurrent_per_client` cap
+active inference requests (0 = unlimited, negatives rejected); a saturated
+request gets `429` `concurrency_limit_exceeded` with `Retry-After: 1`. Optional
+`timeouts.header|body|idle|shutdown` bound inbound reads, idle keep-alive, and
+the graceful drain; 0 selects the default. See [the specification](docs/SPEC.md).
 
 ## Run as a service (systemd --user)
 
@@ -141,7 +150,8 @@ scan: if the router is down, they do not advance their transcript offsets and
 re-send later (records are deduplicated by ID).
 
 Before relying on the deployment, run the [remote acceptance checks](docs/NETWORK.md#3-verify-from-a-remote-client).
-A successful `check` or `/healthz` does not verify upstream inference.
+A successful `check`, `/healthz` (liveness) or `/readyz` (local readiness) does
+not verify upstream inference; only a real model request does.
 Server config/client keys are loaded at startup; validate and restart after
 changing them. Agents also need a restart after config/key changes.
 

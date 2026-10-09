@@ -52,6 +52,16 @@ type Deps struct {
 	// the stored snapshot" (counted as ignored, not a failure). Nil falls back
 	// to matching "stale" in the error text.
 	IsSnapshotStale func(error) bool
+	// Storage probes local storage health for /readyz and diagnostics. Nil
+	// means storage health is not observed (reported as unconfigured).
+	Storage StoragePinger
+	// Inflight reports inference concurrency for diagnostics. Nil reports
+	// zero capacity.
+	Inflight InflightReporter
+	// Ready reports whether this instance is serving. Nil defaults to ready.
+	// It folds in process shutdown so /readyz and diagnostics flip not-ready
+	// once the process stops accepting work, independently of storage health.
+	Ready func() bool
 	// Clock defaults to core.SystemClock.
 	Clock core.Clock
 }
@@ -86,11 +96,13 @@ func New(deps Deps, opts Options) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
+	mux.HandleFunc("GET /readyz", s.readyz)
 	mux.HandleFunc("GET /{$}", s.widget)
 	mux.Handle("GET /control/v1/status", s.auth(http.HandlerFunc(s.status)))
 	mux.Handle("GET /control/v1/usage", s.auth(http.HandlerFunc(s.usage)))
 	mux.Handle("GET /control/v1/analytics", s.auth(http.HandlerFunc(s.analytics)))
 	mux.Handle("GET /control/v1/analytics/dimensions", s.auth(http.HandlerFunc(s.analyticsDimensions)))
+	mux.Handle("GET /control/v1/diagnostics", s.auth(http.HandlerFunc(s.diagnostics)))
 	mux.Handle("POST /control/v1/admit", s.auth(http.HandlerFunc(s.admit)))
 	mux.HandleFunc("POST /control/v1/ingest", s.ingest)
 	return mux

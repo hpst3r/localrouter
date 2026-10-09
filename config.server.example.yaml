@@ -25,6 +25,18 @@ policy:
   inflight_estimate: 0.01
   max_failovers: 2
 
+limits:                             # optional; 0 = unlimited, negatives rejected
+  max_concurrent: 64                # global cap on active inference requests
+  max_concurrent_per_client:        # per-client caps by registered client name
+    vm1: 4                          # cap subagent/cron workers (names must be registered clients)
+    vm2: 4
+
+timeouts:                           # optional; 0 selects the default, negatives rejected
+  header: 10s
+  body: 30s
+  idle: 120s
+  shutdown: 30s
+
 clients:
   # Interactive (people at keyboards)
   - { name: laptop,    class: interactive, host: laptop, key_file: keys/laptop.key, ingest: true }

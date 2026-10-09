@@ -119,6 +119,10 @@ func newFixture(requireAuth bool) *fixture {
 		Quota:  q,
 		Policy: pol,
 		Ledger: led,
+		// Readiness requires a wired storage probe: the fixture wires a healthy
+		// fakePinger explicitly so /readyz is ready by default. Tests that need
+		// failure/unconfigured storage overwrite deps.Storage.
+		Storage: fakePinger{},
 		Routes: []core.Route{{
 			Name: "gpt", Models: []string{"gpt-5", "gpt-5-mini"},
 			Interactive: []string{"primary", "secondary"}, Background: []string{"secondary"},

@@ -142,6 +142,15 @@ func (l *Ledger) migrate() error {
 // Close closes the database.
 func (l *Ledger) Close() error { return l.db.Close() }
 
+// Ping probes storage health with a bounded, read-only check. It uses a
+// connection ping (SQLite issues no statement) and never mutates state, so it
+// is safe to call from the readiness and diagnostics paths. It satisfies
+// control.StoragePinger, letting the control server self-wire the ledger as
+// its read-only storage probe.
+func (l *Ledger) Ping(ctx context.Context) error {
+	return l.db.PingContext(ctx)
+}
+
 const insertSQL = `INSERT INTO requests (
 	id, started_at, finished_at, client, class, route, model, provider,
 	account_id, upstream_identity, status, failover_of, input_tokens,

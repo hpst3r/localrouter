@@ -10,12 +10,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
-	"time"
 
 	"github.com/hpst3r/localrouter/internal/app"
 	"github.com/hpst3r/localrouter/internal/auth"
@@ -263,34 +261,9 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
-	srv := &http.Server{Handler: a.Handler, ReadHeaderTimeout: 10 * time.Second}
-	tls := cfg.TLSCertFile != ""
-	logger.Info("localrouter listening", "addr", ln.Addr().String(), "tls", tls, "accounts", len(cfg.Accounts), "routes", len(cfg.Routes))
-	errc := make(chan error, 1)
-	go func() {
-		if tls {
-			errc <- srv.ServeTLS(ln, cfg.TLSCertFile, cfg.TLSKeyFile)
-			return
-		}
-		errc <- srv.Serve(ln)
-	}()
-	select {
-	case <-ctx.Done():
-		logger.Info("shutting down; draining in-flight requests (up to 30s)")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			// Long streams outlived the drain window: cut them, then give their
-			// handlers a moment to record ledger rows before the ledger closes.
-			logger.Warn("drain timeout; closing remaining connections", "err", err)
-			_ = srv.Close()
-			time.Sleep(2 * time.Second)
-		}
-		return nil
-	case err := <-errc:
-		if errors.Is(err, http.ErrServerClosed) {
-			return nil
-		}
-		return err
-	}
+	logger.Info("localrouter listening", "addr", ln.Addr().String(), "tls", cfg.TLSCertFile != "",
+		"accounts", len(cfg.Accounts), "routes", len(cfg.Routes))
+	// Serve owns the inbound deadlines (header, body, idle), the concurrency
+	// limiter and the graceful drain; the CLI only owns the listener.
+	return a.Serve(ctx, ln)
 }

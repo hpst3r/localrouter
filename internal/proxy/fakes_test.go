@@ -186,6 +186,9 @@ type harness struct {
 	quota    *fakeQuota
 	ledger   *fakeLedger
 	logs     *syncBuffer
+	limiter  Limiter
+	lim      *fakeLimiter
+	gates    []chan struct{} // upstream handlers blocked until closed
 	accounts map[string]core.Account
 	routes   []core.Route
 	opts     Options
@@ -199,6 +202,29 @@ func newHarness(t *testing.T) *harness {
 	}
 }
 
+// setLimiter installs a fake concurrency limiter and returns it for
+// assertions. It is injected into the Proxy through the Limiter interface while
+// the concrete type stays available to the test.
+func (h *harness) setLimiter(global int, perClient map[string]int) *fakeLimiter {
+	l := newFakeLimiter(global, perClient)
+	h.limiter, h.lim = l, l
+	return l
+}
+
+// closeGates unblocks every upstream handler that is waiting on a gate, so a
+// test can end (or a failed assertion can unwind) without any upstream request
+// being left in flight. It is idempotent, and must be safe to run more than
+// once because tests may also close their own gates.
+func (h *harness) closeGates() {
+	for _, g := range h.gates {
+		select {
+		case <-g:
+		default:
+			close(g)
+		}
+	}
+}
+
 // upstream registers an account served by handler and returns its server.
 func (h *harness) upstream(id, provider string, handler http.HandlerFunc) *httptest.Server {
 	s := httptest.NewServer(handler)
@@ -208,9 +234,21 @@ func (h *harness) upstream(id, provider string, handler http.HandlerFunc) *httpt
 }
 
 func (h *harness) start() {
+	// Teardown registered LAST so it runs FIRST (cleanups run LIFO, before the
+	// per-upstream server closes): release any blocked upstream handler, then
+	// stop the proxy. Without this a test that deliberately leaves a request in
+	// flight would deadlock httptest.Server.Close on the active connection and
+	// hang the whole test binary instead of failing fast.
+	h.t.Cleanup(func() {
+		h.closeGates()
+		if h.srv != nil {
+			h.srv.CloseClientConnections()
+			h.srv.Close()
+		}
+	})
 	p := New(Deps{
 		Accounts: h.accounts, Routes: h.routes, Creds: h.creds, Quota: h.quota,
-		Policy: h.policy, Ledger: h.ledger, Clock: fixedClock{testNow},
+		Policy: h.policy, Ledger: h.ledger, Clock: fixedClock{testNow}, Limiter: h.limiter,
 		Logger: slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Authenticate: func(bearer string) (core.Client, bool) {
 			switch bearer {
