@@ -9,6 +9,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+
+	"github.com/hpst3r/localrouter/internal/core"
 )
 
 // MinClientKeyLen is the minimum accepted client key length.
@@ -64,13 +66,8 @@ func LoadClientKeyFiles(files map[string][]string) (*ClientKeys, error) {
 			return nil, fmt.Errorf("auth: client %s: at least one key file is required", name)
 		}
 		for _, path := range paths {
-			fi, err := os.Stat(path)
-			if err != nil {
-				return nil, fmt.Errorf("auth: client %s: key file: %w", name, err)
-			}
-			if fi.Mode().Perm()&0o077 != 0 {
-				return nil, fmt.Errorf("auth: client %s: key file %s has mode %#o; must not be group/world accessible (chmod 600)",
-					name, path, fi.Mode().Perm())
+			if err := core.CheckPrivateFile("auth: client "+name+": key file", path); err != nil {
+				return nil, err
 			}
 			b, err := os.ReadFile(path)
 			if err != nil {

@@ -142,6 +142,7 @@ func (m *Manager) LoginWithOptions(ctx context.Context, accountID string, out io
 		return err
 	}
 	st.tok = &t
+	st.unsaved = false
 	st.invalidated = false
 	st.refreshedAt = now
 	m.clearFailureLocked(st)
