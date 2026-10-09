@@ -27,6 +27,10 @@ After=network-online.target
 
 [Container]
 # Operator: replace VERSION with a real, published tag before installing.
+# Prefer pinning by digest so a re-pushed tag is never pulled silently; take
+# the digest from the release workflow summary and verify its provenance first
+# (docs/CONTAINERS.md, "Verifying releases"):
+#   Image=ghcr.io/hpst3r/localrouter@sha256:<digest>
 Image=ghcr.io/hpst3r/localrouter:VERSION
 ContainerName=localrouter
 Network=localrouter.network

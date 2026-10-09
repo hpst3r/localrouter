@@ -24,13 +24,23 @@ Wants=localrouter.service localrouter-network.service
 After=localrouter.service localrouter-network.service
 
 [Container]
-Image=docker.io/nginxinc/nginx-unprivileged:1.30.5-alpine
+# Pinned to the multi-arch index digest; the tag is informational. To update:
+#   skopeo inspect --raw docker://docker.io/nginxinc/nginx-unprivileged:<tag> | sha256sum
+Image=docker.io/nginxinc/nginx-unprivileged:1.30.5-alpine@sha256:15c994d10d6d78658721c3bcafff14cb281fba2a4bdf9d5ba92c416a472516e3
 ContainerName=localrouter-nginx
 Network=localrouter.network
 NetworkAlias=localrouter-nginx
 
 # The ONLY host publication in this deployment. Rootless 8443.
-PublishPort=8443:8443
+#
+# >>> OPERATOR: replace 127.0.0.1 with the LAN or overlay (e.g. Tailscale/
+# >>> WireGuard) interface IP that clients use. As shipped, the edge is
+# >>> reachable from this host only. Never drop the address: a bare
+# >>> `8443:8443` binds every interface (0.0.0.0 and [::]), including
+# >>> public/Wi-Fi ones. A host firewall is still required; rootless port
+# >>> forwarding hides client source IPs from NGINX and the router, so
+# >>> neither can filter by address.
+PublishPort=127.0.0.1:8443:8443
 
 # Operator-supplied server block and operator-provisioned cert/key (tls.crt,
 # tls.key), both read-only.

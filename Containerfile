@@ -5,7 +5,7 @@
 # (GOMAXPROCS=2, GOFLAGS=-p=2, see scripts/release.sh), so a container build
 # never fans out across every host core.
 #
-# Stage 2 is a pinned minimal Alpine runtime carrying a CA bundle (the router
+# Stage 2 is a digest-pinned minimal Alpine runtime carrying a CA bundle (the router
 # proxies to upstream providers over HTTPS), an explicit non-root UID/GID
 # 1000:1000, and busybox wget as the health-probe helper (no curl is installed).
 # This image never terminates TLS: no tls_cert_file/tls_key_file are configured
@@ -30,7 +30,11 @@
 #     -v localrouter-data:/var/lib/localrouter:rw \
 #     localhost/localrouter:0.3.0
 
-FROM docker.io/library/golang:1.26.8-alpine AS build
+# Base images are pinned to the multi-arch index digest; the tag is kept for
+# readability and is ignored when a digest is present. Dependabot (docker
+# ecosystem) proposes digest bumps. To update by hand:
+#   skopeo inspect --raw docker://docker.io/library/golang:<tag> | sha256sum
+FROM docker.io/library/golang:1.26.8-alpine@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS build
 
 # Static binary; bounded parallelism matches the release contract.
 ENV CGO_ENABLED=0 \
@@ -55,7 +59,7 @@ ARG VERSION=dev
 RUN go build -trimpath -o /out/localrouter ./cmd/localrouter \
  && /out/localrouter --help > /dev/null
 
-FROM docker.io/library/alpine:3.22 AS runtime
+FROM docker.io/library/alpine:3.22@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8 AS runtime
 
 ARG VERSION=dev
 
@@ -67,6 +71,9 @@ LABEL org.opencontainers.image.title="localrouter" \
 # ca-certificates is required: the router proxies to upstream providers over
 # HTTPS. The image's own listener is plain HTTP. A fixed non-root UID/GID keeps
 # the process identity explicit rather than inheriting podman's userns root.
+# ca-certificates is not version-pinned (Alpine drops superseded package
+# versions from its mirrors); the base digest fixes the release branch, so
+# the apk layer is not bit-for-bit reproducible across rebuilds.
 RUN apk add --no-cache ca-certificates \
  && addgroup -g 1000 -S localrouter \
  && adduser -u 1000 -S -D -H -G localrouter -s /sbin/nologin localrouter \
