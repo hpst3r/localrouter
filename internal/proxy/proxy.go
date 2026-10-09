@@ -313,8 +313,8 @@ var errBodyShape = errors.New("request body must be a single JSON object with a 
 // upstream could read differently: anything but a single UTF-8 JSON object,
 // duplicate top-level keys, or a top-level key that matches "model"/"stream"
 // only case-insensitively (encoding/json struct decoding would match it).
-// model must be a non-empty string and stream, if present, a boolean. Nested
-// values are only checked for syntax. A body that passes is unambiguous, so
+// model must be a non-empty string and stream, if present, a boolean or null
+// (false). Nested values are only checked for syntax. A body that passes is unambiguous, so
 // it can be forwarded unchanged.
 func parseHead(body []byte) (requestHead, error) {
 	var h requestHead
@@ -346,8 +346,9 @@ func parseHead(body []byte) (requestHead, error) {
 				return h, errors.New("model must be a string")
 			}
 		case key == "stream":
-			if (raw[0] != 't' && raw[0] != 'f') || json.Unmarshal(raw, &h.Stream) != nil {
-				return h, errors.New("stream must be a boolean")
+			// null is an omitted optional (SDKs send it) and means false.
+			if (raw[0] != 't' && raw[0] != 'f' && raw[0] != 'n') || json.Unmarshal(raw, &h.Stream) != nil {
+				return h, errors.New("stream must be a boolean or null")
 			}
 		case strings.EqualFold(key, "model"), strings.EqualFold(key, "stream"):
 			return h, fmt.Errorf("ambiguous key %q in request body", core.TruncateLabel(key))

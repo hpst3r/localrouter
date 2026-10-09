@@ -73,24 +73,26 @@ func TestSecAmbiguousBodiesRejected(t *testing.T) {
 	singleRoute(h, "o")
 	h.start()
 	cases := map[string]string{
-		"duplicate model":         `{"model":"gpt-x","model":"gpt-x"}`,
-		"duplicate escaped model": `{"model":"gpt-x","model":"other"}`,
-		"duplicate other key":     `{"model":"gpt-x","messages":[],"messages":[]}`,
-		"duplicate stream":        `{"model":"gpt-x","stream":false,"stream":true}`,
-		"case-variant model":      `{"Model":"gpt-x"}`,
-		"case-variant stream":     `{"model":"gpt-x","STREAM":true}`,
-		"unicode-fold stream":     `{"model":"gpt-x","ſtream":true}`,
-		"trailing object":         `{"model":"gpt-x"}{"model":"other"}`,
-		"trailing garbage":        `{"model":"gpt-x"} x`,
-		"model not string":        `{"model":["gpt-x"]}`,
-		"model empty":             `{"model":""}`,
-		"model missing":           `{"messages":[]}`,
-		"stream string":           `{"model":"gpt-x","stream":"true"}`,
-		"stream number":           `{"model":"gpt-x","stream":1}`,
-		"stream null":             `{"model":"gpt-x","stream":null}`,
-		"top-level array":         `[{"model":"gpt-x"}]`,
-		"invalid utf-8":           "{\"model\":\"gpt-x\",\"x\xff\":1}",
-		"unterminated":            `{"model":"gpt-x",`,
+		"duplicate model":          `{"model":"gpt-x","model":"gpt-x"}`,
+		"duplicate escaped model":  `{"model":"gpt-x","model":"other"}`,
+		"duplicate other key":      `{"model":"gpt-x","messages":[],"messages":[]}`,
+		"duplicate stream":         `{"model":"gpt-x","stream":false,"stream":true}`,
+		"case-variant model":       `{"Model":"gpt-x"}`,
+		"case-variant stream":      `{"model":"gpt-x","STREAM":true}`,
+		"unicode-fold stream":      `{"model":"gpt-x","ſtream":true}`,
+		"trailing object":          `{"model":"gpt-x"}{"model":"other"}`,
+		"trailing garbage":         `{"model":"gpt-x"} x`,
+		"model not string":         `{"model":["gpt-x"]}`,
+		"model empty":              `{"model":""}`,
+		"model missing":            `{"messages":[]}`,
+		"stream string":            `{"model":"gpt-x","stream":"true"}`,
+		"stream number":            `{"model":"gpt-x","stream":1}`,
+		"stream object":            `{"model":"gpt-x","stream":{}}`,
+		"case-variant stream null": `{"model":"gpt-x","Stream":null}`,
+		"model null":               `{"model":null}`,
+		"top-level array":          `[{"model":"gpt-x"}]`,
+		"invalid utf-8":            "{\"model\":\"gpt-x\",\"x\xff\":1}",
+		"unterminated":             `{"model":"gpt-x",`,
 	}
 	for name, in := range cases {
 		for _, path := range []string{"/v1/chat/completions", "/v1/responses"} {
@@ -167,9 +169,10 @@ func affordable402(hits *atomic.Int32, afford int) http.HandlerFunc {
 }
 
 // Accounts without a management key never learn their balance, which is the
-// review PoC's setup. The 402 body itself proves funds ("can only afford N",
-// N > 0), so the request is still relayed without failover or cooldown, and
-// the relayed body is intact after the classifier peeked at it.
+// review PoC's setup. The affordability 402 is request-scoped: no cooldown,
+// so an interactive request still succeeds. It fails over (another key may
+// have more credit) and, when every candidate answers the same, the last
+// body is relayed intact after the classifier peeked at it.
 func TestSecRequestScoped402WithoutBalance(t *testing.T) {
 	h := newHarness(t)
 	var hits1, hits2 atomic.Int32
@@ -186,8 +189,8 @@ func TestSecRequestScoped402WithoutBalance(t *testing.T) {
 		!strings.HasSuffix(strings.TrimSpace(string(body)), "}}") {
 		t.Fatalf("bg status %d body %s", resp.StatusCode, body)
 	}
-	if hits1.Load()+hits2.Load() != 1 {
-		t.Fatalf("request replayed: or1=%d or2=%d", hits1.Load(), hits2.Load())
+	if hits1.Load() != 1 || hits2.Load() != 1 {
+		t.Fatalf("hits or1=%d or2=%d", hits1.Load(), hits2.Load())
 	}
 	resp = h.post("/v1/chat/completions", clientKey, `{"model":"gpt-x","messages":[]}`, nil)
 	body, _ = io.ReadAll(resp.Body)
@@ -200,14 +203,16 @@ func TestSecRequestScoped402WithoutBalance(t *testing.T) {
 	}
 }
 
-// "can only afford 0" (or no affordable amount, or a known exhausted balance)
-// is the account being out of credit: cooldown and failover as before.
-func TestSecAffordZeroIsAccountLevel(t *testing.T) {
+// The affordability 402 fails over in every case; it is request-scoped
+// (including "can only afford 0", which a large prompt can cause) unless a
+// known exhausted balance says the account is out of credit.
+func TestSecAffordability402Outcome(t *testing.T) {
 	for name, tc := range map[string]struct {
 		afford int
 		snap   *core.Snapshot
+		scoped bool
 	}{
-		"afford zero":            {afford: 0},
+		"afford zero":            {afford: 0, scoped: true},
 		"exhausted balance wins": {afford: 50, snap: ptrSnap(fundedSnapshot(0, testNow))},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -225,7 +230,7 @@ func TestSecAffordZeroIsAccountLevel(t *testing.T) {
 			if resp.StatusCode != http.StatusOK || hitsB.Load() != 1 {
 				t.Fatalf("status %d, failover hits %d", resp.StatusCode, hitsB.Load())
 			}
-			if o := h.policy.leases[0].outcome; o.Status != 402 || o.RequestScoped {
+			if o := h.policy.leases[0].outcome; o.Status != 402 || o.RequestScoped != tc.scoped {
 				t.Fatalf("outcome %+v", o)
 			}
 		})
@@ -234,9 +239,9 @@ func TestSecAffordZeroIsAccountLevel(t *testing.T) {
 
 func ptrSnap(s core.Snapshot) *core.Snapshot { return &s }
 
-// Adapted from the review PoC: a 402 while the balance is known positive is
-// the request's problem. It is relayed without failover and without a
-// cooldown, so an interactive request on the same route still succeeds.
+// Adapted from the review PoC: the affordability 402 is the request's
+// problem. Every candidate is tried, none is cooled down, the last 402 is
+// relayed, and an interactive request on the same route still succeeds.
 func TestSecRequestScoped402DoesNotLockOutInteractive(t *testing.T) {
 	h := newHarness(t)
 	var hits1, hits2 atomic.Int32
@@ -254,8 +259,8 @@ func TestSecRequestScoped402DoesNotLockOutInteractive(t *testing.T) {
 	if resp.StatusCode != http.StatusPaymentRequired || !strings.Contains(string(body), "fewer max_tokens") {
 		t.Fatalf("bg status %d body %s", resp.StatusCode, body)
 	}
-	if hits1.Load()+hits2.Load() != 1 {
-		t.Fatalf("request replayed: or1=%d or2=%d", hits1.Load(), hits2.Load())
+	if hits1.Load() != 1 || hits2.Load() != 1 {
+		t.Fatalf("hits or1=%d or2=%d", hits1.Load(), hits2.Load())
 	}
 
 	resp = h.post("/v1/chat/completions", clientKey, `{"model":"gpt-x","messages":[]}`, nil)
@@ -272,12 +277,14 @@ func TestSecRequestScoped402DoesNotLockOutInteractive(t *testing.T) {
 	}
 }
 
-// Without proof of funds a 402 stays an account-level answer: cooldown and
-// failover, so a genuinely empty account does not block the route.
+// Any 402 other than the affordability preflight is account-level: cooldown
+// and failover, so a genuinely empty account does not block the route. A
+// fresh positive balance does not prove current funds.
 func TestSecAccountLevel402StillFailsOver(t *testing.T) {
 	cases := map[string]func(q *fakeQuota){
 		"balance zero":  func(q *fakeQuota) { q.setSnapshot("or", fundedSnapshot(0, testNow)) },
 		"balance stale": func(q *fakeQuota) { q.setSnapshot("or", fundedSnapshot(25, testNow.Add(-time.Hour))) },
+		"balance fresh": func(q *fakeQuota) { q.setSnapshot("or", fundedSnapshot(25, testNow)) },
 		"key cap spent": func(q *fakeQuota) {
 			s := fundedSnapshot(25, testNow)
 			zero, cap := 0.0, 10.0

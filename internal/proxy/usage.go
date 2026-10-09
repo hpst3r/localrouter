@@ -97,6 +97,9 @@ func (u *usageJSON) toUsage() (core.Usage, bool) {
 	default:
 		return core.Usage{}, false
 	}
+	// Cached input is a subset of input and reasoning a subset of output.
+	out.CachedInputTokens = min(out.CachedInputTokens, out.InputTokens)
+	out.ReasoningTokens = min(out.ReasoningTokens, out.OutputTokens)
 	return out, true
 }
 
