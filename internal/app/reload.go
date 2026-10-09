@@ -214,7 +214,9 @@ func (a *App) makeGeneration(c *config.Config, number uint64) (*runtimeGeneratio
 }
 
 // collectorLedger selects pricing once per local collector write/batch, while
-// HTTP handlers retain their request generation's frozen pricing view.
+// HTTP handlers retain their request generation's frozen pricing view. It is
+// the single write path of the server-local collectors, so it also applies a
+// final sanitation pass (see sanitizeCollectorRecord).
 type collectorLedger struct {
 	*ledger.Ledger
 	app *App
@@ -225,6 +227,10 @@ func (l collectorLedger) Record(ctx context.Context, r core.RequestRecord) error
 	if g == nil {
 		return fmt.Errorf("runtime unavailable")
 	}
+	r, err := sanitizeCollectorRecord(r)
+	if err != nil {
+		return err
+	}
 	return g.pricing.Record(ctx, r)
 }
 func (l collectorLedger) RecordBatch(ctx context.Context, rs []core.RequestRecord) error {
@@ -232,6 +238,41 @@ func (l collectorLedger) RecordBatch(ctx context.Context, rs []core.RequestRecor
 	if g == nil {
 		return fmt.Errorf("runtime unavailable")
 	}
-	return g.pricing.RecordBatch(ctx, rs)
+	out := make([]core.RequestRecord, len(rs))
+	for i, r := range rs {
+		var err error
+		if out[i], err = sanitizeCollectorRecord(r); err != nil {
+			return err
+		}
+	}
+	return g.pricing.RecordBatch(ctx, out)
+}
+
+// errInvalidCollectorRecord rejects a record whose usage is out of range. It
+// is permanent (claudelog.PermanentError) so collectors drop the record
+// instead of retrying it forever.
+type errInvalidCollectorRecord struct{ id string }
+
+func (e errInvalidCollectorRecord) Error() string {
+	return "collector record " + core.TruncateLabel(e.id) + ": usage out of range"
+}
+func (errInvalidCollectorRecord) Permanent() bool { return true }
+
+// sanitizeCollectorRecord bounds free-form labels (core.TruncateLabel,
+// core.TruncateError) and rejects any token count outside
+// [0, core.MaxRecordTokens]. Valid records are returned unchanged.
+func sanitizeCollectorRecord(r core.RequestRecord) (core.RequestRecord, error) {
+	u := r.Usage
+	for _, v := range []int64{u.InputTokens, u.CachedInputTokens, u.CacheCreationInputTokens, u.OutputTokens, u.ReasoningTokens} {
+		if v < 0 || v > core.MaxRecordTokens {
+			return r, errInvalidCollectorRecord{id: r.ID}
+		}
+	}
+	for _, p := range []*string{&r.Client, &r.Route, &r.Model, &r.Provider, &r.Session, &r.Task, &r.Agent, &r.Host} {
+		*p = core.TruncateLabel(*p)
+	}
+	r.Class = core.Class(core.TruncateLabel(string(r.Class)))
+	r.Error = core.TruncateError(r.Error)
+	return r, nil
 }
 func (l collectorLedger) Close() error { return nil }

@@ -89,7 +89,7 @@ func hrNewUpstream(t *testing.T) *hrUpstream {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"id":    "hr-resp",
+			"id":     "hr-resp",
 			"object": "response",
 			"usage": map[string]any{
 				"input_tokens":  in,
