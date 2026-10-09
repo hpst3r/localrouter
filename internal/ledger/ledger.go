@@ -54,6 +54,13 @@ func validReportedCost(p *float64) (float64, bool) {
 	return c, true
 }
 
+// errBatchTooLarge reports a RecordBatch call whose record count exceeds
+// MaxBatch. Shared by Ledger.RecordBatch and PricingView.RecordBatch so the
+// bound and message are identical for both writers.
+func errBatchTooLarge(n int) error {
+	return fmt.Errorf("ledger: record batch: %d records exceeds max %d", n, MaxBatch)
+}
+
 // migrations are applied in order; index+1 is the schema version.
 // The requests table must never gain prompt/response content columns.
 var migrations = []string{
@@ -184,7 +191,65 @@ ON CONFLICT(id) DO NOTHING`
 // r.ID is replaced with a random one. Record is idempotent on ID: if a row
 // with r.ID already exists it is left unchanged and nil is returned.
 func (l *Ledger) Record(ctx context.Context, r core.RequestRecord) error {
-	args := l.insertArgs(r)
+	return l.recordArgs(ctx, insertArgs(r, l.pricing, l.basis))
+}
+
+// RecordBatch inserts up to MaxBatch rows in one transaction with the same
+// semantics as Record: rows whose ID already exists are skipped silently.
+// Either every new row is written or none is.
+func (l *Ledger) RecordBatch(ctx context.Context, rs []core.RequestRecord) error {
+	if len(rs) > MaxBatch {
+		return errBatchTooLarge(len(rs))
+	}
+	if len(rs) == 0 {
+		return nil
+	}
+	args := make([][]any, len(rs))
+	for i, r := range rs {
+		args[i] = insertArgs(r, l.pricing, l.basis)
+	}
+	return l.recordBatchArgs(ctx, args)
+}
+
+// insertArgs computes cost with the supplied immutable price table and basis
+// and returns the bind arguments for insertSQL. It is a pure function of its
+// arguments: callers pass a generation's pinned pricing (the ledger's startup
+// table, or a view's frozen table) so cost attribution never depends on
+// mutable ledger state. Either pointer may be nil (Pricing.Cost is nil-safe;
+// a nil basis yields a NULL cost_basis).
+func insertArgs(r core.RequestRecord, pricing *Pricing, basis func(accountID string) string) []any {
+	if r.ID == "" {
+		var b [16]byte
+		_, _ = rand.Read(b[:])
+		r.ID = hex.EncodeToString(b[:])
+	}
+	cost, costBasis := resolveCost(r, pricing, basis)
+	var finished sql.NullInt64
+	if !r.FinishedAt.IsZero() {
+		finished = sql.NullInt64{Int64: r.FinishedAt.UnixMilli(), Valid: true}
+	}
+	var failoverOf sql.NullString
+	if r.FailoverOf != "" {
+		failoverOf = sql.NullString{String: r.FailoverOf, Valid: true}
+	}
+	usageKnown := 0
+	if r.UsageKnown {
+		usageKnown = 1
+	}
+	return []any{
+		r.ID, r.StartedAt.UnixMilli(), finished, r.Client, string(r.Class), r.Route, r.Model, r.Provider,
+		r.AccountID, r.UpstreamIdentity, r.Status, failoverOf, r.Usage.InputTokens,
+		r.Usage.CachedInputTokens, r.Usage.OutputTokens, r.Usage.ReasoningTokens, usageKnown,
+		cost, costBasis, r.LatencyMS, r.BytesOut, r.Session, r.Task, r.Agent, r.Error,
+		r.Usage.CacheCreationInputTokens, r.Host,
+	}
+}
+
+// recordArgs is the shared single-row insert path: it binds args computed with
+// the supplied pricing and executes under the ledger's write mutex. The
+// ledger's Record and a PricingView's Record both funnel through it, so a view
+// is never a second writer with its own locking or connection.
+func (l *Ledger) recordArgs(ctx context.Context, args []any) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if _, err := l.db.ExecContext(ctx, insertSQL, args...); err != nil {
@@ -193,20 +258,8 @@ func (l *Ledger) Record(ctx context.Context, r core.RequestRecord) error {
 	return nil
 }
 
-// RecordBatch inserts up to MaxBatch rows in one transaction with the same
-// semantics as Record: rows whose ID already exists are skipped silently.
-// Either every new row is written or none is.
-func (l *Ledger) RecordBatch(ctx context.Context, rs []core.RequestRecord) error {
-	if len(rs) > MaxBatch {
-		return fmt.Errorf("ledger: record batch: %d records exceeds max %d", len(rs), MaxBatch)
-	}
-	if len(rs) == 0 {
-		return nil
-	}
-	args := make([][]any, len(rs))
-	for i, r := range rs {
-		args[i] = l.insertArgs(r)
-	}
+// recordBatchArgs is the shared batch insert path (see recordArgs).
+func (l *Ledger) recordBatchArgs(ctx context.Context, args [][]any) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	tx, err := l.db.BeginTx(ctx, nil)
@@ -230,41 +283,16 @@ func (l *Ledger) RecordBatch(ctx context.Context, rs []core.RequestRecord) error
 	return nil
 }
 
-// insertArgs computes cost and returns the bind arguments for insertSQL.
-func (l *Ledger) insertArgs(r core.RequestRecord) []any {
-	if r.ID == "" {
-		var b [16]byte
-		_, _ = rand.Read(b[:])
-		r.ID = hex.EncodeToString(b[:])
-	}
-	cost, basis := l.resolveCost(r)
-	var finished sql.NullInt64
-	if !r.FinishedAt.IsZero() {
-		finished = sql.NullInt64{Int64: r.FinishedAt.UnixMilli(), Valid: true}
-	}
-	var failoverOf sql.NullString
-	if r.FailoverOf != "" {
-		failoverOf = sql.NullString{String: r.FailoverOf, Valid: true}
-	}
-	usageKnown := 0
-	if r.UsageKnown {
-		usageKnown = 1
-	}
-	return []any{
-		r.ID, r.StartedAt.UnixMilli(), finished, r.Client, string(r.Class), r.Route, r.Model, r.Provider,
-		r.AccountID, r.UpstreamIdentity, r.Status, failoverOf, r.Usage.InputTokens,
-		r.Usage.CachedInputTokens, r.Usage.OutputTokens, r.Usage.ReasoningTokens, usageKnown,
-		cost, basis, r.LatencyMS, r.BytesOut, r.Session, r.Task, r.Agent, r.Error,
-		r.Usage.CacheCreationInputTokens, r.Host,
-	}
-}
-
-// resolveCost picks the persisted cost_usd/cost_basis for r. A usable
-// provider-reported OpenRouter cost takes precedence over the local pricing
-// table — including an explicit zero, and regardless of UsageKnown — and is
-// stored with the reserved "provider_reported" provenance. Otherwise the
-// record is priced from the table as before (only when usage is known).
-func (l *Ledger) resolveCost(r core.RequestRecord) (sql.NullFloat64, sql.NullString) {
+// resolveCost picks the persisted cost_usd/cost_basis for r using the supplied
+// immutable price table and basis function. A usable provider-reported
+// OpenRouter cost (explicit, finite, non-negative — validated by
+// validReportedCost) takes precedence over the local pricing table — including
+// an explicit zero, and regardless of UsageKnown — and is stored with the
+// reserved "provider_reported" provenance. Otherwise the record is priced from
+// the table as before (only when usage is known). It is a pure function of its
+// arguments so a generation-pinned PricingView attributes cost at its own
+// frozen table and never depends on mutable ledger state.
+func resolveCost(r core.RequestRecord, pricing *Pricing, basis func(accountID string) string) (sql.NullFloat64, sql.NullString) {
 	if r.Provider == core.ProviderOpenRouter {
 		if c, ok := validReportedCost(r.ReportedCostUSD); ok {
 			return sql.NullFloat64{Float64: c, Valid: true},
@@ -272,18 +300,18 @@ func (l *Ledger) resolveCost(r core.RequestRecord) (sql.NullFloat64, sql.NullStr
 		}
 	}
 	var cost sql.NullFloat64
-	var basis sql.NullString
+	var costBasis sql.NullString
 	if r.UsageKnown {
-		if c, ok := l.pricing.Cost(r.Model, r.Usage); ok {
+		if c, ok := pricing.Cost(r.Model, r.Usage); ok {
 			cost = sql.NullFloat64{Float64: c, Valid: true}
-			if l.basis != nil {
-				if b := l.basis(r.AccountID); b != "" {
-					basis = sql.NullString{String: b, Valid: true}
+			if basis != nil {
+				if b := basis(r.AccountID); b != "" {
+					costBasis = sql.NullString{String: b, Valid: true}
 				}
 			}
 		}
 	}
-	return cost, basis
+	return cost, costBasis
 }
 
 // Reprice recomputes cost_usd and cost_basis for every row with known usage

@@ -293,15 +293,99 @@ key.
 - `GET /control/v1/diagnostics` (auth like `status`) → `{schema_version, now,
   ready, storage:{configured, ok, error?}, inflight:{global_limit,
   global_active, global_peak, clients:[{name, limit, active}]},
+  reload:{generation, ok, at, reason?, restart_only?},
   accounts:[{id, provider, healthy, stale, cooldown, reason,
   snapshot_age_s}]}`. Authenticated diagnostics; a limit of 0 means unlimited;
-  no keys, secret paths, prompt content or per-account quota windows.
+  no keys, secret paths, prompt content or per-account quota windows. `reload`
+  is present only when a reload seam is wired; it is the sanitized last reload
+  attempt (see "Configuration reload" below) and never carries key material.
 
 ## Logging
 
 `log/slog` text to stderr. Never log tokens, keys, prompt/response bodies,
 or full upstream URLs with query strings. Log: account chosen, class,
-model, status, latency, usage numbers, policy denials with reason.
+model, status, latency, usage numbers, policy denials with reason. A rejected
+reload logs only its sanitized reason class and the restart-only config key
+names; the raw error (which may embed a secret path) is never logged.
+
+## Configuration reload
+
+A running server re-reads its config on `SIGHUP` (Unix) or via the in-process
+`App.Reload` seam (portable, and the only trigger Windows has). There is **no
+HTTP endpoint** for reload. The new config is parsed and validated in full
+before anything is published; only then is the reloadable subset swapped
+atomically. In-flight requests finish against the generation they started on,
+and persistent state — SQLite, the rotating-token cache, quota observations,
+policy inflight/cooldown counters, collector progress and the listener — is
+preserved by construction because it is shared, not rebuilt.
+
+If validation fails, the change touches a restart-only field, or another reload
+is already running, nothing is published: the previous (last-good) generation
+keeps serving, the generation does not advance, and the attempt is recorded
+with a sanitized `reason` and, for a restart-only rejection, the offending
+`restart_only` key names. Rapid signals coalesce (a bounded number of reloads)
+and reloads are serialized.
+
+Reloadable in place: `clients[]` (`name`, `class`, `key_file`/`key_files`,
+`host`, `ingest`), `routes[]`, `accounts[].reserve`, `pricing_file` contents,
+`policy.stale_after`/`safety_margin`/`inflight_estimate`/`max_failovers`, and
+`limits.max_concurrent`/`max_concurrent_per_client` (active counts preserved).
+
+Pricing is **frozen per request by generation**, not resolved at ledger-write
+time. One accepted generation publishes its handler, auth, routes, limits,
+reserves, price table and generation number together under a single pointer, so
+an inference or HTTP-ingest request is costed from the generation it was
+admitted on even if a reload swaps the price table while it is in flight. The
+in-process `claude_logs` collector selects the current generation once per
+`Record`/`RecordBatch` call, so each batch is costed by the generation live when
+that batch is written.
+
+A reload replaces the live generation only: it never re-prices rows already
+written and never rewrites the startup table. History is reconciled only by the
+separate offline `localrouter pricing reprice` command, which loads the price
+files from disk and opens the database itself — it is not run by a reload.
+There is no global price set and no live re-price on reload, so a request never
+mixes one generation's admission with another's price table.
+
+Restart-only — a reload that changes any of these is **rejected whole**, never
+partially applied: `listen`, `allow_non_loopback`, `allowed_hosts`,
+`tls_cert_file`, `tls_key_file`, `data_dir`, the `pricing_file` path, the token
+store location, `quota.poll_interval`, account topology (`accounts[].id`,
+`provider`, `base_url`, `quota_source`, `api_key_file`, `api_key_env`,
+`credentials_file`, `cost_basis`), `claude_logs.*`, `hermes_logs.*`,
+`host_name`, `control.require_auth`, and the structural timeouts
+(`timeouts.header`/`body`/`idle`/`shutdown`).
+
+`GET /control/v1/diagnostics` reports the last attempt under `reload`:
+`{generation, ok, at, reason?, restart_only?}`. `Generation` is 1 at startup
+and increments by one per accepted reload; a failed attempt reports the
+still-serving generation (it neither lags nor advances). `at` is UTC. The
+document never contains keys, tokens or secret paths. Readiness (`/readyz`) is
+unaffected by a reload: it stays a statement about local serving and storage.
+
+Client keys rotate without downtime by deliberately overlapping two single-key
+files: each file holds exactly one raw key, `key_file` and `key_files` are
+mutually exclusive on a client, `key_files` entries must be distinct, and
+duplicate keys across clients are rejected. List old and new, `SIGHUP`, roll the
+client to the new key, remove the old file and `SIGHUP` again. A revoked key is
+rejected for new requests at the next reload while in-flight requests holding
+it finish. The config lists key file paths only; key material never appears in
+the config, logs or diagnostics.
+
+```bash
+localrouter check -config ~/.config/localrouter/config.yaml    # validate first
+kill -HUP "$(systemctl --user show -p MainPID --value localrouter)"
+```
+
+Rollback is implicit and automatic: a rejected reload never publishes, so the
+last-good generation keeps serving and the generation number does not advance —
+there is no separate rollback command. Diagnose a rejection from the sanitized
+last attempt at `GET /control/v1/diagnostics` under
+`reload:{generation, ok, at, reason?, restart_only?}` (`ok:false`, a `reason`,
+and, for a restart-only change, the offending key names), and from the
+`config reload rejected` log line, which carries only `reason`, `restart_only`
+and `generation` — never the raw error or a secret path. Correct the config and
+`SIGHUP` again.
 
 ## Acceptance tests (must exist across packages)
 
@@ -321,6 +405,14 @@ model, status, latency, usage numbers, policy denials with reason.
 8. Ollama fractions: `usage: 0.484` → `UsedFrac 0.484`.
 9. Secrets: no log line/response contains a token or client key.
 10. No content columns in SQLite.
+11. Reload: `SIGHUP` re-reads config; a valid change publishes a new generation
+    while in-flight requests finish on the old one; an invalid change or a
+    restart-only change is rejected whole (last-good keeps serving, generation
+    unchanged) with a sanitized reason and, when restart-only, the offending key
+    names. Rapid signals coalesce.
+12. Diagnostics `reload` block: present only when the seam is wired; it carries
+    `generation`/`ok`/`at` and, on failure, `reason` + `restart_only` — never
+    keys, tokens or secret paths.
 
 ## Claude (quota-only account + transcript accounting)
 

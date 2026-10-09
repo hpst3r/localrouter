@@ -1,0 +1,83 @@
+# LocalRouter container example configuration.
+#
+# Copy to config.yaml, mount it read-only at /etc/localrouter/config.yaml, and
+# start the image with its default command:
+#   localrouter serve -config /etc/localrouter/config.yaml
+#
+# This image speaks plain HTTP on 0.0.0.0:8787 and publishes no host port. Put a
+# TLS terminator (NGINX) in front on the same private network, preserve the Host
+# header, and publish the host port only there. There are deliberately no
+# tls_cert_file / tls_key_file entries: this process does not terminate TLS.
+#
+# Expected mounts (see Containerfile):
+#   /etc/localrouter/config.yaml   ro   this file
+#   /etc/localrouter/pricing.yaml  ro   imported price table (may be absent)
+#   /run/secrets/*                 ro   client bearer keys and provider API keys
+#   /var/lib/localrouter           rw   THE ONLY WRITABLE PATH: SQLite ledger,
+#                                       rotated OAuth tokens, collector state
+#   /tmp                           tmpfs (run with --tmpfs /tmp)
+
+listen: 0.0.0.0:8787             # private container network only; no host port published
+allow_non_loopback: true
+allowed_hosts: [router.example.com, localhost]   # accepted Host headers, not a network ACL
+
+data_dir: /var/lib/localrouter   # EXPLICIT and writable; never rely on a $HOME default
+pricing_file: /etc/localrouter/pricing.yaml
+
+control:
+  require_auth: true             # mandatory whenever allow_non_loopback is true
+
+quota:
+  poll_interval: 5m
+
+policy:
+  stale_after: 10m
+  safety_margin: 0.02
+  inflight_estimate: 0.01
+  max_failovers: 2
+
+limits:                          # optional; 0 = unlimited
+  max_concurrent: 64
+
+timeouts:                        # optional; 0 selects the default
+  header: 10s
+  body: 30s
+  idle: 120s
+  shutdown: 30s
+
+clients:
+  # Client bearer keys are mounted read-only under /run/secrets.
+  - { name: router-client, class: interactive, host: client, key_file: /run/secrets/client-router.key, ingest: true }
+  - { name: router-worker, class: background,  host: worker, key_file: /run/secrets/client-worker.key }
+
+accounts:
+  # Codex OAuth tokens are rotated at runtime, so they belong in the writable
+  # data_dir (/var/lib/localrouter/tokens), never in a read-only secret mount.
+  - id: codex-primary
+    provider: codex
+    reserve: { 5h: 0.10, weekly: 0.10 }
+  - id: codex-secondary
+    provider: codex
+    reserve: {}                  # drain fully
+  # Provider API keys are static: mount them read-only under /run/secrets.
+  - id: ollama-cloud
+    provider: ollama
+    base_url: https://ollama.com/v1
+    api_key_file: /run/secrets/ollama.key
+    reserve: { 5h: 0.10, weekly: 0.10 }
+
+routes:
+  - name: gpt
+    models: [gpt-5.6-sol, gpt-5.6-luna]
+    interactive: [codex-primary, codex-secondary]
+    background:  [codex-secondary, codex-primary]
+  - name: ollama
+    models: [deepseek-v4.1-flash, kimi-k3]
+    interactive: [ollama-cloud]
+    background:  [ollama-cloud]
+
+# Collectors are disabled: no host transcript/state directories are mounted.
+claude_logs:
+  enabled: false
+hermes_logs:
+  enabled: false
