@@ -561,8 +561,9 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
   router are skipped. Counters that go backwards are rebased, not recorded.
 - Plausibility: a row is skipped (`Stats.SkippedInvalid`, logged without
   content) and rebased if any cumulative counter or token total is outside
-  [0, 1e12] (so delta arithmetic cannot overflow), or `last_seen` is
-  non-finite or outside [now-400d, now+5m]. A missing `last_seen` uses now.
+  [0, 1e12] (so delta arithmetic cannot overflow), or the raw `last_seen` is
+  non-finite, negative or outside [now-400d, now+5m]. Only a missing (NULL or
+  0) `last_seen` uses now.
   Increases from an implausible baseline are rebased, not recorded. Labels
   are bounded with `core.TruncateLabel`.
 - A ledger error with `Permanent() == true` drops the row (`Stats.Dropped`)
