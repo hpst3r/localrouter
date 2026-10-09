@@ -40,15 +40,15 @@ const MaxBatch = 1000
 const costBasisProviderReported = "provider_reported"
 
 // validReportedCost reports whether p is a usable provider-reported cost: an
-// explicit, finite, non-negative USD amount. nil, NaN, ±Inf and negative values
-// are unusable. It guards both the proxy's observations and records ingested
+// explicit, non-negative USD amount of at most core.MaxReportedCostUSD. nil,
+// NaN, ±Inf, negative and larger values are unusable. It guards both the proxy's observations and records ingested
 // from agents.
 func validReportedCost(p *float64) (float64, bool) {
 	if p == nil {
 		return 0, false
 	}
 	c := *p
-	if math.IsNaN(c) || math.IsInf(c, 0) || c < 0 {
+	if !(c >= 0 && c <= core.MaxReportedCostUSD) { // also rejects NaN
 		return 0, false
 	}
 	return c, true
@@ -425,17 +425,8 @@ func (l *Ledger) Summary(ctx context.Context, since time.Time, group string) ([]
 	out := []core.UsageRow{}
 	for rows.Next() {
 		var u core.UsageRow
-		var cost sql.NullFloat64
-		var in, cached, creation, outTok, reasoning float64
-		if err := rows.Scan(&u.Key, &u.Requests, &in, &cached,
-			&creation, &outTok, &reasoning, &cost, &u.UnknownUsageRequests, &u.UnpricedRequests); err != nil {
+		if err := scanAgg(rows, &u, &u.Key); err != nil {
 			return nil, fmt.Errorf("ledger: summary: %w", err)
-		}
-		u.InputTokens, u.CachedInputTokens = satInt(in), satInt(cached)
-		u.CacheCreationInputTokens, u.OutputTokens, u.ReasoningTokens = satInt(creation), satInt(outTok), satInt(reasoning)
-		if cost.Valid {
-			c := cost.Float64
-			u.CostUSD = &c
 		}
 		out = append(out, u)
 	}
@@ -480,9 +471,9 @@ func (l *Ledger) summaryByDay(ctx context.Context, since time.Time) ([]core.Usag
 			u.UnknownUsageRequests++
 		}
 		if cost.Valid {
-			c := cost.Float64
+			c := satCost(cost.Float64)
 			if u.CostUSD != nil {
-				c += *u.CostUSD
+				c = satCost(c + *u.CostUSD)
 			}
 			u.CostUSD = &c
 		} else if known {
@@ -511,6 +502,20 @@ func satInt(f float64) int64 {
 		return math.MinInt64
 	}
 	return int64(f)
+}
+
+// satCost keeps a cost sum JSON-encodable: a SUM(cost_usd) or Go-side sum
+// that overflowed to ±Inf saturates at ±math.MaxFloat64, and NaN becomes 0.
+func satCost(c float64) float64 {
+	switch {
+	case c != c:
+		return 0
+	case math.IsInf(c, 1):
+		return math.MaxFloat64
+	case math.IsInf(c, -1):
+		return -math.MaxFloat64
+	}
+	return c
 }
 
 // satAdd returns a+b, saturating instead of wrapping on overflow.
