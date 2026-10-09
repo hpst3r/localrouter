@@ -82,7 +82,10 @@ unknown balance or key part does not deny on its own (upstream `402` is the
 backstop). An
 OpenRouter `402` fails over to the next account before any byte is sent, cools
 the account down (60s or `Retry-After`), and refreshes its balance urgently; a
-top-up clears the cooldown early. `reserve` is rejected for these accounts.
+top-up clears the cooldown early. The affordability preflight 402 ("requires
+more credits, or fewer max_tokens") depends on the request, so it fails over
+without cooling the account down; a moderation `403` is returned to the client
+as is. `reserve` is rejected for these accounts.
 
 Optional `limits.max_concurrent` / `limits.max_concurrent_per_client` cap
 active inference requests (0 = unlimited, negatives rejected); a saturated
