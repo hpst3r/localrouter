@@ -575,9 +575,14 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   // BEGIN prepaidLines
   // Prepaid (OpenRouter) credit: signed USD account balance and the key's own
   // spend/cap. Unavailable is shown as such, never as $0; no cap is explicit.
+  // signedUSD renders a signed USD amount. A nonzero magnitude below one
+  // cent is shown as "-<$0.01" (debt) or "<$0.01" (tiny credit) rather than
+  // rounding to a flat "$0.00", which would erase the balance's direction.
+  // Exact zero stays "$0.00"; all other amounts round to two decimals.
   function signedUSD(v) {
-    const n = Number(v), s = Math.abs(n).toFixed(2);
-    return (n < 0 && s !== "0.00" ? "-$" : "$") + s;
+    const n = Number(v), a = Math.abs(n), s = a.toFixed(2);
+    if (n !== 0 && a < 0.01) return n < 0 ? "-<$0.01" : "<$0.01";
+    return (n < 0 ? "-$" : "$") + s;
   }
   function prepaidLines(a) {
     if (a.provider !== "openrouter") return [];

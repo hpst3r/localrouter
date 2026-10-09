@@ -368,8 +368,11 @@ func (s *Server) keyView(k *core.KeyUsage, now time.Time) *keyStatus {
 		t := k.LimitResetAt.UTC()
 		v.LimitResetAt = &t
 	}
-	v.Exhausted = k.LimitUSD != nil && k.LimitRemainingUSD != nil && *k.LimitRemainingUSD <= 0 &&
-		(k.LimitResetAt.IsZero() || now.Before(k.LimitResetAt))
+	// LimitResetAt is informational only: reaching the predicted reset does not
+	// restore spending credit, so a zero-remaining cap stays exhausted until a
+	// fresh /key observation reports positive remaining. A finite cap with a
+	// null remaining is a malformed pair the parser rejects, not exhaustion.
+	v.Exhausted = k.LimitUSD != nil && k.LimitRemainingUSD != nil && *k.LimitRemainingUSD <= 0
 	return v
 }
 

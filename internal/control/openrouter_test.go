@@ -97,7 +97,16 @@ func TestStatusOpenRouterUnavailableAndCaps(t *testing.T) {
 			Key: &core.KeyUsage{LimitUSD: f64(10), LimitRemainingUSD: f64(9), LimitReset: "daily",
 				LimitResetAt: t0.Add(12 * time.Hour), UsageUSD: 500, FetchedAt: t0},
 		},
-	}, "noperm", "daily", "never")
+		// Stale key cap, zero remaining, computed reset already passed: the
+		// reset is informational, so exhausted must stay true and the account
+		// must not be reported healthy.
+		"resetpast": {
+			AccountID: "resetpast", FetchedAt: t0.Add(-3 * time.Hour),
+			Credits: &core.Credits{TotalCreditsUSD: 20, TotalUsageUSD: 5, BalanceUSD: 15, FetchedAt: t0.Add(-3 * time.Hour)},
+			Key: &core.KeyUsage{LimitUSD: f64(10), LimitRemainingUSD: f64(0), LimitReset: "daily",
+				LimitResetAt: t0.Add(-time.Hour), UsageUSD: 500, FetchedAt: t0.Add(-3 * time.Hour)},
+		},
+	}, "noperm", "daily", "never", "resetpast")
 
 	c := st["noperm"]["credits"].(map[string]any)
 	if c["available"] != false || c["balance_usd"] != nil || c["total_credits_usd"] != nil || c["exhausted"] != false || c["age_s"] != nil {
@@ -120,6 +129,18 @@ func TestStatusOpenRouterUnavailableAndCaps(t *testing.T) {
 	}
 	if c := st["daily"]["credits"].(map[string]any); num(t, c["balance_usd"]) != 15 || c["exhausted"] != false {
 		t.Errorf("daily credits = %v", c)
+	}
+
+	// A predicted reset is informational: a stale zero-remaining cap keeps
+	// exhausted true after its LimitResetAt. The account balance stays
+	// independent (positive here, not exhausted). A fresh observation with
+	// positive remaining (the "daily" account) reports exhausted false.
+	rk := st["resetpast"]["key"].(map[string]any)
+	if rk["exhausted"] != true || rk["limit_reset_at"] != "2026-10-01T11:00:00Z" || num(t, rk["limit_remaining_usd"]) != 0 {
+		t.Errorf("past-reset exhausted key = %v", rk)
+	}
+	if c := st["resetpast"]["credits"].(map[string]any); num(t, c["balance_usd"]) != 15 || c["exhausted"] != false {
+		t.Errorf("resetpast credits stay independent = %v", c)
 	}
 
 	// Never fetched: both parts present and explicitly unavailable.

@@ -35,11 +35,35 @@ func (e *httpStatusError) Error() string { return fmt.Sprintf("usage api: http %
 // get performs an authenticated GET. On 401 it invalidates the credential and
 // retries once.
 func (m *Manager) get(ctx context.Context, id, url string, extra http.Header) ([]byte, error) {
-	return m.getWith(ctx, m.creds, id, url, extra)
+	return m.getWith(ctx, m.creds, id, url, extra, m.opts.HTTPClient)
 }
 
-// getWith is get using the given credential source.
-func (m *Manager) getWith(ctx context.Context, creds core.CredentialSource, id, url string, extra http.Header) ([]byte, error) {
+// orClient returns an HTTP client for the OpenRouter quota endpoints
+// (/credits, /key) that never follows redirects. A 3xx from the configured
+// base_url points at a different endpoint (another port on the same host, a
+// subdomain, ...), and net/http forwards Authorization to any redirect whose
+// host matches the initial host — the port is ignored — so following one
+// could hand the management or inference credential to a foreign endpoint.
+// The client is a shallow copy: Transport, Timeout and Jar are shared (all
+// safe for concurrent use) and the shared Options.HTTPClient is never
+// mutated. Only OpenRouter endpoints use this; other providers keep the
+// configured client's redirect policy. (Go's net/http has no Client.Clone,
+// so the copy is taken directly.)
+func (m *Manager) orClient() *http.Client {
+	c := *m.opts.HTTPClient
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &c
+}
+
+// orGet performs the account's normal authenticated GET (m.creds) against an
+// OpenRouter endpoint using the no-redirect client. /credits with an explicit
+// management key goes through getWith directly with that key source.
+func (m *Manager) orGet(ctx context.Context, id, url string, extra http.Header) ([]byte, error) {
+	return m.getWith(ctx, m.creds, id, url, extra, m.orClient())
+}
+
+// getWith is get using the given credential source and client.
+func (m *Manager) getWith(ctx context.Context, creds core.CredentialSource, id, url string, extra http.Header, client *http.Client) ([]byte, error) {
 	for attempt := 0; ; attempt++ {
 		cred, err := creds.Credential(ctx, id)
 		if err != nil {
@@ -55,7 +79,7 @@ func (m *Manager) getWith(ctx context.Context, creds core.CredentialSource, id, 
 		for k, vs := range extra {
 			req.Header[k] = append([]string(nil), vs...)
 		}
-		resp, err := m.opts.HTTPClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			return nil, classifyTransport(ctx, err)
 		}

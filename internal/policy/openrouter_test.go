@@ -52,7 +52,12 @@ func TestOpenRouterAdmission(t *testing.T) {
 		{"negative key remaining", ptr(orSnap("or", credits(50, t0), keyCap(ptr(10.0), ptr(-0.2), time.Time{}, t0))), false, "key spending cap exhausted"},
 		{"stale exhausted key cap without reset still denies", ptr(orSnap("or", nil, keyCap(ptr(10.0), ptr(0.0), time.Time{}, stale))), false, "key spending cap exhausted"},
 		{"daily cap remaining is authoritative, not cap minus lifetime usage", ptr(orSnap("or", credits(50, t0), keyCap(ptr(10.0), ptr(9.0), t0.Add(time.Hour), t0))), true, ""},
-		{"exhausted key cap past its reset is allowed", ptr(orSnap("or", credits(50, stale), keyCap(ptr(10.0), ptr(0.0), t0.Add(-time.Minute), stale))), true, ""},
+		// A predicted cap reset is informational only: reaching LimitResetAt
+		// does not restore spending credit, so a stale exhausted key cap keeps
+		// denying BOTH classes until a fresh /key observation reports positive
+		// remaining. Reopening on the clock alone would burn an upstream 402.
+		{"exhausted key cap past its reset still denies", ptr(orSnap("or", credits(50, stale), keyCap(ptr(10.0), ptr(0.0), t0.Add(-time.Minute), stale))), false, "key spending cap exhausted"},
+		{"exhausted key cap reset far in the past still denies", ptr(orSnap("or", credits(50, stale), keyCap(ptr(10.0), ptr(0.0), t0.Add(-72*time.Hour), stale))), false, "key spending cap exhausted"},
 		{"key reset never clears account exhaustion", ptr(orSnap("or", credits(-0.5, stale), keyCap(ptr(10.0), ptr(0.0), t0.Add(-time.Minute), stale))), false, "account balance -$0.50"},
 		{"unknown remaining with a cap is not treated as exhausted", ptr(orSnap("or", credits(5, t0), keyCap(ptr(10.0), nil, time.Time{}, t0))), true, ""},
 	}
@@ -157,5 +162,49 @@ func TestOpenRouter429CooldownNotClearedByBalance(t *testing.T) {
 	h.q.Set(orSnap("or", credits(50, h.clock.Now()), nil))
 	if _, d := h.p.Acquire(core.ClassInteractive, []string{"or"}, nil); d.Allow {
 		t.Error("429 cooldown cleared by balance")
+	}
+}
+
+// A predicted cap reset (LimitResetAt) is informational only. A stale key cap
+// with zero remaining keeps denying BOTH classes after its computed reset has
+// passed; only a fresh /key observation with positive remaining reopens. The
+// account balance is independent: an exhausted balance denies on its own even
+// when the key cap looks reset.
+func TestOpenRouterStaleKeyCapResetDoesNotReopen(t *testing.T) {
+	now := t0
+	stale := t0.Add(-3 * time.Hour)
+	classes := []core.Class{core.ClassInteractive, core.ClassBackground}
+
+	// Stale snapshot: key cap is 10 in total, 0 remaining, reset already passed.
+	h := newHarness([]core.Account{orAcct("or")}, Options{InflightEstimate: 0.01, SafetyMargin: 0.05})
+	h.clock.now = now
+	// The account balance is healthy and independent of the key cap.
+	h.q.Set(orSnap("or", credits(50, stale), keyCap(ptr(10.0), ptr(0.0), t0.Add(-time.Minute), stale)))
+	for _, class := range classes {
+		if l, d := h.p.Acquire(class, []string{"or"}, nil); d.Allow || l != nil {
+			t.Fatalf("%s: stale exhausted key at/past its predicted reset must deny: %+v", class, d)
+		} else if !strings.Contains(d.Reason, "key spending cap exhausted") {
+			t.Errorf("%s: reason = %q", class, d.Reason)
+		}
+	}
+	if st := h.p.Status("or"); st.InteractiveAdmissible || st.BackgroundAdmissible {
+		t.Fatalf("status must stay denied while the key cap is exhausted: %+v", st)
+	}
+
+	// A fresh /key observation with positive remaining reopens both classes.
+	h.q.Set(orSnap("or", credits(50, now), keyCap(ptr(10.0), ptr(5.0), t0.Add(time.Hour), now)))
+	for _, class := range classes {
+		if _, d := h.p.Acquire(class, []string{"or"}, nil); !d.Allow {
+			t.Fatalf("%s: fresh positive remaining must reopen: %s", class, d.Reason)
+		}
+	}
+
+	// Balance independence: a fresh key cap that is exhausted by a zero cap
+	// still denies, and a reobserved positive cap never overrides an exhausted
+	// account balance.
+	h2 := newHarness([]core.Account{orAcct("or")}, Options{InflightEstimate: 0.01})
+	h2.q.Set(orSnap("or", credits(-0.5, now), keyCap(ptr(10.0), ptr(5.0), t0.Add(time.Hour), now)))
+	if _, d := h2.p.Acquire(core.ClassInteractive, []string{"or"}, nil); d.Allow || !strings.Contains(d.Reason, "account balance") {
+		t.Fatalf("known negative balance must deny regardless of a positive key cap: %+v", d)
 	}
 }

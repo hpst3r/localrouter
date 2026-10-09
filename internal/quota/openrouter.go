@@ -80,7 +80,7 @@ func (m *Manager) fetchORCredits(ctx context.Context, id, url string, hdr http.H
 	if mgmt != nil {
 		creds = mgmt
 	}
-	body, err := m.getWith(ctx, creds, id, url, hdr)
+	body, err := m.getWith(ctx, creds, id, url, hdr, m.orClient())
 	if err != nil {
 		var se *httpStatusError
 		switch {
@@ -111,7 +111,7 @@ func (m *Manager) fetchORCredits(ctx context.Context, id, url string, hdr http.H
 }
 
 func (m *Manager) fetchORKey(ctx context.Context, id, url string, hdr http.Header, now time.Time) (core.KeyUsage, error) {
-	body, err := m.get(ctx, id, url, hdr)
+	body, err := m.orGet(ctx, id, url, hdr)
 	if err != nil {
 		return core.KeyUsage{}, fmt.Errorf("key: %w", err)
 	}
@@ -122,10 +122,13 @@ func (m *Manager) fetchORKey(ctx context.Context, id, url string, hdr http.Heade
 	return k, nil
 }
 
-// parseORKey validates a /key body. limit and limit_remaining must be present
-// (null = no cap); usage must be a non-negative number. Optional counters are
-// nil when absent or null. Unknown fields (including the deprecated
-// rate_limit and the key label) are ignored.
+// parseORKey validates a /key body. limit and limit_remaining must both be
+// present; both null means no cap (unlimited) and both finite is a real cap
+// (limit >= 0; remaining may be zero or negative). A pair with only one side
+// null is logically contradictory — it would otherwise be silently treated
+// as unlimited — so it is rejected as malformed. usage must be a non-negative
+// number. Optional counters are nil when absent or null. Unknown fields
+// (including the deprecated rate_limit and the key label) are ignored.
 func parseORKey(body []byte, now time.Time) (core.KeyUsage, bool) {
 	var env struct {
 		Data map[string]json.RawMessage `json:"data"`
@@ -141,6 +144,10 @@ func parseORKey(body []byte, now time.Time) (core.KeyUsage, bool) {
 	}
 	remaining, present, ok := f.num("limit_remaining")
 	if !ok || !present {
+		return k, false
+	}
+	// limit and limit_remaining are a single cap: null only as a pair.
+	if (limit == nil) != (remaining == nil) {
 		return k, false
 	}
 	usage, _, ok := f.num("usage")

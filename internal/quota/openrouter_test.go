@@ -3,10 +3,12 @@ package quota
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -452,5 +454,229 @@ func TestOpenRouterEndpointsDeriveFromBaseURL(t *testing.T) {
 	h.refresh(t)
 	if len(h.seen("/api/v1/credits")) != 1 || len(h.seen("/api/v1/key")) != 1 {
 		t.Errorf("credits=%v key=%v", h.seen("/api/v1/credits"), h.seen("/api/v1/key"))
+	}
+}
+
+// --- Redirect hardening ---------------------------------------------------
+//
+// A 3xx from the configured OpenRouter base_url must never be followed: Go's
+// default client forwards Authorization to any redirect target on the same
+// hostname — the port is ignored by net/http's same-domain test — so a
+// redirect from 127.0.0.1:portA to 127.0.0.1:portB, or from a provider host to
+// one of its subdomains, would hand the management/inference credential to a
+// different endpoint. OpenRouter /credits and /key must instead surface a
+// sanitized HTTP 3xx error and keep the last-good values.
+
+// TestOpenRouterRedirectsNotFollowed proves the guard: a redirecting
+// /credits and /key must be reported as a sanitized 3xx error, the redirect
+// destination must receive no request at all (and thus no credential), and
+// no part of the redirect must appear in errors or logs.
+func TestOpenRouterRedirectsNotFollowed(t *testing.T) {
+	var mu sync.Mutex
+	var destHits int
+	var destAuths []string
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		destHits++
+		destAuths = append(destAuths, r.Header.Get("Authorization"))
+		mu.Unlock()
+		// A healthy-looking answer would make a followed redirect look like a
+		// successful fetch; hand back an unmistakable balance.
+		w.Write([]byte(`{"data":{"total_credits":9999,"total_usage":0,"limit":null,"limit_remaining":null,"usage":0}}`))
+	}))
+	t.Cleanup(dest.Close)
+
+	// h's origin client has the DEFAULT redirect policy (httptest sets no
+	// CheckRedirect), the same client shape production wires in.
+	h := newORHarness(t, true)
+	h.set(
+		func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, dest.URL+r.URL.Path, http.StatusFound)
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, dest.URL+r.URL.Path, http.StatusFound)
+		},
+	)
+
+	s := h.refresh(t)
+
+	mu.Lock()
+	hits, auths := destHits, append([]string(nil), destAuths...)
+	mu.Unlock()
+
+	// RED: with redirects followed, hits == 2 and auths carry the management
+	// and inference credentials to a different port. GREEN: hits == 0.
+	if hits != 0 {
+		t.Errorf("redirect target received %d request(s) with auth %q; credential forwarded to a different endpoint", hits, auths)
+	}
+	// The origin itself must be asked exactly once per endpoint.
+	if got := len(h.seen("/api/v1/credits")); got != 1 {
+		t.Errorf("origin /credits hits = %d, want 1", got)
+	}
+	if got := len(h.seen("/api/v1/key")); got != 1 {
+		t.Errorf("origin /key hits = %d, want 1", got)
+	}
+	if s.Credits == nil || !s.Credits.FetchedAt.IsZero() || !strings.Contains(s.Credits.Err, "http 3") {
+		t.Errorf("credits must fail with a sanitized 3xx error, got %+v", s.Credits)
+	}
+	if s.Credits != nil && s.Credits.BalanceUSD == 9999 {
+		t.Errorf("balance came from the redirect target: %+v", s.Credits)
+	}
+	if s.Key == nil || !s.Key.FetchedAt.IsZero() || !strings.Contains(s.Key.Err, "http 3") {
+		t.Errorf("key must fail with a sanitized 3xx error, got %+v", s.Key)
+	}
+	if s.Err == "" {
+		t.Error("snapshot must not claim full health after a redirect")
+	}
+	for _, leak := range []string{secretToken, mgmtToken, dest.URL} {
+		if strings.Contains(s.Err+s.Credits.Err+s.Key.Err+h.logs.String(), leak) {
+			t.Errorf("leaked %q", leak)
+		}
+	}
+}
+
+// A redirect that appears only after a good fetch must keep the last-good
+// values and must not consult the redirect destination.
+func TestOpenRouterRedirectKeepsLastGood(t *testing.T) {
+	var mu sync.Mutex
+	var destHits int
+	var destAuths []string
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		destHits++
+		destAuths = append(destAuths, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Write([]byte(`{"data":{"total_credits":9999,"total_usage":0,"limit":null,"limit_remaining":null,"usage":0}}`))
+	}))
+	t.Cleanup(dest.Close)
+
+	h := newORHarness(t, true)
+	good := h.refresh(t)
+	if good.Err != "" || !approx(good.Credits.BalanceUSD, userBalance) || !approx(good.Key.UsageUSD, 770.89) {
+		t.Fatalf("baseline fetch not healthy: %+v", good)
+	}
+	h.clock.Advance(5 * time.Minute)
+
+	h.set(
+		func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, dest.URL+r.URL.Path, http.StatusTemporaryRedirect)
+		},
+		func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, dest.URL+r.URL.Path, http.StatusTemporaryRedirect)
+		},
+	)
+	s := h.refresh(t)
+
+	mu.Lock()
+	hits, auths := destHits, append([]string(nil), destAuths...)
+	mu.Unlock()
+	if hits != 0 {
+		t.Errorf("redirect target received %d request(s) with auth %q", hits, auths)
+	}
+	if c := s.Credits; !approx(c.BalanceUSD, userBalance) || !c.FetchedAt.Equal(t0) || !strings.Contains(c.Err, "http 3") {
+		t.Errorf("credits must keep last-good balance and old timestamp: %+v", c)
+	}
+	if !approx(s.Key.UsageUSD, 770.89) || !s.Key.FetchedAt.Equal(t0) || !strings.Contains(s.Key.Err, "http 3") {
+		t.Errorf("key must keep last-good usage and old timestamp: %+v", s.Key)
+	}
+	if !s.FetchedAt.Equal(t0) {
+		t.Errorf("snapshot FetchedAt %v must stay at the oldest known part %v", s.FetchedAt, t0)
+	}
+}
+
+// --- Inconsistent cap pairs ----------------------------------------------
+//
+// /key reports limit and limit_remaining together. Both null means no cap
+// (unlimited); both finite is a real cap (remaining may be zero or negative).
+// A pair with only one side null is logically contradictory and must be
+// rejected as malformed rather than silently treated as unlimited.
+
+func TestOpenRouterKeyInconsistentCapPairs(t *testing.T) {
+	bad := []string{
+		`{"data":{"limit":null,"limit_remaining":0,"usage":1}}`,
+		`{"data":{"limit":null,"limit_remaining":5,"usage":1}}`,
+		`{"data":{"limit":null,"limit_remaining":-3,"usage":1}}`,
+		`{"data":{"limit":10,"limit_remaining":null,"usage":1}}`,
+		`{"data":{"limit":10,"limit_remaining":null,"limit_reset":"daily","usage":1}}`,
+	}
+	for _, badBody := range bad {
+		h := newORHarness(t, false)
+		h.set(body(userCredits), body(badBody))
+		s := h.refresh(t)
+		if s.Key == nil || !s.Key.FetchedAt.IsZero() || !strings.Contains(s.Key.Err, "malformed") {
+			t.Errorf("%s: inconsistent cap pair must be malformed, got %+v", badBody, s.Key)
+		}
+		if s.Credits == nil || !approx(s.Credits.BalanceUSD, userBalance) {
+			t.Errorf("%s: credits should still be fetched: %+v", badBody, s.Credits)
+		}
+	}
+}
+
+func orPtr(v float64) *float64 { return &v }
+
+// The no-redirect policy must be scoped to OpenRouter: the shared
+// Options.HTTPClient keeps its configured redirect policy (nil = default)
+// so every other provider's get() behaves exactly as before.
+func TestOpenRouterDoesNotMutateSharedClient(t *testing.T) {
+	h := &orHarness{clock: &fakeClock{t: t0}, creds: &fakeCreds{}, mgmt: &staticCreds{token: mgmtToken},
+		logs: &bytes.Buffer{}, auths: map[string][]string{}}
+	shared := &http.Client{}
+	opts := Options{Clock: h.clock, HTTPClient: shared, Logger: slog.New(slog.NewTextHandler(h.logs, nil))}
+	h.m = New([]core.Account{{ID: "or", Provider: core.ProviderOpenRouter, BaseURL: "http://127.0.0.1:1/api/v1"}}, h.creds, opts)
+
+	or := h.m.orClient()
+	if or == shared {
+		t.Error("OpenRouter client must be a copy, not the shared client")
+	}
+	if or.CheckRedirect == nil {
+		t.Error("OpenRouter client must refuse redirects")
+	}
+	if err := or.CheckRedirect(&http.Request{}, nil); err != http.ErrUseLastResponse {
+		t.Errorf("CheckRedirect = %v, want http.ErrUseLastResponse", err)
+	}
+	if shared.CheckRedirect != nil {
+		t.Error("shared client redirect policy was mutated")
+	}
+	if or.Transport != shared.Transport || or.Timeout != shared.Timeout || or.Jar != shared.Jar {
+		t.Error("copy must share Transport/Timeout/Jar")
+	}
+	if m := h.m.orClient(); m == or {
+		t.Error("each call must return its own copy")
+	}
+}
+
+func TestOpenRouterKeyConsistentCapPairs(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		limit, remain *float64
+	}{
+		{"both-null-unlimited", nil, nil},
+		{"finite-zero-remaining", orPtr(10), orPtr(0)},
+		{"finite-negative-remaining", orPtr(10), orPtr(-1.5)},
+		{"finite-zero-cap-zero-remaining", orPtr(0), orPtr(0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lim, rem := "null", "null"
+			if tc.limit != nil {
+				lim = strconv.FormatFloat(*tc.limit, 'f', -1, 64)
+			}
+			if tc.remain != nil {
+				rem = strconv.FormatFloat(*tc.remain, 'f', -1, 64)
+			}
+			kb := fmt.Sprintf(`{"data":{"limit":%s,"limit_remaining":%s,"limit_reset":null,"usage":1}}`, lim, rem)
+			h := newORHarness(t, false)
+			h.set(body(userCredits), body(kb))
+			s := h.refresh(t)
+			if s.Key == nil || !s.Key.FetchedAt.Equal(t0) || s.Key.Err != "" {
+				t.Fatalf("valid cap pair rejected: %+v", s.Key)
+			}
+			if tc.limit == nil {
+				if s.Key.LimitUSD != nil || s.Key.LimitRemainingUSD != nil {
+					t.Errorf("both-null must stay unlimited: %+v", s.Key)
+				}
+			} else if !eqp(s.Key.LimitUSD, *tc.limit) || !eqp(s.Key.LimitRemainingUSD, *tc.remain) {
+				t.Errorf("cap pair = %v/%v, want %v/%v", s.Key.LimitUSD, s.Key.LimitRemainingUSD, tc.limit, tc.remain)
+			}
+		})
 	}
 }

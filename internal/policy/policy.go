@@ -182,7 +182,7 @@ func (p *Policy) admitLocked(acct core.Account, class core.Class, now time.Time)
 	// stale: a balance never rolls over on its own, so failing open would
 	// only burn an upstream 402.
 	if prepaid && has {
-		if why := prepaidExhausted(snap, now); why != "" {
+		if why := prepaidExhausted(snap); why != "" {
 			return false, why
 		}
 	}
@@ -335,23 +335,33 @@ func earliestExhaustedReset(s core.Snapshot, now time.Time) time.Time {
 }
 
 // prepaidExhausted explains why a prepaid (openrouter) account cannot serve,
-// or returns "". A known balance at or below zero always denies; a key cap
-// with no remaining spend denies until its computed reset. Unknown parts
-// (never fetched, or credits unavailable) never deny on their own.
-func prepaidExhausted(s core.Snapshot, now time.Time) string {
+// or returns "". A known balance at or below zero always denies; a known key
+// cap with no remaining spend denies regardless of its predicted reset. The
+// provider limit_remaining is the only authoritative signal that a cap has
+// been restored, so a stale exhaustion is never cleared on the clock alone.
+// Unknown parts (never fetched, or credits unavailable) never deny on their
+// own.
+func prepaidExhausted(s core.Snapshot) string {
 	if c := s.Credits; c != nil && !c.FetchedAt.IsZero() && c.BalanceUSD <= 0 {
 		return "openrouter account balance " + usd(c.BalanceUSD) + " (credit exhausted)"
 	}
-	if keyCapExhausted(s.Key, now) {
+	if keyCapExhausted(s.Key) {
 		k := s.Key
 		return fmt.Sprintf("openrouter key spending cap exhausted (%s left of %s)", usd(*k.LimitRemainingUSD), usd(*k.LimitUSD))
 	}
 	return ""
 }
 
-func keyCapExhausted(k *core.KeyUsage, now time.Time) bool {
+// keyCapExhausted reports whether a known key cap has no spend left. A cap is
+// exhausted when both the cap and its remaining amount are known and remaining
+// is at or below zero; a malformed pair (finite cap with unknown remaining, or
+// null cap with finite remaining) is rejected by the quota parser and must not
+// be read as exhausted. LimitResetAt is informational: reaching the predicted
+// reset does not restore spending credit, so it never clears exhaustion. Only
+// a fresh /key observation with positive LimitRemainingUSD reopens the gate.
+func keyCapExhausted(k *core.KeyUsage) bool {
 	return k != nil && !k.FetchedAt.IsZero() && k.LimitRemainingUSD != nil && k.LimitUSD != nil &&
-		*k.LimitRemainingUSD <= 0 && (k.LimitResetAt.IsZero() || now.Before(k.LimitResetAt))
+		*k.LimitRemainingUSD <= 0
 }
 
 // prepaidHeadroom reports whether a prepaid account was topped up after a
@@ -361,7 +371,7 @@ func keyCapExhausted(k *core.KeyUsage, now time.Time) bool {
 func prepaidHeadroom(s core.Snapshot, since time.Time, from *float64, now time.Time) bool {
 	c := s.Credits
 	return c != nil && c.FetchedAt.After(since) && c.BalanceUSD > 0 &&
-		(from == nil || c.BalanceUSD > *from+epsilon) && !keyCapExhausted(s.Key, now)
+		(from == nil || c.BalanceUSD > *from+epsilon) && !keyCapExhausted(s.Key)
 }
 
 func hasReserve(a core.Account) bool {

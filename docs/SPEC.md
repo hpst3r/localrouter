@@ -690,10 +690,14 @@ debounced post-request / urgent refreshes:
   retries once, management key only).
 - `GET <base_url>/key` (inference credential only) → `core.KeyUsage`.
   `limit` and `limit_remaining` must be present (null = no cap; zero kept);
+  a finite `limit` with a null `limit_remaining` (or a null `limit` with a
+  finite `limit_remaining`) is a contradictory pair rejected as malformed, and
+  an invalid response never marks the account healthy or available.
   `usage` required ≥ 0; `usage_daily|weekly|monthly`, `byok_usage*` optional
   (nil when absent/null, never 0), must be ≥ 0; `include_byok_in_limit`,
   `is_free_tier` optional bools; `limit_reset` optional string
-  (`daily|weekly|monthly` → `LimitResetAt` = next 00:00 UTC / Monday / 1st).
+  (`daily|weekly|monthly` → `LimitResetAt` = next 00:00 UTC / Monday / 1st;
+  informational only, see policy below).
   Unknown fields (label, deprecated `rate_limit`) ignored; BYOK never summed
   into `usage`; remaining is never derived from lifetime usage.
 - Each part keeps last-good values, its own `FetchedAt`, and `Err` on failure;
@@ -703,15 +707,20 @@ debounced post-request / urgent refreshes:
   `Allowed`. Error strings never include bodies or credentials.
 
 Policy: a known `BalanceUSD <= 0`, or a known key cap with
-`LimitRemainingUSD <= 0` before `LimitResetAt` (zero = never), denies both
-classes regardless of staleness; a key reset never overrides account
-exhaustion. Unknown parts follow the normal stale rule (no reserve → allow;
-upstream 402 is the backstop). Upstream 402 on an openrouter account: proxy
-fails over (no bytes sent yet; streamed/completed responses are never
-repeated), outcome carries the `Retry-After` hint, policy cools down for
-`max(60s, hint)` and requests an urgent refresh. A 402 cooldown clears early
-only when a balance fetched after it is positive and above the balance known
-at the 402. Other providers' 402 handling is unchanged.
+`LimitRemainingUSD <= 0`, denies both classes regardless of staleness. The
+predicted cap reset (`LimitResetAt`) is informational only: reaching it never
+restores spending credit, so a stale exhausted cap keeps denying both classes
+until a later successful `/key` response observes a positive
+`LimitRemainingUSD`; only such a fresh observation reopens the gate (the
+periodic response recomputes `LimitResetAt` for display only). A key reset
+never overrides account exhaustion. An unknown or malformed key part never
+denies on its own (no invented exhaustion), so unknown parts follow the normal
+stale rule (no reserve → allow; upstream 402 is the backstop). Upstream 402 on
+an openrouter account: proxy fails over (no bytes sent yet; streamed/completed
+responses are never repeated), outcome carries the `Retry-After` hint, policy
+cools down for `max(60s, hint)` and requests an urgent refresh. A 402 cooldown
+clears early only when a balance fetched after it is positive and above the
+balance known at the 402. Other providers' 402 handling is unchanged.
 
 Control status adds, for openrouter accounts only, `credits:{available,
 balance_usd, total_credits_usd, total_usage_usd, exhausted, age_s, stale,
@@ -719,8 +728,14 @@ error}` (amounts null when unavailable) and `key:{available, unlimited,
 limit_usd, limit_remaining_usd, limit_reset, limit_reset_at, exhausted,
 usage_usd, usage_{daily,weekly,monthly}_usd, byok_usage{,_daily,_weekly,
 _monthly}_usd, include_byok_in_limit, is_free_tier, age_s, stale, error}`.
-The widget shows the signed balance (e.g. `-$0.08`), "unavailable" rather
-than $0, and "unlimited" for a null cap.
+`key.limit_reset_at` is informational (predicted reset, display only): status
+`key.exhausted` follows the same authoritative rule as admission and stays
+true for a zero-remaining cap even after that predicted reset passes, until a
+fresh `/key` response observes a positive `limit_remaining`. An unknown key
+part is never reported exhausted.
+The widget shows the signed balance (e.g. `-$0.08`; a non-zero amount below one
+cent keeps its sign as `<$0.01` / `-<$0.01` rather than rounding to `$0.00`),
+"unavailable" rather than $0, and "unlimited" for a null cap.
 
 ## Engineering constraints
 

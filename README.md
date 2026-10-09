@@ -70,9 +70,12 @@ Both are the provider's authoritative lifetime/period totals and include
 traffic that bypassed LocalRouter; ledger `cost_usd` (default
 `cost_basis: metered`) remains a local price estimate per request.
 
-A known balance at or below zero, or a key cap with nothing left (until its
-daily/weekly/monthly reset), denies every class even if the data is stale. An
-unknown balance does not deny on its own (upstream `402` is the backstop). An
+A known balance at or below zero, or a key cap with nothing left, denies every
+class even if the data is stale. The cap's predicted reset date is informational
+only: it never reopens a spent key on its own — the gate reopens solely when a
+fresh `/key` response reports positive `limit_remaining`. An
+unknown balance or key part does not deny on its own (upstream `402` is the
+backstop). An
 OpenRouter `402` fails over to the next account before any byte is sent, cools
 the account down (60s or `Retry-After`), and refreshes its balance urgently; a
 top-up clears the cooldown early. `reserve` is rejected for these accounts.
