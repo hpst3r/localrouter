@@ -239,7 +239,19 @@ type RequestRecord struct {
 	// Host is the machine the usage happened on ("" = the server itself for
 	// proxied requests from clients without a configured host).
 	Host string `json:"host,omitempty"`
-	// CostUSD/CostBasis are computed by the ledger from pricing; callers leave zero.
+	// ReportedCostUSD is the cost the upstream provider itself reported for
+	// this request, in USD, when it returns one (e.g. OpenRouter's
+	// usage.cost). It is an independent observation, not derived from tokens:
+	// nil means the provider reported no cost, or one that was unusable
+	// (null, non-numeric, negative, or non-finite). An explicit zero is a
+	// valid, known cost. The proxy only populates this for
+	// core.ProviderOpenRouter; cost fields from other providers are ignored.
+	// The ledger persists it as cost_usd with cost_basis "provider_reported",
+	// which takes precedence over the local pricing table and is never
+	// overwritten by Reprice.
+	ReportedCostUSD *float64 `json:"reported_cost_usd,omitempty"`
+	// CostUSD/CostBasis are resolved by the ledger: valid OpenRouter reported
+	// costs take precedence; otherwise known token usage uses local pricing.
 }
 
 // UsageRow is one aggregate row.

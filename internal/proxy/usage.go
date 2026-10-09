@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"strings"
 
 	"github.com/hpst3r/localrouter/internal/core"
@@ -35,6 +36,35 @@ type usageJSON struct {
 	CompletionDetails *struct {
 		ReasoningTokens int64 `json:"reasoning_tokens"`
 	} `json:"completion_tokens_details"`
+
+	// Cost is the provider-reported cost in USD (OpenRouter usage.cost). It is
+	// kept as raw JSON so that an unusable value (string, null, negative,
+	// non-finite, out of range) is ignored without failing the decode and
+	// losing otherwise-valid token counts. cost_details is deliberately not
+	// declared: only usage.cost is ever considered.
+	Cost json.RawMessage `json:"cost"`
+}
+
+// reportedCostUSD decodes the provider-reported cost strictly. A usable cost
+// is a JSON number that is finite and non-negative; an explicit zero is valid.
+// Missing, null, non-numeric, negative, non-finite, or out-of-range values
+// yield nil.
+func (u *usageJSON) reportedCostUSD() *float64 {
+	if u == nil {
+		return nil
+	}
+	raw := bytes.TrimSpace(u.Cost)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil
+	}
+	var f float64
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return nil
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+		return nil
+	}
+	return &f
 }
 
 // toUsage converts a decoded usage object; ok is false if it has no token counts.
@@ -93,6 +123,12 @@ type usageCapture struct {
 
 	usage core.Usage
 	known bool
+
+	// reportedCost is the usable provider-reported cost in the latest
+	// meaningful usage record. It is tracked independently of token
+	// knowledge so a cost-only usage object still yields a value; nil means
+	// that latest record did not carry a usable cost.
+	reportedCost *float64
 }
 
 func newUsageCapture(contentType string) *usageCapture {
@@ -198,15 +234,29 @@ func (c *usageCapture) dispatch() {
 	switch typ {
 	case "response.completed", "response.incomplete", "response.failed":
 		if ev.Response != nil {
-			if u, ok := ev.Response.Usage.toUsage(); ok {
-				c.usage, c.known = u, true
+			if u := ev.Response.Usage; u != nil {
+				// The most recent usage-bearing record is authoritative for
+				// cost: re-read it unconditionally so a stale intermediate
+				// cost (e.g. 0 from continuous usage stats) cannot survive a
+				// final record whose cost is unusable. Cost knowledge stays
+				// independent of token knowledge, so a cost-only usage object
+				// still yields a value.
+				c.reportedCost = u.reportedCostUSD()
+				if tok, ok := u.toUsage(); ok {
+					c.usage, c.known = tok, true
+				}
 			}
 		}
 		return
 	}
 	// Chat completions: the final chunk carries top-level usage.
-	if u, ok := ev.Usage.toUsage(); ok {
-		c.usage, c.known = u, true
+	if u := ev.Usage; u != nil {
+		// Same authority rule as above: the latest usage-bearing record decides
+		// the cost, and an unusable cost clears any earlier one.
+		c.reportedCost = u.reportedCostUSD()
+		if tok, ok := u.toUsage(); ok {
+			c.usage, c.known = tok, true
+		}
 	}
 }
 
@@ -233,5 +283,16 @@ func (c *usageCapture) Result() (core.Usage, bool) {
 	if json.Unmarshal(c.body.Bytes(), &body) != nil {
 		return core.Usage{}, false
 	}
+	if u := body.Usage; u != nil {
+		if cost := u.reportedCostUSD(); cost != nil {
+			c.reportedCost = cost
+		}
+	}
 	return body.Usage.toUsage()
 }
+
+// ReportedCost returns the usable cost in the latest meaningful usage record,
+// or nil if that record did not carry one. It is independent of token knowledge:
+// a cost-only usage object still yields a value. Call it after Result so any
+// final event buffered without a trailing blank line has been flushed.
+func (c *usageCapture) ReportedCost() *float64 { return c.reportedCost }

@@ -67,8 +67,10 @@ Instead of 5h/weekly windows, LocalRouter polls two provider figures:
   spending cap. `limit: null` is shown as unlimited; a cap of `0` is a real cap.
 
 Both are the provider's authoritative lifetime/period totals and include
-traffic that bypassed LocalRouter; ledger `cost_usd` (default
-`cost_basis: metered`) remains a local price estimate per request.
+traffic that bypassed LocalRouter; ledger `cost_usd` remains a per-request
+figure — a local price estimate (`cost_basis: metered`, the default, or
+`api_equivalent`), or the exact amount OpenRouter reported in `usage.cost`
+(`cost_basis: provider_reported`).
 
 A known balance at or below zero, or a key cap with nothing left, denies every
 class even if the data is stale. The cap's predicted reset date is informational
@@ -224,6 +226,19 @@ bin/localrouter pricing reprice
 
 Subscription accounts record `api_equivalent` cost (what it would cost at API list
 price), not actual spend. Unpriced models show as unpriced, never $0.
+
+When an OpenRouter response carries a usable request cost in `usage.cost`,
+that provider-reported amount is recorded as `cost_usd` with
+`cost_basis: provider_reported`, taking precedence over the local price table
+(including a genuine $0, e.g. `:free` models) and independent of whether token
+usage was parseable. Missing or unusable costs fall back to the existing local
+price estimate; if no price is available, they remain unpriced. `pricing reprice`
+never recomputes or clears provider-reported costs; rows recorded before this
+feature are historical and are not retroactively recovered. `cost_details` from
+the provider is ignored — only `usage.cost` is used, to avoid double counting.
+For an interrupted stream, an already observed cost is retained alongside the
+request error; it is a provider-reported observation, not a guarantee of the
+final billed amount. Account-wide spend from `/credits` remains separate.
 
 ## Client usage
 

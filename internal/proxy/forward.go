@@ -310,6 +310,12 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	if known {
 		rec.Usage = usage
 	}
+	// Provider-reported cost is an independent observation and is only trusted
+	// from OpenRouter; cost fields from other providers are ignored. Read it
+	// after Result above has flushed any final buffered event.
+	if rec.Provider == core.ProviderOpenRouter {
+		rec.ReportedCostUSD = capture.ReportedCost()
+	}
 	switch {
 	case aborted:
 		rec.Error = "client disconnected"
