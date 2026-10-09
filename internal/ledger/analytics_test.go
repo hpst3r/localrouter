@@ -79,7 +79,11 @@ func checkInvariants(t *testing.T, res core.AnalyticsResult) {
 			}
 		}
 	}
-	if !rowsEqual(bsum, res.Totals) {
+	if len(res.Breakdown) > core.AnalyticsMaxBreakdown || res.BreakdownOmitted < 0 {
+		t.Fatalf("breakdown len %d omitted %d", len(res.Breakdown), res.BreakdownOmitted)
+	}
+	// Omitted keys are only in Totals and __other__.
+	if res.BreakdownOmitted == 0 && !rowsEqual(bsum, res.Totals) {
 		t.Fatalf("breakdown sum %+v != totals %+v", bsum, res.Totals)
 	}
 }

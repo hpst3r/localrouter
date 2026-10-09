@@ -169,6 +169,7 @@ tbody tr.click:hover, tbody tr.click:focus-visible { background: var(--hover); o
 td.key { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
 td.key .swatch { margin-right: 7px; vertical-align: -1px; }
 td .sub { color: var(--muted); font-size: 11px; margin-left: 4px; }
+.tablenote { font-size: 12px; margin: 6px 2px 0; }
 td.share { width: 150px; }
 .sbar { display: inline-flex; align-items: center; gap: 8px; width: 100%; justify-content: flex-end; }
 .sbar .strack { flex: 1; max-width: 90px; height: 6px; border-radius: 99px; background: var(--track); overflow: hidden; }
@@ -246,6 +247,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
 <h2>Breakdown</h2>
 <section class="card">
   <div class="tablewrap"><table id="breakdown"><caption class="hidden">Usage breakdown</caption><thead></thead><tbody></tbody></table></div>
+  <p class="muted tablenote hidden" id="breakdownmore"></p>
 </section>
 
 <h2>Machines <span class="h2note">24h sparkline of tokens</span></h2>
@@ -990,6 +992,10 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     thead.appendChild(hr);
 
     const doc = data.main;
+    // The server lists at most 200 keys; the rest are only in totals.
+    const omitted = (doc && doc.breakdown_omitted) || 0, more = $("breakdownmore");
+    more.textContent = omitted > 0 ? fmtCount(omitted) + " more not shown" : "";
+    more.classList.toggle("hidden", !(omitted > 0));
     const rows = ((doc && doc.breakdown) || []).slice();
     if (!rows.length) {
       const tr = el("tr", "empty-row"), td = el("td", null, doc ? "No requests match this view." : "Usage unavailable.");
@@ -1167,6 +1173,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   }
   // Server rule: cost_usd is null only when the row has requests and none were priced.
   function finishRow(r) { if (r.cost_usd === null && r.requests === 0) r.cost_usd = 0; return r; }
+  const MAX_BREAKDOWN = 200; // core.AnalyticsMaxBreakdown
   function demoAnalytics(q) {
     const span = { "24h": 24, "7d": 168, "30d": 720, "90d": 2160 }[q.get("range") || "7d"] * HOUR;
     const to = q.get("to") ? Date.parse(q.get("to")) : Date.now();
@@ -1197,7 +1204,8 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     }
     return { schema_version: 1, from: new Date(from).toISOString(), to: new Date(to).toISOString(), bucket: bucket,
       bucket_starts: starts.map((b) => new Date(b).toISOString()), group: group, filters: filters,
-      totals: finishRow(totals), breakdown: ranked.map((g) => g.total), series: series };
+      totals: finishRow(totals), breakdown: ranked.slice(0, MAX_BREAKDOWN).map((g) => g.total),
+      breakdown_omitted: Math.max(0, ranked.length - MAX_BREAKDOWN), series: series };
   }
   function demoStatus() {
     const now = Date.now(), iso = (ms) => new Date(now + ms).toISOString();
