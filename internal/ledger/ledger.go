@@ -34,6 +34,26 @@ var (
 // MaxBatch is the maximum number of records accepted by RecordBatch.
 const MaxBatch = 1000
 
+// costBasisProviderReported is the reserved cost_basis provenance for a cost
+// the upstream provider reported itself (e.g. OpenRouter usage.cost). It takes
+// precedence over the local pricing table and is never overwritten by Reprice.
+const costBasisProviderReported = "provider_reported"
+
+// validReportedCost reports whether p is a usable provider-reported cost: an
+// explicit, finite, non-negative USD amount. nil, NaN, ±Inf and negative values
+// are unusable. It guards both the proxy's observations and records ingested
+// from agents.
+func validReportedCost(p *float64) (float64, bool) {
+	if p == nil {
+		return 0, false
+	}
+	c := *p
+	if math.IsNaN(c) || math.IsInf(c, 0) || c < 0 {
+		return 0, false
+	}
+	return c, true
+}
+
 // errBatchTooLarge reports a RecordBatch call whose record count exceeds
 // MaxBatch. Shared by Ledger.RecordBatch and PricingView.RecordBatch so the
 // bound and message are identical for both writers.
@@ -203,18 +223,7 @@ func insertArgs(r core.RequestRecord, pricing *Pricing, basis func(accountID str
 		_, _ = rand.Read(b[:])
 		r.ID = hex.EncodeToString(b[:])
 	}
-	var cost sql.NullFloat64
-	var costBasis sql.NullString
-	if r.UsageKnown {
-		if c, ok := pricing.Cost(r.Model, r.Usage); ok {
-			cost = sql.NullFloat64{Float64: c, Valid: true}
-			if basis != nil {
-				if b := basis(r.AccountID); b != "" {
-					costBasis = sql.NullString{String: b, Valid: true}
-				}
-			}
-		}
-	}
+	cost, costBasis := resolveCost(r, pricing, basis)
 	var finished sql.NullInt64
 	if !r.FinishedAt.IsZero() {
 		finished = sql.NullInt64{Int64: r.FinishedAt.UnixMilli(), Valid: true}
@@ -274,9 +283,44 @@ func (l *Ledger) recordBatchArgs(ctx context.Context, args [][]any) error {
 	return nil
 }
 
+// resolveCost picks the persisted cost_usd/cost_basis for r using the supplied
+// immutable price table and basis function. A usable provider-reported
+// OpenRouter cost (explicit, finite, non-negative — validated by
+// validReportedCost) takes precedence over the local pricing table — including
+// an explicit zero, and regardless of UsageKnown — and is stored with the
+// reserved "provider_reported" provenance. Otherwise the record is priced from
+// the table as before (only when usage is known). It is a pure function of its
+// arguments so a generation-pinned PricingView attributes cost at its own
+// frozen table and never depends on mutable ledger state.
+func resolveCost(r core.RequestRecord, pricing *Pricing, basis func(accountID string) string) (sql.NullFloat64, sql.NullString) {
+	if r.Provider == core.ProviderOpenRouter {
+		if c, ok := validReportedCost(r.ReportedCostUSD); ok {
+			return sql.NullFloat64{Float64: c, Valid: true},
+				sql.NullString{String: costBasisProviderReported, Valid: true}
+		}
+	}
+	var cost sql.NullFloat64
+	var costBasis sql.NullString
+	if r.UsageKnown {
+		if c, ok := pricing.Cost(r.Model, r.Usage); ok {
+			cost = sql.NullFloat64{Float64: c, Valid: true}
+			if basis != nil {
+				if b := basis(r.AccountID); b != "" {
+					costBasis = sql.NullString{String: b, Valid: true}
+				}
+			}
+		}
+	}
+	return cost, costBasis
+}
+
 // Reprice recomputes cost_usd and cost_basis for every row with known usage
 // using the ledger's current pricing (e.g. after importing prices). Rows for
-// unpriced models get NULL cost. It returns how many rows are now priced.
+// unpriced models get NULL cost. Rows whose cost was reported by the provider
+// (cost_basis "provider_reported") are never recomputed, overwritten, or
+// cleared; the guard is applied both when selecting rows and in the UPDATE so
+// a row that gains provider-reported provenance between the two is still
+// protected. It returns how many rows are now priced.
 func (l *Ledger) Reprice(ctx context.Context) (int, error) {
 	type row struct {
 		id, model, account string
@@ -284,7 +328,8 @@ func (l *Ledger) Reprice(ctx context.Context) (int, error) {
 	}
 	rs, err := l.db.QueryContext(ctx, `SELECT id, model, account_id, input_tokens,
 		cached_input_tokens, cache_creation_input_tokens, output_tokens, reasoning_tokens
-		FROM requests WHERE usage_known = 1`)
+		FROM requests WHERE usage_known = 1
+		AND (cost_basis IS NULL OR cost_basis <> '`+costBasisProviderReported+`')`)
 	if err != nil {
 		return 0, fmt.Errorf("ledger: reprice: %w", err)
 	}
@@ -310,7 +355,8 @@ func (l *Ledger) Reprice(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("ledger: reprice: %w", err)
 	}
 	defer tx.Rollback()
-	stmt, err := tx.PrepareContext(ctx, `UPDATE requests SET cost_usd = ?, cost_basis = ? WHERE id = ?`)
+	stmt, err := tx.PrepareContext(ctx, `UPDATE requests SET cost_usd = ?, cost_basis = ?
+		WHERE id = ? AND (cost_basis IS NULL OR cost_basis <> '`+costBasisProviderReported+`')`)
 	if err != nil {
 		return 0, fmt.Errorf("ledger: reprice: %w", err)
 	}
@@ -428,16 +474,18 @@ func (l *Ledger) summaryByDay(ctx context.Context, since time.Time) ([]core.Usag
 		u.CacheCreationInputTokens = satAdd(u.CacheCreationInputTokens, creation)
 		u.OutputTokens = satAdd(u.OutputTokens, outTok)
 		u.ReasoningTokens = satAdd(u.ReasoningTokens, reasoning)
-		switch {
-		case cost.Valid:
+		// Token knowledge and cost knowledge are independent for reported
+		// OpenRouter costs, matching the SQL aggregation in other groups.
+		if !known {
+			u.UnknownUsageRequests++
+		}
+		if cost.Valid {
 			c := cost.Float64
 			if u.CostUSD != nil {
 				c += *u.CostUSD
 			}
 			u.CostUSD = &c
-		case !known:
-			u.UnknownUsageRequests++
-		default:
+		} else if known {
 			u.UnpricedRequests++
 		}
 	}

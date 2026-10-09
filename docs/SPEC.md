@@ -175,8 +175,23 @@ cached_input_tokens, output_tokens, reasoning_tokens, usage_known,
 cost_usd, cost_basis, latency_ms, bytes_out, session, task, agent, error`.
 
 `cost_basis`: `api_equivalent` (subscription accounts: what it would cost at
-API list price), `metered` (API-key billing), or NULL if unpriced. Unknown
-price ⇒ `cost_usd` NULL, never 0.
+API list price), `metered` (API-key billing), `provider_reported` (the cost the
+upstream provider itself reported, e.g. OpenRouter `usage.cost`), or NULL if
+unpriced. Unknown price ⇒ `cost_usd` NULL, never 0. `metered` and
+`api_equivalent` amounts from local pricing are estimates; `provider_reported`
+is a distinct request-level provenance.
+
+A usable provider-reported cost (finite, ≥ 0, present only for OpenRouter) is
+recorded verbatim as `cost_usd` with `cost_basis: provider_reported`. It takes
+precedence over the local price table — including an explicit 0 — and is kept
+even when token usage was not parseable (`usage_known = 0`), since the cost is
+known independently. `usage.cost_details`, if present, is ignored: only
+`usage.cost` counts, to avoid double counting. `localrouter pricing reprice`
+never overwrites or clears a `provider_reported` row (NULL-safe on both the
+select and the update); rows written before this feature are historical and are
+not retroactively recovered. A row with known cost but unknown tokens still
+contributes to cost totals, counts in `unknown_usage_requests` (token knowledge),
+and is not an unpriced request.
 
 Pricing file `pricing.yaml`: per model, USD per 1M `input`, `cached_input`,
 `output` (reasoning billed as output). Shipped EMPTY of numbers; user or
@@ -192,10 +207,22 @@ Cost = (input−cached)·in + cached·cached_in + output·out, all /1e6.
 - Chat completions: `usage.{prompt_tokens, completion_tokens,
   prompt_tokens_details.cached_tokens, completion_tokens_details.reasoning_tokens}`
   from the final chunk / body.
+- Provider-reported cost: `usage.cost` (USD) from the same final record — the
+  final chat chunk's top-level `usage`, the non-stream body's top-level `usage`,
+  or a Responses terminal event's `response.usage`. The last meaningful final
+  usage wins; costs are never summed per chunk. Captured only for OpenRouter.
+  An explicit 0 is valid; missing, `null`, non-numeric, negative, or non-finite
+  cost in the latest meaningful usage record clears any earlier intermediate
+  cost, without discarding that record's valid token counts. Usage-less chunks
+  do not clear the observation.
 - Client disconnect or missing usage ⇒ `usage_known = false`; lease still
-  released.
+  released. An already observed provider cost is retained alongside the
+  transport/request error, independently of token knowledge; for an interrupted
+  stream it is not a guarantee of the final billed amount.
 - Parser must handle multi-line `data:` fields and `\r\n`, and must not
   buffer the entire stream (scan incrementally; keep ≤ 4 MiB per event).
+  Non-stream JSON capture is bounded to 16 MiB; oversized bodies are still
+  relayed, but their usage and cost are left unknown.
 
 ## Auth
 
