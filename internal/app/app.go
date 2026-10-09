@@ -99,6 +99,41 @@ func StaticKeys(cfg *config.Config) map[string]auth.StaticKey {
 	return keys
 }
 
+// ManagementKeys maps openrouter accounts that configure a management key to
+// its source. Those keys are held by a separate credential manager used only
+// for GET /credits, so they can never be attached to inference or GET /key.
+func ManagementKeys(cfg *config.Config) map[string]auth.StaticKey {
+	keys := map[string]auth.StaticKey{}
+	for _, a := range cfg.Accounts {
+		if a.Provider == core.ProviderOpenRouter && (a.ManagementKeyFile != "" || a.ManagementKeyEnv != "") {
+			keys[a.ID] = auth.StaticKey{File: a.ManagementKeyFile, Env: a.ManagementKeyEnv}
+		}
+	}
+	return keys
+}
+
+// managementCredentials returns the quota.Options.ManagementCredentials
+// lookup: the management-key manager for accounts with one, nil otherwise.
+func managementCredentials(cfg *config.Config, logger *slog.Logger, ov Overrides) func(string) core.CredentialSource {
+	keys := ManagementKeys(cfg)
+	if len(keys) == 0 {
+		return nil
+	}
+	var accts []core.Account
+	for _, a := range cfg.CoreAccounts() {
+		if _, ok := keys[a.ID]; ok {
+			accts = append(accts, a)
+		}
+	}
+	m := auth.New(accts, keys, nil, auth.Options{HTTPClient: ov.HTTPClient, Clock: ov.Clock, Logger: logger})
+	return func(id string) core.CredentialSource {
+		if _, ok := keys[id]; ok {
+			return m
+		}
+		return nil
+	}
+}
+
 // NewAuth builds the credential manager (used by serve and login).
 func NewAuth(cfg *config.Config, logger *slog.Logger, ov Overrides) (*auth.Manager, error) {
 	store, err := auth.NewStore(filepath.Join(cfg.DataDir, "tokens"))
@@ -163,6 +198,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		OllamaUsageURL:        ov.OllamaUsageURL,
 		ClaudeUsageURL:        ov.ClaudeUsageURL,
 		ClaudeCredentialsFile: func(id string) string { return claudeCreds[id] },
+		ManagementCredentials: managementCredentials(cfg, logger, ov),
 	})
 	pol := policy.New(accounts, qm, policy.Options{
 		StaleAfter:       cfg.Policy.StaleAfter.D(),

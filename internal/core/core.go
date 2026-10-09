@@ -19,6 +19,10 @@ const (
 	// quota (read-only, never refreshing the CLI's token) and ingests token
 	// usage from Claude Code's local transcripts.
 	ProviderClaude = "claude"
+	// ProviderOpenRouter is a prepaid OpenRouter API account. Inference is
+	// forwarded like openai_compat; quota is a signed USD account balance
+	// (GET /credits) and the key's own spend/cap (GET /key), not windows.
+	ProviderOpenRouter = "openrouter"
 )
 
 // Workload classes.
@@ -58,6 +62,52 @@ type Snapshot struct {
 	// the account, including clients that bypass LocalRouter. nil if the
 	// provider does not report them.
 	ModelRequests map[string][]ModelCount `json:"model_requests,omitempty"`
+	// Credits is the account-level prepaid balance (openrouter only); nil for
+	// providers without one. Key is the API key's own spend and cap
+	// (openrouter only). Each carries its own FetchedAt/Err so a partial
+	// refresh never makes the other look fresh. For these accounts
+	// FetchedAt is the oldest successful observation among the parts.
+	Credits *Credits  `json:"credits,omitempty"`
+	Key     *KeyUsage `json:"key,omitempty"`
+}
+
+// Credits is a provider-reported prepaid USD account balance (OpenRouter GET
+// /credits). TotalCreditsUSD and TotalUsageUSD are lifetime totals; BalanceUSD
+// = TotalCreditsUSD - TotalUsageUSD and is signed (negative = overdrawn). They
+// are the provider's figures, independent of the router's ledger estimates.
+// FetchedAt is zero until the first successful fetch: the values are then
+// unknown (not zero). Err is the last fetch error; values stay last-good.
+type Credits struct {
+	TotalCreditsUSD float64   `json:"total_credits_usd"`
+	TotalUsageUSD   float64   `json:"total_usage_usd"`
+	BalanceUSD      float64   `json:"balance_usd"`
+	FetchedAt       time.Time `json:"fetched_at"`
+	Err             string    `json:"error,omitempty"`
+}
+
+// KeyUsage is the spend and spending cap of one API key (OpenRouter GET
+// /key), in USD. A nil pointer means the provider reported null (LimitUSD /
+// LimitRemainingUSD: no cap) or did not report the field; zero is a real
+// zero. BYOK figures are kept separate from UsageUSD and never summed into
+// it. LimitResetAt is the next cap reset derived from LimitReset ("daily",
+// "weekly", "monthly"; zero if none or unknown). FetchedAt/Err as Credits.
+type KeyUsage struct {
+	LimitUSD            *float64  `json:"limit_usd"`
+	LimitRemainingUSD   *float64  `json:"limit_remaining_usd"`
+	LimitReset          string    `json:"limit_reset,omitempty"`
+	LimitResetAt        time.Time `json:"limit_reset_at"`
+	IncludeBYOKInLimit  *bool     `json:"include_byok_in_limit,omitempty"`
+	UsageUSD            float64   `json:"usage_usd"`
+	UsageDailyUSD       *float64  `json:"usage_daily_usd"`
+	UsageWeeklyUSD      *float64  `json:"usage_weekly_usd"`
+	UsageMonthlyUSD     *float64  `json:"usage_monthly_usd"`
+	BYOKUsageUSD        *float64  `json:"byok_usage_usd"`
+	BYOKUsageDailyUSD   *float64  `json:"byok_usage_daily_usd"`
+	BYOKUsageWeeklyUSD  *float64  `json:"byok_usage_weekly_usd"`
+	BYOKUsageMonthlyUSD *float64  `json:"byok_usage_monthly_usd"`
+	IsFreeTier          *bool     `json:"is_free_tier,omitempty"`
+	FetchedAt           time.Time `json:"fetched_at"`
+	Err                 string    `json:"error,omitempty"`
 }
 
 // ModelCount is one provider-reported per-model request count.

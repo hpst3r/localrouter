@@ -43,6 +43,12 @@ type Options struct {
 	// a claude account. The file is only ever read, never written. Nil or an
 	// empty result makes fetches for that account fail with a sanitized Err.
 	ClaudeCredentialsFile func(accountID string) string
+
+	// ManagementCredentials returns the separate credential source holding an
+	// openrouter account's optional management key, or nil when none is
+	// configured. It is used only for GET <base_url>/credits; inference and
+	// GET <base_url>/key always use the account's normal credential.
+	ManagementCredentials func(accountID string) core.CredentialSource
 }
 
 type accountState struct {
@@ -112,7 +118,7 @@ func New(accounts []core.Account, creds core.CredentialSource, opts Options) *Ma
 	}
 	for _, a := range accounts {
 		switch a.Provider {
-		case core.ProviderCodex, core.ProviderOllama, core.ProviderClaude:
+		case core.ProviderCodex, core.ProviderOllama, core.ProviderClaude, core.ProviderOpenRouter:
 			m.state[a.ID] = &accountState{acct: a, observedAt: make(map[string]time.Time)}
 		}
 	}
@@ -204,6 +210,28 @@ func (m *Manager) refresh(ctx context.Context, id string, urgent bool) {
 	ch := make(chan struct{})
 	st.inflight = ch
 	acct := st.acct
+	if acct.Provider == core.ProviderOpenRouter {
+		var prev *core.Snapshot
+		if st.snap != nil {
+			c := copySnapshot(*st.snap)
+			prev = &c
+		}
+		m.mu.Unlock()
+		// Partial results are merged part by part inside fetchOpenRouter, so
+		// the outcome always replaces the snapshot. Only this single-flight
+		// fetch writes openrouter snapshots (headers and ingest do not).
+		snap := m.fetchOpenRouter(ctx, acct, prev)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		defer close(ch)
+		st.inflight = nil
+		st.lastFetch = m.opts.Clock.Now()
+		if snap.Err != "" {
+			m.opts.Logger.Warn("quota fetch failed", "account", id, "provider", acct.Provider, "error", snap.Err)
+		}
+		st.snap = &snap
+		return
+	}
 	m.mu.Unlock()
 
 	snap, err := m.fetch(ctx, acct)
@@ -287,6 +315,27 @@ func copySnapshot(s core.Snapshot) core.Snapshot {
 			mr[k] = append([]core.ModelCount(nil), v...)
 		}
 		s.ModelRequests = mr
+	}
+	if s.Credits != nil {
+		c := *s.Credits
+		s.Credits = &c
+	}
+	if s.Key != nil {
+		k := *s.Key
+		for _, p := range []**float64{&k.LimitUSD, &k.LimitRemainingUSD, &k.UsageDailyUSD, &k.UsageWeeklyUSD,
+			&k.UsageMonthlyUSD, &k.BYOKUsageUSD, &k.BYOKUsageDailyUSD, &k.BYOKUsageWeeklyUSD, &k.BYOKUsageMonthlyUSD} {
+			if *p != nil {
+				v := **p
+				*p = &v
+			}
+		}
+		for _, p := range []**bool{&k.IncludeBYOKInLimit, &k.IsFreeTier} {
+			if *p != nil {
+				v := **p
+				*p = &v
+			}
+		}
+		s.Key = &k
 	}
 	return s
 }

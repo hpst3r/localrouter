@@ -76,6 +76,11 @@ type accountState struct {
 	inflight      int
 	cooldownStart time.Time
 	cooldownUntil time.Time
+	// topUp is set for a prepaid 402 cooldown: it may clear early only once
+	// a fresh balance exceeds topUpFrom (the balance known at the 402; nil
+	// when unknown, then any positive balance).
+	topUp     bool
+	topUpFrom *float64
 }
 
 var _ core.Policy = (*Policy)(nil)
@@ -221,11 +226,22 @@ func (p *Policy) admitLocked(c *cfg, acct core.Account, class core.Class, now ti
 	st := p.state[acct.ID]
 	snap, has := p.quota.Latest(acct.ID)
 
+	prepaid := acct.Provider == core.ProviderOpenRouter
 	if now.Before(st.cooldownUntil) {
-		if has && snap.FetchedAt.After(st.cooldownStart) && showsHeadroom(snap, now) {
-			st.cooldownStart, st.cooldownUntil = time.Time{}, time.Time{}
+		if has && (prepaid && st.topUp && prepaidHeadroom(snap, st.cooldownStart, st.topUpFrom, now) ||
+			!prepaid && snap.FetchedAt.After(st.cooldownStart) && showsHeadroom(snap, now)) {
+			st.cooldownStart, st.cooldownUntil, st.topUp, st.topUpFrom = time.Time{}, time.Time{}, false, nil
 		} else {
 			return false, "cooldown until " + st.cooldownUntil.UTC().Format(time.RFC3339)
+		}
+	}
+
+	// Known prepaid exhaustion denies every class even when the snapshot is
+	// stale: a balance never rolls over on its own, so failing open would
+	// only burn an upstream 402.
+	if prepaid && has {
+		if why := prepaidExhausted(snap); why != "" {
+			return false, why
 		}
 	}
 
@@ -285,6 +301,7 @@ func (p *Policy) release(id string, o core.Outcome) {
 	if st.inflight > 0 {
 		st.inflight--
 	}
+	prepaid := c.accounts[id].Provider == core.ProviderOpenRouter
 	var until time.Time
 	switch o.Status {
 	case 429:
@@ -299,11 +316,25 @@ func (p *Policy) release(id string, o core.Outcome) {
 		}
 	case 401, 403:
 		until = now.Add(cooldownMin)
+	case 402:
+		// Payment required: OpenRouter's out-of-credit answer. Other
+		// providers keep their previous (no cooldown) handling.
+		if prepaid {
+			until = now.Add(cooldownMin)
+			if o.ResetAt.After(until) {
+				until = o.ResetAt
+			}
+		}
 	}
 	if !until.IsZero() {
 		st.cooldownStart = now
 		if until.After(st.cooldownUntil) {
 			st.cooldownUntil = until
+		}
+		st.topUp, st.topUpFrom = prepaid && o.Status == 402, nil
+		if snap, ok := p.quota.Latest(id); st.topUp && ok && snap.Credits != nil && !snap.Credits.FetchedAt.IsZero() {
+			b := snap.Credits.BalanceUSD
+			st.topUpFrom = &b
 		}
 	}
 	p.mu.Unlock()
@@ -311,7 +342,7 @@ func (p *Policy) release(id string, o core.Outcome) {
 	if !until.IsZero() {
 		c.opts.Logger.Info("account cooldown", "account", id, "status", o.Status, "until", until)
 	}
-	p.quota.RequestRefresh(id, o.Status == 429)
+	p.quota.RequestRefresh(id, o.Status == 429 || prepaid && o.Status == 402)
 }
 
 // normalizeOptions fills in the process-identity and default values that are
@@ -441,6 +472,46 @@ func earliestExhaustedReset(s core.Snapshot, now time.Time) time.Time {
 		}
 	}
 	return best
+}
+
+// prepaidExhausted explains why a prepaid (openrouter) account cannot serve,
+// or returns "". A known balance at or below zero always denies; a known key
+// cap with no remaining spend denies regardless of its predicted reset. The
+// provider limit_remaining is the only authoritative signal that a cap has
+// been restored, so a stale exhaustion is never cleared on the clock alone.
+// Unknown parts (never fetched, or credits unavailable) never deny on their
+// own.
+func prepaidExhausted(s core.Snapshot) string {
+	if c := s.Credits; c != nil && !c.FetchedAt.IsZero() && c.BalanceUSD <= 0 {
+		return "openrouter account balance " + usd(c.BalanceUSD) + " (credit exhausted)"
+	}
+	if keyCapExhausted(s.Key) {
+		k := s.Key
+		return fmt.Sprintf("openrouter key spending cap exhausted (%s left of %s)", usd(*k.LimitRemainingUSD), usd(*k.LimitUSD))
+	}
+	return ""
+}
+
+// keyCapExhausted reports whether a known key cap has no spend left. A cap is
+// exhausted when both the cap and its remaining amount are known and remaining
+// is at or below zero; a malformed pair (finite cap with unknown remaining, or
+// null cap with finite remaining) is rejected by the quota parser and must not
+// be read as exhausted. LimitResetAt is informational: reaching the predicted
+// reset does not restore spending credit, so it never clears exhaustion. Only
+// a fresh /key observation with positive LimitRemainingUSD reopens the gate.
+func keyCapExhausted(k *core.KeyUsage) bool {
+	return k != nil && !k.FetchedAt.IsZero() && k.LimitRemainingUSD != nil && k.LimitUSD != nil &&
+		*k.LimitRemainingUSD <= 0
+}
+
+// prepaidHeadroom reports whether a prepaid account was topped up after a
+// 402: a balance observed after since that is positive and above from (the
+// balance known at the 402, if any), with no exhausted key cap. Key data alone
+// is not proof of funds, so unavailable credits never clear a cooldown early.
+func prepaidHeadroom(s core.Snapshot, since time.Time, from *float64, now time.Time) bool {
+	c := s.Credits
+	return c != nil && c.FetchedAt.After(since) && c.BalanceUSD > 0 &&
+		(from == nil || c.BalanceUSD > *from+epsilon) && !keyCapExhausted(s.Key)
 }
 
 func hasReserve(a core.Account) bool {

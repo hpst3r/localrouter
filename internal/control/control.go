@@ -193,6 +193,50 @@ type accountStatus struct {
 	// ModelRequests are provider-reported per-model request counts per window
 	// kind; they include traffic that bypassed LocalRouter.
 	ModelRequests map[string][]core.ModelCount `json:"model_requests,omitempty"`
+	// Credits and Key are present only for openrouter accounts: the signed
+	// USD account balance and the API key's own spend/cap, each with its own
+	// freshness. Provider figures, independent of ledger cost estimates.
+	Credits *creditsStatus `json:"credits,omitempty"`
+	Key     *keyStatus     `json:"key,omitempty"`
+}
+
+// creditsStatus is the account-level prepaid balance. Amounts are null while
+// unavailable (never fetched, or no permission); BalanceUSD is signed.
+type creditsStatus struct {
+	Available       bool     `json:"available"`
+	BalanceUSD      *float64 `json:"balance_usd"`
+	TotalCreditsUSD *float64 `json:"total_credits_usd"`
+	TotalUsageUSD   *float64 `json:"total_usage_usd"`
+	// Exhausted is true when the known balance is at or below zero.
+	Exhausted bool    `json:"exhausted"`
+	AgeS      *int64  `json:"age_s"`
+	Stale     bool    `json:"stale"`
+	Error     *string `json:"error"`
+}
+
+// keyStatus is the API key's spend and cap. Unlimited is true when the
+// provider reports no cap (limit null); a zero cap is a real cap.
+type keyStatus struct {
+	Available           bool       `json:"available"`
+	Unlimited           bool       `json:"unlimited"`
+	LimitUSD            *float64   `json:"limit_usd"`
+	LimitRemainingUSD   *float64   `json:"limit_remaining_usd"`
+	LimitReset          string     `json:"limit_reset,omitempty"`
+	LimitResetAt        *time.Time `json:"limit_reset_at"`
+	Exhausted           bool       `json:"exhausted"`
+	UsageUSD            *float64   `json:"usage_usd"`
+	UsageDailyUSD       *float64   `json:"usage_daily_usd"`
+	UsageWeeklyUSD      *float64   `json:"usage_weekly_usd"`
+	UsageMonthlyUSD     *float64   `json:"usage_monthly_usd"`
+	BYOKUsageUSD        *float64   `json:"byok_usage_usd"`
+	BYOKUsageDailyUSD   *float64   `json:"byok_usage_daily_usd"`
+	BYOKUsageWeeklyUSD  *float64   `json:"byok_usage_weekly_usd"`
+	BYOKUsageMonthlyUSD *float64   `json:"byok_usage_monthly_usd"`
+	IncludeBYOKInLimit  *bool      `json:"include_byok_in_limit"`
+	IsFreeTier          *bool      `json:"is_free_tier"`
+	AgeS                *int64     `json:"age_s"`
+	Stale               bool       `json:"stale"`
+	Error               *string    `json:"error"`
 }
 
 type windowStatus struct {
@@ -268,8 +312,73 @@ func (s *Server) accountStatus(a core.Account, now time.Time) accountStatus {
 		}
 		st.ModelRequests = snap.ModelRequests
 	}
+	if a.Provider == core.ProviderOpenRouter {
+		st.Credits, st.Key = s.creditsView(snap.Credits, now), s.keyView(snap.Key, now)
+	}
 	st.Healthy = !coolingDown && st.Error == nil
 	return st
+}
+
+// partAge returns the age and staleness of a part fetched at t (nil, true if
+// never fetched).
+func (s *Server) partAge(t, now time.Time) (*int64, bool) {
+	if t.IsZero() {
+		return nil, true
+	}
+	age := int64(max(now.Sub(t), 0) / time.Second)
+	return &age, now.Sub(t) > s.opts.StaleAfter
+}
+
+func errPtr(e string) *string {
+	if e == "" {
+		return nil
+	}
+	return &e
+}
+
+func (s *Server) creditsView(c *core.Credits, now time.Time) *creditsStatus {
+	if c == nil {
+		c = &core.Credits{}
+	}
+	v := &creditsStatus{Error: errPtr(c.Err)}
+	v.AgeS, v.Stale = s.partAge(c.FetchedAt, now)
+	if !c.FetchedAt.IsZero() {
+		bal, tc, tu := c.BalanceUSD, c.TotalCreditsUSD, c.TotalUsageUSD
+		v.Available, v.BalanceUSD, v.TotalCreditsUSD, v.TotalUsageUSD = true, &bal, &tc, &tu
+		v.Exhausted = bal <= 0
+	}
+	return v
+}
+
+func (s *Server) keyView(k *core.KeyUsage, now time.Time) *keyStatus {
+	if k == nil {
+		k = &core.KeyUsage{}
+	}
+	v := &keyStatus{Error: errPtr(k.Err)}
+	v.AgeS, v.Stale = s.partAge(k.FetchedAt, now)
+	if k.FetchedAt.IsZero() {
+		return v
+	}
+	// The snapshot comes from Latest (a private deep copy), so its pointers
+	// can be shared with the response.
+	usage := k.UsageUSD
+	v.Available, v.UsageUSD = true, &usage
+	v.Unlimited = k.LimitUSD == nil
+	v.LimitUSD, v.LimitRemainingUSD, v.LimitReset = k.LimitUSD, k.LimitRemainingUSD, k.LimitReset
+	v.UsageDailyUSD, v.UsageWeeklyUSD, v.UsageMonthlyUSD = k.UsageDailyUSD, k.UsageWeeklyUSD, k.UsageMonthlyUSD
+	v.BYOKUsageUSD, v.BYOKUsageDailyUSD = k.BYOKUsageUSD, k.BYOKUsageDailyUSD
+	v.BYOKUsageWeeklyUSD, v.BYOKUsageMonthlyUSD = k.BYOKUsageWeeklyUSD, k.BYOKUsageMonthlyUSD
+	v.IncludeBYOKInLimit, v.IsFreeTier = k.IncludeBYOKInLimit, k.IsFreeTier
+	if !k.LimitResetAt.IsZero() {
+		t := k.LimitResetAt.UTC()
+		v.LimitResetAt = &t
+	}
+	// LimitResetAt is informational only: reaching the predicted reset does not
+	// restore spending credit, so a zero-remaining cap stays exhausted until a
+	// fresh /key observation reports positive remaining. A finite cap with a
+	// null remaining is a malformed pair the parser rejects, not exhaustion.
+	v.Exhausted = k.LimitUSD != nil && k.LimitRemainingUSD != nil && *k.LimitRemainingUSD <= 0
+	return v
 }
 
 func windowView(win core.Window, now time.Time) windowStatus {
