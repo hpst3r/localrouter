@@ -181,7 +181,8 @@ unpriced. Unknown price ⇒ `cost_usd` NULL, never 0. `metered` and
 `api_equivalent` amounts from local pricing are estimates; `provider_reported`
 is a distinct request-level provenance.
 
-A usable provider-reported cost (finite, ≥ 0, present only for OpenRouter) is
+A usable provider-reported cost (0 ≤ cost ≤ `core.MaxReportedCostUSD` = 1e6
+USD, so NaN/±Inf are unusable; present only for OpenRouter) is
 recorded verbatim as `cost_usd` with `cost_basis: provider_reported`. It takes
 precedence over the local price table — including an explicit 0 — and is kept
 even when token usage was not parseable (`usage_known = 0`), since the cost is
@@ -197,6 +198,13 @@ Pricing file `pricing.yaml`: per model, USD per 1M `input`, `cached_input`,
 `output` (reasoning billed as output). Shipped EMPTY of numbers; user or
 `localrouter pricing import <litellm json>` populates it. Never invent prices.
 Cost = (input−cached)·in + cached·cached_in + output·out, all /1e6.
+Every price must be 0 ≤ price ≤ `core.MaxPricePerMTokUSD` (1e6 USD per 1M
+tokens); loading `pricing.yaml` or `pricing.local.yaml` fails on any other
+value (including YAML `.nan`/`.inf`), naming the model, and `pricing import`
+fails the same way instead of writing such a table. A computed cost that is
+not finite counts as unpriced (`cost_usd` NULL) in Record and Reprice. Cost
+sums in Summary and Analytics saturate at the largest finite float64 so
+responses stay JSON-encodable.
 
 ## Usage capture
 
@@ -299,6 +307,9 @@ key.
   no keys, secret paths, prompt content or per-account quota windows. `reload`
   is present only when a reload seam is wired; it is the sanitized last reload
   attempt (see "Configuration reload" below) and never carries key material.
+- JSON responses are encoded before the status line is written; a body that
+  cannot be encoded yields 500 `{"error":{"message":"encoding response
+  failed"}}` instead of a 200 with an empty body.
 
 ## Logging
 
@@ -570,8 +581,15 @@ server's `/v1` with their own client keys.
   whatever the agent claimed), and FORCES `Route="claude"`, `Provider="claude"`;
   records whose `AccountID` is not a configured claude account -> whole
   request 400 (no partial writes).
-  Records must have non-empty ID, `UsageKnown=true`, non-negative usage;
-  otherwise 400.
+  Records must have an ID matching `[A-Za-z0-9:._-]{1,128}`,
+  `UsageKnown=true`, usage token counts in [0, `core.MaxRecordTokens`] (1e12)
+  and `started_at` within -400 days..+5 minutes of server time. `class` must
+  be "", `interactive` or `background`; `model`, `session`, `task`, `agent`,
+  `upstream_identity` and `failover_of` at most `core.MaxLabelBytes` (128)
+  bytes and `error` at most `core.MaxErrorBytes` (256) bytes, each valid
+  UTF-8 without control characters (the proxy truncates its own values to
+  the same bounds); `status`, `latency_ms` and `bytes_out` non-negative.
+  Otherwise 400 with `error.code` `invalid_record` (whole request rejected).
 - Snapshots: each must name a configured claude account with
   `quota_source: agent`, else 400. Passed to `SnapshotIngester`; a snapshot
   with `FetchedAt` <= the stored one is ignored (counted in
@@ -697,7 +715,7 @@ to LocalRouter only through the documented control API.
   (time.Local, DST-correct: bucket boundaries are local midnights; a 23h or
   25h day is one bucket). BucketStarts covers [From, To) from the bucket
   containing From to the bucket containing To-1ns.
-- One SQL query aggregates by (bucket key, group key) over
+- SQL aggregates by (bucket key, group key) over
   `started_at >= From AND started_at < To` + filters; bucketing of local days
   happens in Go (do NOT trust SQLite localtime). Must handle 1M rows in < 1s
   on a laptop: aggregate in SQL by hour (`started_at/3600000`), then fold
@@ -708,9 +726,13 @@ to LocalRouter only through the documented control API.
   the point has requests but none priced, else sum of priced; same rule as
   Summary.
 - Rank keys by total tokens (input+output) desc, then key asc. Breakdown =
-  all keys ranked (UsageRow.Key = group value, "" allowed). Series = top N in
-  rank order, then `__other__` summing the rest (omitted if none). Every
-  series has exactly len(BucketStarts) points (zeros where empty).
+  the highest-ranked `core.AnalyticsMaxBreakdown` (200) keys in rank order
+  (UsageRow.Key = group value, "" allowed); `breakdown_omitted` counts the
+  remaining keys, which appear only in Totals and `__other__`. Series = top N
+  in rank order, then `__other__` summing the rest (omitted if none). Every
+  series has exactly len(BucketStarts) points (zeros where empty). Keys are
+  ranked first and per-bucket points are kept only for the top N plus
+  `__other__`, so memory does not grow with the number of distinct keys.
 - Totals = sum over everything matched.
 
 ### HTTP
@@ -755,10 +777,11 @@ and wide (browser). Sections:
    zooms the time range to that bucket (day -> hourly view of that day).
    State is kept in the URL hash (`#range=7d&group=model&f.host=pf3llssv`) so
    reload/back works.
-5. **Breakdown table** under the chart: the full Breakdown with columns key,
+5. **Breakdown table** under the chart: the Breakdown with columns key,
    requests, input, cached (and % cache hit), cache write, output, cost,
    share bar (inline CSS bar). Sortable by clicking headers. Rows clickable
-   = drill down.
+   = drill down. When `breakdown_omitted` > 0 a note under the table reads
+   "N more not shown".
 6. **Machines strip**: one compact card per host (from a host-grouped query
    for the current range, unfiltered): tokens, cost, requests, last seen
    (max started_at is NOT available from the API — show a 24h sparkline of

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"slices"
@@ -114,7 +115,11 @@ func (s *Server) analyticsDimensions(w http.ResponseWriter, r *http.Request) {
 		}
 		vals := make([]dimensionValue, 0, min(len(res.Breakdown), dimensionsTop))
 		for _, row := range res.Breakdown[:min(len(res.Breakdown), dimensionsTop)] {
-			vals = append(vals, dimensionValue{Key: row.Key, Requests: row.Requests, Tokens: row.InputTokens + row.OutputTokens})
+			tokens := row.InputTokens + row.OutputTokens
+			if tokens < row.InputTokens || tokens < row.OutputTokens { // saturate on overflow
+				tokens = math.MaxInt64
+			}
+			vals = append(vals, dimensionValue{Key: row.Key, Requests: row.Requests, Tokens: tokens})
 		}
 		doc.Dimensions[dim] = vals
 	}

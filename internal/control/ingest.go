@@ -20,8 +20,6 @@ const (
 	maxIngestRecords = 1000
 	maxSnapshotSkew  = 5 * time.Minute
 	maxRecordAge     = 400 * 24 * time.Hour
-	// maxTokens caps each usage field so ledger sums stay far from int64.
-	maxTokens = 1_000_000_000_000
 	// QuotaSourceAgent marks claude accounts whose snapshots come from agents.
 	QuotaSourceAgent = "agent"
 )
@@ -177,9 +175,12 @@ func (s *Server) validateIngest(req *core.IngestRequest, client string) error {
 		u := rec.Usage
 		for _, n := range []int64{u.InputTokens, u.CachedInputTokens, u.CacheCreationInputTokens,
 			u.OutputTokens, u.ReasoningTokens} {
-			if n < 0 || n > maxTokens {
-				return recErr("records[%d]: usage token counts must be between 0 and %d", i, int64(maxTokens))
+			if n < 0 || n > core.MaxRecordTokens {
+				return recErr("records[%d]: usage token counts must be between 0 and %d", i, core.MaxRecordTokens)
 			}
+		}
+		if err := validateRecordFields(i, rec); err != nil {
+			return err
 		}
 		switch {
 		case rec.StartedAt.IsZero():
@@ -225,6 +226,35 @@ func (s *Server) validateIngest(req *core.IngestRequest, client string) error {
 		if snap.FetchedAt.After(now) {
 			snap.FetchedAt = now
 		}
+	}
+	return nil
+}
+
+// validateRecordFields bounds the free-form fields of an ingested record the
+// way the proxy bounds its own: labels at most core.MaxLabelBytes and the
+// error at most core.MaxErrorBytes of valid UTF-8 without control
+// characters (the core truncation helpers leave such values unchanged).
+func validateRecordFields(i int, rec *core.RequestRecord) error {
+	switch rec.Class {
+	case "", core.ClassInteractive, core.ClassBackground:
+	default:
+		return recErr("records[%d]: class must be empty, interactive or background", i)
+	}
+	for _, f := range []struct{ name, v string }{
+		{"model", rec.Model}, {"session", rec.Session}, {"task", rec.Task}, {"agent", rec.Agent},
+		{"upstream_identity", rec.UpstreamIdentity}, {"failover_of", rec.FailoverOf},
+	} {
+		if core.TruncateLabel(f.v) != f.v {
+			return recErr("records[%d]: %s must be at most %d bytes of UTF-8 without control characters",
+				i, f.name, core.MaxLabelBytes)
+		}
+	}
+	if core.TruncateError(rec.Error) != rec.Error {
+		return recErr("records[%d]: error must be at most %d bytes of UTF-8 without control characters",
+			i, core.MaxErrorBytes)
+	}
+	if rec.Status < 0 || rec.LatencyMS < 0 || rec.BytesOut < 0 {
+		return recErr("records[%d]: status, latency_ms and bytes_out must be non-negative", i)
 	}
 	return nil
 }

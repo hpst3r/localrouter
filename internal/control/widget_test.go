@@ -1,6 +1,9 @@
 package control
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -43,5 +46,29 @@ func TestWidgetSelfContained(t *testing.T) {
 		if !strings.Contains(html, want) {
 			t.Errorf("widget missing %q", want)
 		}
+	}
+}
+
+// TestWidgetBreakdownOmitted: the table notes keys the server left out of
+// breakdown, and demo mode caps breakdown like the server.
+func TestWidgetBreakdownOmitted(t *testing.T) {
+	html := string(indexHTML)
+	for _, want := range []string{`id="breakdownmore"`, "doc.breakdown_omitted", "more.textContent",
+		"breakdown_omitted: Math.max(0, ranked.length - MAX_BREAKDOWN)"} {
+		if !strings.Contains(html, want) {
+			t.Errorf("widget missing %q", want)
+		}
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; static check only")
+	}
+	i, j := strings.Index(html, "<script>"), strings.Index(html, "</script>")
+	path := filepath.Join(t.TempDir(), "widget.js")
+	if err := os.WriteFile(path, []byte(html[i+len("<script>"):j]), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(node, "--check", path).CombinedOutput(); err != nil {
+		t.Fatalf("widget script does not parse: %v\n%s", err, out)
 	}
 }
