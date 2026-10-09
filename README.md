@@ -198,8 +198,10 @@ again. Inspect the sanitized last attempt:
 
 ```bash
 # reload:{generation, ok, at, reason?, restart_only?}
+# The header is read from a process substitution, so the key never appears
+# in curl's argv (printf is a shell builtin).
 curl --silent --show-error \
-  -H "Authorization: Bearer $(cat ~/.config/localrouter/keys/me.key)" \
+  -H @<(printf 'Authorization: Bearer %s\n' "$(cat ~/.config/localrouter/keys/me.key)") \
   http://127.0.0.1:8787/control/v1/diagnostics | python3 -m json.tool | sed -n '/"reload"/,/}/p'
 journalctl --user -u localrouter -n 20 --no-pager | grep -i 'config reload'
 ```
