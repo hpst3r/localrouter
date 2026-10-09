@@ -1,0 +1,34 @@
+# Minimal LocalRouter configuration with one OpenRouter account.
+# Copy to ~/.config/localrouter/config.yaml. Secrets live in separate 0600
+# files (or environment variables), never in this file.
+
+listen: 127.0.0.1:8787
+data_dir: ~/.config/localrouter
+
+clients:
+  - name: me
+    class: interactive
+    key_file: keys/me.key
+
+accounts:
+  - id: openrouter
+    provider: openrouter
+    # base_url defaults to https://openrouter.ai/api/v1. Balance and key
+    # usage are read from <base_url>/credits and <base_url>/key, so the
+    # credentials only ever go to this host.
+    api_key_file: keys/openrouter.key        # or api_key_env: OPENROUTER_API_KEY
+    # Optional. OpenRouter documents GET /credits (the account balance) as
+    # requiring a management key. When set, that key is used ONLY for
+    # /credits; inference and GET /key always use api_key_file. Without it
+    # LocalRouter tries /credits with the inference key and, on 403, shows
+    # the balance as unavailable while still reporting the key's spend/cap.
+    # management_key_file: keys/openrouter-mgmt.key   # or management_key_env
+    # cost_basis defaults to metered. Ledger costs are local price estimates;
+    # the authoritative spend is OpenRouter's own (shown on the dashboard).
+    # reserve is not supported: prepaid credit has no 5h/weekly windows.
+
+routes:
+  - name: openrouter
+    # OpenRouter model ids contain slashes; they are forwarded unchanged.
+    models: [anthropic/claude-sonnet-4.5, openai/gpt-5-mini]
+    interactive: [openrouter]

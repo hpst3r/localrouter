@@ -26,11 +26,22 @@ var (
 	errMalformed  = errors.New("usage api: malformed response")
 )
 
+// httpStatusError is a non-200 usage API answer. Its text carries only the
+// status code, never the body.
+type httpStatusError struct{ code int }
+
+func (e *httpStatusError) Error() string { return fmt.Sprintf("usage api: http %d", e.code) }
+
 // get performs an authenticated GET. On 401 it invalidates the credential and
 // retries once.
 func (m *Manager) get(ctx context.Context, id, url string, extra http.Header) ([]byte, error) {
+	return m.getWith(ctx, m.creds, id, url, extra)
+}
+
+// getWith is get using the given credential source.
+func (m *Manager) getWith(ctx context.Context, creds core.CredentialSource, id, url string, extra http.Header) ([]byte, error) {
 	for attempt := 0; ; attempt++ {
-		cred, err := m.creds.Credential(ctx, id)
+		cred, err := creds.Credential(ctx, id)
 		if err != nil {
 			return nil, errCredential
 		}
@@ -51,11 +62,11 @@ func (m *Manager) get(ctx context.Context, id, url string, extra http.Header) ([
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 {
-			m.creds.Invalidate(id)
+			creds.Invalidate(id)
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("usage api: http %d", resp.StatusCode)
+			return nil, &httpStatusError{code: resp.StatusCode}
 		}
 		if err != nil {
 			return nil, classifyTransport(ctx, err)

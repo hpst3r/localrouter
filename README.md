@@ -45,6 +45,38 @@ Liveness: `/healthz`. Local readiness (willing to serve + storage healthy, never
 a statement about upstream providers): `/readyz`. Authenticated diagnostics,
 including inference concurrency: `/control/v1/diagnostics`.
 
+### OpenRouter
+
+`provider: openrouter` forwards `/v1/chat/completions` and `/v1/responses` to
+`<base_url>` (default `https://openrouter.ai/api/v1`) with the account's API key
+(`api_key_file` / `api_key_env`); model ids with slashes
+(`anthropic/claude-sonnet-4.5`) pass through unchanged. See
+[`config.openrouter.example.yaml`](config.openrouter.example.yaml).
+
+Instead of 5h/weekly windows, LocalRouter polls two provider figures:
+
+- **Account balance** — `GET <base_url>/credits`: `total_credits - total_usage`
+  in USD, kept **signed** (e.g. `770.8176 - 770.893717902 = -$0.08`). OpenRouter
+  documents this endpoint as management-key only; set the optional
+  `management_key_file` / `management_key_env`, which is used **only** for
+  `/credits` (never for inference or `/key`). Without it the inference key is
+  tried; on 403 the balance is shown as *unavailable* (never as $0) and the
+  account is reported unhealthy, while key data below still works.
+- **Key usage and cap** — `GET <base_url>/key` with the inference key: lifetime,
+  daily, weekly and monthly spend, BYOK spend (shown separately), and the key's
+  spending cap. `limit: null` is shown as unlimited; a cap of `0` is a real cap.
+
+Both are the provider's authoritative lifetime/period totals and include
+traffic that bypassed LocalRouter; ledger `cost_usd` (default
+`cost_basis: metered`) remains a local price estimate per request.
+
+A known balance at or below zero, or a key cap with nothing left (until its
+daily/weekly/monthly reset), denies every class even if the data is stale. An
+unknown balance does not deny on its own (upstream `402` is the backstop). An
+OpenRouter `402` fails over to the next account before any byte is sent, cools
+the account down (60s or `Retry-After`), and refreshes its balance urgently; a
+top-up clears the cooldown early. `reserve` is rejected for these accounts.
+
 Optional `limits.max_concurrent` / `limits.max_concurrent_per_client` cap
 active inference requests (0 = unlimited, negatives rejected); a saturated
 request gets `429` `concurrency_limit_exceeded` with `Retry-After: 1`. Optional

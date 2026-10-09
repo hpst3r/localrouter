@@ -16,3 +16,12 @@ func pct(f float64) string {
 	s := fmt.Sprintf("%.1f", math.Max(0, math.Min(1, f))*100)
 	return strings.TrimSuffix(s, ".0") + "%"
 }
+
+// usd formats signed dollars to cents: -0.076 -> "-$0.08", 5 -> "$5.00".
+func usd(f float64) string {
+	s := fmt.Sprintf("%.2f", math.Abs(f))
+	if f < 0 && s != "0.00" {
+		return "-$" + s
+	}
+	return "$" + s
+}

@@ -173,12 +173,12 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			continue
 		}
 
-		if retryable(status) && canFailover {
+		if retryableFor(account.Provider, status) && canFailover {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxFailureBody))
 			drain(resp)
 			f := &failure{status: status, header: resp.Header.Clone(), body: body}
 			out := core.Outcome{Status: status}
-			if status == http.StatusTooManyRequests {
+			if wantsResetHint(account.Provider, status) {
 				out.ResetAt = resetHint(resp.Header, p.clock.Now())
 			}
 			lease.Release(out)
@@ -299,7 +299,7 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 		known = false
 	}
 	out := core.Outcome{Status: resp.StatusCode, UsageKnown: known, BytesToClient: written}
-	if resp.StatusCode == http.StatusTooManyRequests {
+	if wantsResetHint(rec.Provider, resp.StatusCode) {
 		out.ResetAt = resetHint(resp.Header, p.clock.Now())
 	}
 	lease.Release(out)
@@ -393,6 +393,18 @@ func copyHeaders(dst, src http.Header) {
 func retryable(status int) bool {
 	return status == http.StatusTooManyRequests || status == http.StatusUnauthorized ||
 		status == http.StatusForbidden || status >= 500
+}
+
+// retryableFor adds provider-specific failover statuses to retryable. An
+// OpenRouter 402 (out of credit) is account-specific, so another account may
+// still serve; for other providers 402 stays a final answer.
+func retryableFor(provider string, status int) bool {
+	return retryable(status) || provider == core.ProviderOpenRouter && status == http.StatusPaymentRequired
+}
+
+// wantsResetHint reports whether the outcome should carry resetHint.
+func wantsResetHint(provider string, status int) bool {
+	return status == http.StatusTooManyRequests || provider == core.ProviderOpenRouter && status == http.StatusPaymentRequired
 }
 
 func drain(resp *http.Response) {
