@@ -336,9 +336,11 @@ time. One accepted generation publishes its handler, auth, routes, limits,
 reserves, price table and generation number together under a single pointer, so
 an inference or HTTP-ingest request is costed from the generation it was
 admitted on even if a reload swaps the price table while it is in flight. The
-in-process `claude_logs` collector selects the current generation once per
-`Record`/`RecordBatch` call, so each batch is costed by the generation live when
-that batch is written.
+in-process `claude_logs` and `hermes_logs` collectors select the current
+generation once per `Record`/`RecordBatch` call, so each batch is costed by the
+generation live when that batch is written. That write path also bounds labels
+(`core.TruncateLabel`/`core.TruncateError`) and rejects records with a token
+count outside [0, 1e12] with a permanent error, which the collectors drop.
 
 A reload replaces the live generation only: it never re-prices rows already
 written and never rewrites the startup table. History is reconciled only by the
@@ -490,6 +492,27 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
   treat a key as final when a later line in the same file has a different key,
   or the file has not been modified for ≥ 30s. (Keep pending keys in memory.)
 - Runs every `claude_logs.scan_interval` (default 1m) plus once at startup.
+- Plausibility (same bounds as ingest): lines with any usage field < 0 or
+  > 1e12, or a timestamp missing or outside [now-400d, now+5m], are skipped
+  (`Stats.Skipped`; old timestamps log at debug). Model, session, project and
+  client labels are bounded with `core.TruncateLabel` (128 bytes, valid UTF-8,
+  no control characters).
+
+### Hermes usage import (internal/hermeslog)
+
+- Reads `session_model_usage` from `<home>/state.db` and
+  `<home>/profiles/*/state.db` read-only, and records the increase of each
+  row's cumulative counters since the last scan (state in
+  `<data_dir>/hermeslog-state.json`). Rows whose `billing_base_url` is this
+  router are skipped. Counters that go backwards are rebased, not recorded.
+- Plausibility: a row is skipped (`Stats.SkippedInvalid`, logged without
+  content) and rebased if any cumulative counter or token total is outside
+  [0, 1e12] (so delta arithmetic cannot overflow), or `last_seen` is
+  non-finite or outside [now-400d, now+5m]. A missing `last_seen` uses now.
+  Increases from an implausible baseline are rebased, not recorded. Labels
+  are bounded with `core.TruncateLabel`.
+- A ledger error with `Permanent() == true` drops the row (`Stats.Dropped`)
+  and rebases it; other errors leave state unchanged for retry.
 
 ### Ledger changes
 
