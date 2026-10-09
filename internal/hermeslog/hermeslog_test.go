@@ -94,6 +94,7 @@ func newC(t *testing.T, home string, l core.Ledger) *Collector {
 		Host:      "pf3llssv",
 		SelfHosts: []string{"127.0.0.1:8787", "localhost:8787"},
 		StatePath: filepath.Join(t.TempDir(), "state.json"),
+		Clock:     fixedClock(secNow), // fixtures use fixed last_seen values
 	})
 }
 
@@ -152,10 +153,10 @@ func TestRestartDoesNotDoubleCountAndCrashIsIdempotent(t *testing.T) {
 	home := t.TempDir()
 	db := mkdb(t, filepath.Join(home, "state.db"))
 	exec(t, db, `INSERT INTO sessions VALUES ('s1','cli',NULL,1,NULL,NULL)`)
-	exec(t, db, `INSERT INTO session_model_usage (session_id,model,billing_provider,api_call_count,input_tokens,output_tokens,last_seen) VALUES ('s1','claude-opus-5-5','anthropic',1,10,5,1)`)
+	exec(t, db, `INSERT INTO session_model_usage (session_id,model,billing_provider,api_call_count,input_tokens,output_tokens,last_seen) VALUES ('s1','claude-opus-5-5','anthropic',1,10,5,1791406023)`)
 	l := &memLedger{}
 	statePath := filepath.Join(t.TempDir(), "state.json")
-	opts := Options{Home: home, StatePath: statePath, Accounts: map[string]string{"anthropic": "claude-max"}}
+	opts := Options{Home: home, StatePath: statePath, Accounts: map[string]string{"anthropic": "claude-max"}, Clock: fixedClock(secNow)}
 	if _, err := New(l, opts).ScanOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
