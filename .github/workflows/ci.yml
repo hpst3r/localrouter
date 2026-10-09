@@ -1,0 +1,57 @@
+name: CI
+
+"on":
+  push:
+  pull_request:
+
+# Normal CI is read-only: it never needs to write to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: vet, build, test
+    runs-on: ubuntu-latest
+
+    # Bounded parallelism: the toolchain is pinned to -p=2 and GOMAXPROCS=2 so
+    # CI matches the documented local worker budget and stays predictable.
+    # GOTEST_TIMEOUT bounds the race suite so a wedged test cannot hold a runner
+    # open indefinitely: a stall fails at 120s instead of GitHub's job cap.
+    env:
+      GOFLAGS: -p=2
+      GOMAXPROCS: "2"
+      GOTEST_TIMEOUT: 120s
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        timeout-minutes: 10
+        run: go vet ./...
+
+      - name: go build
+        timeout-minutes: 10
+        env:
+          # Release binaries are static; keep the CI build honest about that.
+          CGO_ENABLED: "0"
+        run: go build -trimpath ./...
+
+      - name: go test (race)
+        timeout-minutes: 15
+        env:
+          # The race detector needs cgo and a C toolchain.
+          CGO_ENABLED: "1"
+        run: go test -race -p 2 -count=1 -timeout "$GOTEST_TIMEOUT" ./...

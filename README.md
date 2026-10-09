@@ -14,6 +14,8 @@ multi-user authentication or tenant isolation. One binary that:
 See [the specification](docs/SPEC.md) for the behavior contract and
 [Network deployment and operations](docs/NETWORK.md) for secure central-server
 setup, remote verification, key rotation, troubleshooting, and backup/restore.
+For the container image under rootless Podman/Quadlet with an NGINX TLS edge,
+see [Container deployment](docs/CONTAINERS.md).
 
 ## Build
 
