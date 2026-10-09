@@ -65,6 +65,9 @@ type Stats struct {
 	// SkippedInvalid counts rows not recorded because their counters or
 	// last_seen are implausible (see plausible).
 	SkippedInvalid int
+	// Dropped counts rows the ledger permanently rejected (an error with
+	// Permanent() == true); they are rebased so the scan can advance.
+	Dropped int
 }
 
 type counters struct {
@@ -157,7 +160,7 @@ func (c *Collector) ScanOnce(ctx context.Context) (Stats, error) {
 			errs = append(errs, fmt.Errorf("profile %s: %w", db[0], err))
 		}
 	}
-	if st.Recorded > 0 || st.SkippedInvalid > 0 {
+	if st.Recorded > 0 || st.SkippedInvalid > 0 || st.Dropped > 0 {
 		if err := c.saveState(); err != nil {
 			errs = append(errs, fmt.Errorf("save state: %w", err))
 		}
@@ -249,7 +252,15 @@ func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats)
 	}
 	for _, p := range todo {
 		if err := c.ledger.Record(ctx, p.rec); err != nil {
-			return err // state for later rows not advanced; retried next scan
+			var pe interface{ Permanent() bool }
+			if !errors.As(err, &pe) || !pe.Permanent() {
+				return err // state for later rows not advanced; retried next scan
+			}
+			// Rejected as invalid; resending cannot succeed.
+			c.opts.Logger.Warn("hermeslog: ledger rejected record; dropping", "profile", profile, "id", p.rec.ID, "err", err)
+			c.seen[p.key] = p.cur
+			st.Dropped++
+			continue
 		}
 		c.seen[p.key] = p.cur
 		st.Recorded++

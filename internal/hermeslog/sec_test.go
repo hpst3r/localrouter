@@ -98,3 +98,41 @@ func TestSecLabelsSanitized(t *testing.T) {
 		}
 	}
 }
+
+type permErr struct{}
+
+func (permErr) Error() string   { return "rejected" }
+func (permErr) Permanent() bool { return true }
+
+// rejectLedger permanently rejects records for one session.
+type rejectLedger struct {
+	memLedger
+	bad string
+}
+
+func (l *rejectLedger) Record(ctx context.Context, r core.RequestRecord) error {
+	if r.Session == l.bad {
+		return permErr{}
+	}
+	return l.memLedger.Record(ctx, r)
+}
+
+// A permanent ledger rejection drops that row (rebased, not retried) instead
+// of stalling every later row of the database on every scan.
+func TestSecPermanentRejectDoesNotStall(t *testing.T) {
+	home := t.TempDir()
+	db := mkdb(t, filepath.Join(home, "state.db"))
+	ok := secUnix(secNow.Add(-time.Hour))
+	q := `INSERT INTO session_model_usage (session_id,model,billing_provider,api_call_count,input_tokens,output_tokens,last_seen) VALUES (?,?,?,1,10,5,?)`
+	exec(t, db, q, "a-bad", "m", "anthropic", ok)
+	exec(t, db, q, "b-good", "m", "anthropic", ok)
+	l := &rejectLedger{bad: "a-bad"}
+	c := secCollector(t, home, l)
+	st, err := c.ScanOnce(context.Background())
+	if err != nil || st.Recorded != 1 || st.Dropped != 1 {
+		t.Fatalf("stats %+v err %v", st, err)
+	}
+	if st, err := c.ScanOnce(context.Background()); err != nil || st.Dropped != 0 || st.Recorded != 0 {
+		t.Fatalf("rescan %+v %v", st, err)
+	}
+}
