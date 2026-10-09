@@ -80,7 +80,7 @@ func (m *Manager) fetchORCredits(ctx context.Context, id, url string, hdr http.H
 	if mgmt != nil {
 		creds = mgmt
 	}
-	body, err := m.getWith(ctx, creds, id, url, hdr, m.orClient())
+	body, err := m.getWith(ctx, creds, id, url, hdr, m.noRedirectClient())
 	if err != nil {
 		var se *httpStatusError
 		switch {
@@ -111,7 +111,7 @@ func (m *Manager) fetchORCredits(ctx context.Context, id, url string, hdr http.H
 }
 
 func (m *Manager) fetchORKey(ctx context.Context, id, url string, hdr http.Header, now time.Time) (core.KeyUsage, error) {
-	body, err := m.orGet(ctx, id, url, hdr)
+	body, err := m.get(ctx, id, url, hdr)
 	if err != nil {
 		return core.KeyUsage{}, fmt.Errorf("key: %w", err)
 	}

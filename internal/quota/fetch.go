@@ -8,7 +8,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/core"
@@ -32,34 +34,27 @@ type httpStatusError struct{ code int }
 
 func (e *httpStatusError) Error() string { return fmt.Sprintf("usage api: http %d", e.code) }
 
-// get performs an authenticated GET. On 401 it invalidates the credential and
-// retries once.
+// get performs an authenticated GET with the no-redirect client. On 401 it
+// invalidates the credential and retries once.
 func (m *Manager) get(ctx context.Context, id, url string, extra http.Header) ([]byte, error) {
-	return m.getWith(ctx, m.creds, id, url, extra, m.opts.HTTPClient)
+	return m.getWith(ctx, m.creds, id, url, extra, m.noRedirectClient())
 }
 
-// orClient returns an HTTP client for the OpenRouter quota endpoints
-// (/credits, /key) that never follows redirects. A 3xx from the configured
-// base_url points at a different endpoint (another port on the same host, a
+// noRedirectClient returns the HTTP client used for every usage/quota
+// request: a copy of Options.HTTPClient that never follows redirects. A 3xx
+// points at a different endpoint (another port on the same host, a
 // subdomain, ...), and net/http forwards Authorization to any redirect whose
 // host matches the initial host — the port is ignored — so following one
-// could hand the management or inference credential to a foreign endpoint.
-// The client is a shallow copy: Transport, Timeout and Jar are shared (all
-// safe for concurrent use) and the shared Options.HTTPClient is never
-// mutated. Only OpenRouter endpoints use this; other providers keep the
-// configured client's redirect policy. (Go's net/http has no Client.Clone,
-// so the copy is taken directly.)
-func (m *Manager) orClient() *http.Client {
-	c := *m.opts.HTTPClient
+// could hand the account credential to a foreign endpoint. A 3xx surfaces as
+// an "http 3xx" fetch error. The client is a shallow copy: Transport, Timeout
+// and Jar are shared (all safe for concurrent use) and the shared
+// Options.HTTPClient is never mutated.
+func (m *Manager) noRedirectClient() *http.Client { return noRedirect(m.opts.HTTPClient) }
+
+func noRedirect(client *http.Client) *http.Client {
+	c := *client
 	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &c
-}
-
-// orGet performs the account's normal authenticated GET (m.creds) against an
-// OpenRouter endpoint using the no-redirect client. /credits with an explicit
-// management key goes through getWith directly with that key source.
-func (m *Manager) orGet(ctx context.Context, id, url string, extra http.Header) ([]byte, error) {
-	return m.getWith(ctx, m.creds, id, url, extra, m.orClient())
 }
 
 // getWith is get using the given credential source and client.
@@ -211,7 +206,31 @@ func ollamaModelCounts(l *ollamaLimit) []core.ModelCount {
 	return out
 }
 
-func (m *Manager) fetchOllama(ctx context.Context, id string) (core.Snapshot, error) {
+// errOllamaForeignHost is returned, without any request, for an ollama
+// account whose base_url host is not the usage URL host: its key belongs to
+// that other service and must not be sent to ollama.com.
+var errOllamaForeignHost = errors.New("usage api: usage polling unavailable for non-ollama.com base_url")
+
+// sameHost reports whether the two URLs name the same host (case-insensitive,
+// port ignored). Unparseable or host-less URLs never match.
+func sameHost(a, b string) bool {
+	ua, err := url.Parse(a)
+	if err != nil {
+		return false
+	}
+	ub, err := url.Parse(b)
+	if err != nil {
+		return false
+	}
+	ha, hb := ua.Hostname(), ub.Hostname()
+	return ha != "" && strings.EqualFold(ha, hb)
+}
+
+func (m *Manager) fetchOllama(ctx context.Context, acct core.Account) (core.Snapshot, error) {
+	id := acct.ID
+	if !sameHost(acct.BaseURL, m.opts.OllamaUsageURL) {
+		return core.Snapshot{}, errOllamaForeignHost
+	}
 	now := m.opts.Clock.Now()
 	body, err := m.get(ctx, id, m.opts.OllamaUsageURL, http.Header{"Accept": {"application/json"}})
 	if err != nil {
