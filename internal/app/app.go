@@ -5,7 +5,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -20,13 +19,11 @@ import (
 	"github.com/hpst3r/localrouter/internal/claudelog"
 	"github.com/hpst3r/localrouter/internal/config"
 	"github.com/hpst3r/localrouter/internal/connlim"
-	"github.com/hpst3r/localrouter/internal/control"
 	"github.com/hpst3r/localrouter/internal/core"
 	"github.com/hpst3r/localrouter/internal/hermeslog"
 	"github.com/hpst3r/localrouter/internal/httpguard"
 	"github.com/hpst3r/localrouter/internal/ledger"
 	"github.com/hpst3r/localrouter/internal/policy"
-	"github.com/hpst3r/localrouter/internal/proxy"
 	"github.com/hpst3r/localrouter/internal/quota"
 )
 
@@ -74,7 +71,12 @@ type App struct {
 	// Logger is the server logger.
 	Logger *slog.Logger
 
-	serving atomic.Bool
+	serving     atomic.Bool
+	current     atomic.Pointer[runtimeGeneration]
+	lastReload  atomic.Pointer[core.ReloadStatus]
+	reloadMu    sync.Mutex
+	reloadBase  *config.Config
+	reloadClock core.Clock
 
 	// srvMu guards the one-shot Serve lifecycle fields below. Serve publishes
 	// an active server to at most one caller; Shutdown may run concurrently on
@@ -111,6 +113,10 @@ func NewAuth(cfg *config.Config, logger *slog.Logger, ov Overrides) (*auth.Manag
 // Build wires every component. Call Start to begin quota polling and Close
 // when done.
 func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) {
+	cfg, err := cloneConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -122,34 +128,11 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		return nil, err
 	}
 
-	keyFiles := map[string]string{}
-	clients := map[string]core.Client{}
-	for _, c := range cfg.Clients {
-		keyFiles[c.Name] = c.KeyFile
-		host := c.Host
-		if host == "" {
-			host = cfg.HostName // usage from un-attributed clients happens on this machine
-		}
-		clients[c.Name] = core.Client{Name: c.Name, Class: core.Class(c.Class), Host: host, Ingest: c.Ingest}
-	}
-	clientKeys, err := auth.LoadClientKeys(keyFiles)
-	if err != nil {
-		return nil, fmt.Errorf("client keys: %w", err)
-	}
-	authenticate := func(bearer string) (core.Client, bool) {
-		name, ok := clientKeys.Lookup(bearer)
-		if !ok {
-			return core.Client{}, false
-		}
-		return clients[name], true
-	}
-
 	accounts := cfg.CoreAccounts()
 	acctMap := map[string]core.Account{}
-	for _, a := range accounts {
-		acctMap[a.ID] = a
+	for _, account := range accounts {
+		acctMap[account.ID] = account
 	}
-	routes := cfg.CoreRoutes()
 
 	creds, err := NewAuth(cfg, logger, ov)
 	if err != nil {
@@ -192,46 +175,8 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 	if err != nil {
 		return nil, fmt.Errorf("concurrency limits: %w", err)
 	}
-	px := proxy.New(proxy.Deps{
-		Accounts: acctMap, Routes: routes, Creds: creds, Quota: qm, Policy: pol,
-		Ledger: led, Authenticate: authenticate, Clock: clock, Logger: logger,
-		Limiter: lim,
-	}, proxy.Options{MaxFailovers: cfg.Policy.MaxFailovers})
-	ctlDeps := control.Deps{
-		Accounts: accounts, Quota: qm, Policy: pol, Ledger: led, Routes: routes,
-		Authenticate: authenticate, Clock: clock,
-	}
-	for _, c := range cfg.Clients {
-		ctlDeps.Clients = append(ctlDeps.Clients, control.ClientInfo{Name: c.Name, Class: c.Class, Host: clients[c.Name].Host, Ingest: c.Ingest})
-	}
-	if ing, ok := any(qm).(core.SnapshotIngester); ok {
-		ctlDeps.Ingester = ing
-		ctlDeps.IsSnapshotStale = func(err error) bool { return errors.Is(err, quota.ErrSnapshotStale) }
-	}
-	// Diagnostics and readiness seams (owned by control). Storage is installed
-	// only when the ledger actually exposes a bounded ping, so this wiring
-	// keeps compiling across the control/ledger work and self-connects as soon
-	// as it lands.
-	if p, ok := any(led).(control.StoragePinger); ok {
-		ctlDeps.Storage = p
-	}
-	ctlDeps.Inflight = inflightReporter{lim}
-	var a *App
-	ctlDeps.Ready = func() bool { return a != nil && a.Serving() }
-	ctl := control.New(ctlDeps, control.Options{RequireAuth: cfg.Control.RequireAuth, StaleAfter: cfg.Policy.StaleAfter.D()})
-
-	mux := http.NewServeMux()
-	mux.Handle("/v1/", px.Handler())
-	mux.Handle("/", ctl.Handler())
-	// The Host guard is always on; allowed_hosts only applies in network
-	// mode (config validation rejects it otherwise).
-	var allowed []string
-	if cfg.AllowNonLoopback {
-		allowed = cfg.AllowedHosts
-	}
-	h := HostGuard(allowed, mux)
-	a = &App{
-		Handler: h, Quota: qm, Policy: pol, Ledger: led, Auth: creds,
+	a := &App{
+		Quota: qm, Policy: pol, Ledger: led, Auth: creds,
 		Limiter: lim, BodyGuard: httpguard.NewBodyTimeout(cfg.Timeouts.Body.D()),
 		Timeouts: Timeouts{
 			Header:   cfg.Timeouts.Header.D(),
@@ -242,8 +187,21 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		TLSCertFile: cfg.TLSCertFile, TLSKeyFile: cfg.TLSKeyFile, Logger: logger,
 	}
 	a.serving.Store(true)
+	a.reloadBase = cfg
+	a.reloadClock = clock
+	generation, _, err := a.makeGeneration(cfg, 1)
+	if err != nil {
+		_ = led.Close()
+		return nil, err
+	}
+	a.current.Store(generation)
+	a.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g := a.current.Load()
+		g.handler.ServeHTTP(w, r)
+	})
+	collector := collectorLedger{Ledger: led, app: a}
 	if cfg.ClaudeLogs.Enabled {
-		a.ClaudeLog = claudelog.New(led, claudelog.Options{
+		a.ClaudeLog = claudelog.New(collector, claudelog.Options{
 			Dir:          cfg.ClaudeLogs.Dir,
 			AccountID:    cfg.ClaudeLogs.Account,
 			Host:         cfg.HostName,
@@ -255,7 +213,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		})
 	}
 	if cfg.HermesLogs.Enabled {
-		a.HermesLog = hermeslog.New(led, hermeslog.Options{
+		a.HermesLog = hermeslog.New(collector, hermeslog.Options{
 			Home:         cfg.HermesLogs.Home,
 			Accounts:     cfg.HermesLogs.Accounts,
 			Client:       cfg.HermesLogs.Client,

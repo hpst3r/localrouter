@@ -58,6 +58,11 @@ type Deps struct {
 	// Inflight reports inference concurrency for diagnostics. Nil reports
 	// zero capacity.
 	Inflight InflightReporter
+	// ReloadStatus reports the sanitized last configuration-reload attempt for
+	// the diagnostics document. Nil omits the reload block entirely, so a
+	// server without a reload seam never claims a reload state it cannot
+	// observe. It is consulted per request (a live view), not sampled once.
+	ReloadStatus func() core.ReloadStatus
 	// Ready reports whether this instance is serving. Nil defaults to ready.
 	// It folds in process shutdown so /readyz and diagnostics flip not-ready
 	// once the process stops accepting work, independently of storage health.

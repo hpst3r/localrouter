@@ -66,6 +66,133 @@ the home directory is read-only except `~/.config/localrouter`. To upgrade,
 rebuild, re-run `install`, then `systemctl --user restart localrouter`. With
 lingering enabled (`loginctl enable-linger`), it runs without a login session.
 
+## Reload configuration (SIGHUP)
+
+Send `SIGHUP` to a running server to re-validate the config file and apply the
+reloadable subset in place — without dropping in-flight requests, losing
+quota/cooldown state, re-opening the database or refreshing credentials:
+
+```bash
+kill -HUP "$(systemctl --user show -p MainPID --value localrouter)"
+# or, for a foreground process:  pkill -HUP -x localrouter
+```
+
+The new configuration is validated in full first and published atomically. On
+any error the previous configuration keeps serving (last-good), the generation
+does not advance, and the failure is logged with a sanitized reason. Rapid
+signals coalesce (a burst causes a bounded number of reloads) and reloads are
+serialized. Windows has no SIGHUP; the in-process `App.Reload` seam is the
+portable trigger.
+
+**Reloaded without restart:**
+
+| Config key | Effect |
+|---|---|
+| `clients[]` (`name`, `class`, `key_file`/`key_files`, `host`, `ingest`) | new keys and client attributes |
+| `routes[]` (`models`, `upstream_model`, `interactive`, `background`) | new model/route table |
+| `accounts[].reserve` | per-account reserves |
+| `pricing_file` contents (`pricing.yaml`, `pricing.local.yaml`) | price table |
+| `policy.stale_after`, `policy.safety_margin`, `policy.inflight_estimate` | admission knobs |
+| `policy.max_failovers` | failover budget |
+| `limits.max_concurrent`, `limits.max_concurrent_per_client` | concurrency limits (active counts preserved) |
+
+**Restart-only — a reload that changes any of these is rejected whole** (never
+partially applied), with the offending keys named in the log and diagnostics:
+
+- `listen`, `allow_non_loopback`, `allowed_hosts`, `tls_cert_file`, `tls_key_file`
+- `data_dir`, the `pricing_file` *path*, token store location
+- `quota.poll_interval`
+- account topology: `accounts[].id` / `provider` / `base_url` / `quota_source` /
+  `api_key_file` / `api_key_env` / `credentials_file` / `cost_basis`
+- `claude_logs.*`, `hermes_logs.*`, `host_name`
+- `control.require_auth`
+- structural timeouts: `timeouts.header`, `timeouts.body`, `timeouts.idle`,
+  `timeouts.shutdown`
+
+Reload never changes the listener, TLS material, storage paths or inbound
+timeouts, and it adds no HTTP endpoint: the only triggers are `SIGHUP` (Unix)
+and the in-process `App.Reload` method. The last reload attempt is exposed at
+`GET /control/v1/diagnostics` under `reload` as a sanitized document (a
+generation, timestamp, and, on failure, the reason and the restart-only key
+names) — never keys, tokens or secret paths. A failed attempt reports the
+still-serving generation, so it never lags or advances falsely.
+
+### Rotate a client key without downtime
+
+Each key file holds exactly one raw key, so rotation uses an overlap window
+across two files:
+
+```yaml
+clients:
+  - name: laptop
+    class: interactive
+    key_files: [keys/laptop-old.key, keys/laptop-new.key]   # both accepted
+```
+
+1. Write the new key file and list both under `key_files`. Do not set `key_file`
+   and `key_files` on the same client: exactly one is required.
+2. `SIGHUP`; both keys now authenticate for **new** requests.
+3. Switch the client to the new key; existing requests finish on the old key.
+4. Remove the old key from `key_files` and `SIGHUP` again.
+
+A revoked key is rejected for new requests immediately after the reload. The
+config file lists only file paths, never key material.
+
+Practical commands:
+
+```bash
+# 1. Write keys/laptop-new.key (0600), list both files, validate, then reload:
+$EDITOR ~/.config/localrouter/config.yaml           # key_files: [old, new]
+bin/localrouter check -config ~/.config/localrouter/config.yaml
+kill -HUP "$(systemctl --user show -p MainPID --value localrouter)"
+# 2. Point the client at keys/laptop-new.key and confirm it works, then:
+$EDITOR ~/.config/localrouter/config.yaml           # drop the old key file
+kill -HUP "$(systemctl --user show -p MainPID --value localrouter)"
+```
+
+### Rollback and reload diagnostics
+
+A rejected reload rolls back automatically — nothing is published, so the
+last-good generation keeps serving and the generation number does not advance.
+There is no separate rollback command; correct the config file and `SIGHUP`
+again. Inspect the sanitized last attempt:
+
+```bash
+# reload:{generation, ok, at, reason?, restart_only?}
+curl --silent --show-error \
+  -H "Authorization: Bearer $(cat ~/.config/localrouter/keys/me.key)" \
+  http://127.0.0.1:8787/control/v1/diagnostics | python3 -m json.tool | sed -n '/"reload"/,/}/p'
+journalctl --user -u localrouter -n 20 --no-pager | grep -i 'config reload'
+```
+
+On failure `ok` is `false` with a sanitized `reason`, plus the offending
+`restart_only` key names when the change was restart-only; a failure reports the
+still-serving generation (it neither lags nor advances). The diagnostic and the
+`config reload rejected` log line never carry keys, tokens, secret paths or the
+raw error.
+
+Packaging wires the same contract: the container/systemd unit reloads with a
+HUP (`ExecReload`/`podman kill --signal=HUP localrouter`). That belongs to the
+packaging change, not to this repository's config; no Compose file is added.
+
+### Pricing across a reload
+
+Pricing is **frozen per request by generation**, not resolved at ledger-write
+time. One accepted generation publishes its handler, auth, routes, limits,
+reserves, price table and generation number together under a single pointer, so
+an inference or HTTP-ingest request is costed from the generation it was
+admitted on even if a reload swaps the price table while it is in flight. The
+in-process `claude_logs` collector selects the current generation once per
+`Record`/`RecordBatch` call, so each batch is costed by the generation live when
+that batch is written.
+
+A reload swaps only the live generation: it never re-prices rows already written
+and never rewrites the startup table. History is reconciled only by the separate
+offline `localrouter pricing reprice` command, which loads the price files from
+disk and opens the database itself — it is not run by a reload. There is no
+global price set and no live re-price on reload, so a request never mixes one
+generation's admission with another's price table.
+
 ## Hermes usage import
 
 Hermes Agent sends some traffic directly to providers (e.g. its Anthropic
@@ -152,8 +279,10 @@ re-send later (records are deduplicated by ID).
 Before relying on the deployment, run the [remote acceptance checks](docs/NETWORK.md#3-verify-from-a-remote-client).
 A successful `check`, `/healthz` (liveness) or `/readyz` (local readiness) does
 not verify upstream inference; only a real model request does.
-Server config/client keys are loaded at startup; validate and restart after
-changing them. Agents also need a restart after config/key changes.
+Server config/client keys are loaded at startup and the reloadable subset can be
+re-read in place with `SIGHUP` (see [Reload configuration](#reload-configuration-sighup));
+validate with `localrouter check` first. Agents still need a restart after
+config/key changes.
 
 For authenticated quota gating from a client:
 
