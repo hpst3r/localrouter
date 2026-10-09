@@ -127,6 +127,12 @@ type AccountConfig struct {
 	BaseURL    string `yaml:"base_url"`
 	APIKeyFile string `yaml:"api_key_file"`
 	APIKeyEnv  string `yaml:"api_key_env"`
+	// ManagementKeyFile / ManagementKeyEnv (openrouter only) locate an
+	// optional OpenRouter management key used solely for GET /credits (the
+	// account balance). It is never attached to inference or GET /key. File
+	// is preferred when both are set.
+	ManagementKeyFile string `yaml:"management_key_file"`
+	ManagementKeyEnv  string `yaml:"management_key_env"`
 	// CredentialsFile is the Claude Code credentials file read (never
 	// written) for provider claude. Default ~/.claude/.credentials.json.
 	CredentialsFile string `yaml:"credentials_file"`
@@ -255,6 +261,7 @@ func (c *Config) applyDefaults(baseDir string) {
 	for i := range c.Accounts {
 		a := &c.Accounts[i]
 		a.APIKeyFile = expand(a.APIKeyFile, baseDir)
+		a.ManagementKeyFile = expand(a.ManagementKeyFile, baseDir)
 		if a.Provider == core.ProviderClaude {
 			if a.CredentialsFile == "" {
 				a.CredentialsFile = "~/.claude/.credentials.json"
@@ -273,6 +280,8 @@ func (c *Config) applyDefaults(baseDir string) {
 				a.BaseURL = "https://chatgpt.com/backend-api/codex"
 			case core.ProviderOllama:
 				a.BaseURL = "https://ollama.com/v1"
+			case core.ProviderOpenRouter:
+				a.BaseURL = "https://openrouter.ai/api/v1"
 			}
 		}
 		a.BaseURL = strings.TrimRight(a.BaseURL, "/")
@@ -412,7 +421,7 @@ func (c *Config) Validate() error {
 		accts[a.ID] = true
 		switch a.Provider {
 		case core.ProviderCodex, core.ProviderClaude:
-		case core.ProviderOllama, core.ProviderOpenAICompat:
+		case core.ProviderOllama, core.ProviderOpenAICompat, core.ProviderOpenRouter:
 			if a.APIKeyFile == "" && a.APIKeyEnv == "" {
 				errs = append(errs, fmt.Errorf("account %s: api_key_file or api_key_env required", a.ID))
 			}
@@ -421,6 +430,13 @@ func (c *Config) Validate() error {
 			}
 		default:
 			errs = append(errs, fmt.Errorf("account %s: unknown provider %q", a.ID, a.Provider))
+		}
+		if a.Provider != core.ProviderOpenRouter && (a.ManagementKeyFile != "" || a.ManagementKeyEnv != "") {
+			errs = append(errs, fmt.Errorf("account %s: management_key_file/management_key_env apply only to openrouter accounts", a.ID))
+		}
+		if a.Provider == core.ProviderOpenRouter && len(a.Reserve) > 0 {
+			// Prepaid credit has no rolling 5h/weekly windows to reserve.
+			errs = append(errs, fmt.Errorf("account %s: reserve does not apply to prepaid openrouter accounts (no 5h/weekly windows)", a.ID))
 		}
 		for k, v := range a.Reserve {
 			if k != core.Window5h && k != core.WindowWeekly {

@@ -559,8 +559,10 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     card.appendChild(chips);
 
     const ws = (a.windows || []).slice().sort((x, y) => windowRank(x.kind) - windowRank(y.kind));
-    if (!ws.length) card.appendChild(el("div", "line-warn", "no quota windows reported"));
+    const prepaid = prepaidLines(a);
+    if (!ws.length && !prepaid.length) card.appendChild(el("div", "line-warn", "no quota windows reported"));
     ws.forEach((w) => card.appendChild(windowBar(a, w, now)));
+    prepaid.forEach((l) => card.appendChild(el("div", l.cls, l.text)));
 
     if (a.reason && !(a.interactive_admissible && a.background_admissible)) card.appendChild(el("div", "line-warn", a.reason));
     if (cooling) card.appendChild(el("div", "line-warn", "cooling down for " + duration((Date.parse(a.cooldown_until) - now) / 1000)));
@@ -570,6 +572,49 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     if (pc) card.appendChild(pc);
     return card;
   }
+  // BEGIN prepaidLines
+  // Prepaid (OpenRouter) credit: signed USD account balance and the key's own
+  // spend/cap. Unavailable is shown as such, never as $0; no cap is explicit.
+  // signedUSD renders a signed USD amount. A nonzero magnitude below one
+  // cent is shown as "-<$0.01" (debt) or "<$0.01" (tiny credit) rather than
+  // rounding to a flat "$0.00", which would erase the balance's direction.
+  // Exact zero stays "$0.00"; all other amounts round to two decimals.
+  function signedUSD(v) {
+    const n = Number(v), a = Math.abs(n), s = a.toFixed(2);
+    if (n !== 0 && a < 0.01) return n < 0 ? "-<$0.01" : "<$0.01";
+    return (n < 0 ? "-$" : "$") + s;
+  }
+  function prepaidLines(a) {
+    if (a.provider !== "openrouter") return [];
+    const out = [], c = a.credits || {}, k = a.key || {};
+    const has = (v) => v !== null && v !== undefined;
+    if (c.available && has(c.balance_usd)) {
+      let t = "balance " + signedUSD(c.balance_usd);
+      if (has(c.total_credits_usd) && has(c.total_usage_usd)) t += " · " + signedUSD(c.total_credits_usd) + " bought, " + signedUSD(c.total_usage_usd) + " spent (lifetime)";
+      if (c.exhausted) t += " · exhausted";
+      out.push({ cls: c.exhausted ? "line-err" : "acct-meta", text: t });
+      if (c.error) out.push({ cls: "line-warn", text: "balance refresh failed: " + c.error });
+    } else {
+      out.push({ cls: "line-warn", text: "account balance unavailable" + (c.error ? ": " + c.error : "") });
+    }
+    if (k.available) {
+      let t;
+      if (k.unlimited) t = "key: no spending cap (unlimited)";
+      else t = "key cap " + (has(k.limit_usd) ? signedUSD(k.limit_usd) : "?") + (k.limit_reset ? " (" + k.limit_reset + ")" : "") +
+        " · " + (has(k.limit_remaining_usd) ? signedUSD(k.limit_remaining_usd) + " left" : "remaining unknown");
+      if (k.exhausted) t += " · exhausted";
+      out.push({ cls: k.exhausted ? "line-err" : "acct-meta", text: t });
+      const spend = [["usage_daily_usd", "today"], ["usage_weekly_usd", "this week"], ["usage_monthly_usd", "this month"], ["usage_usd", "lifetime"]]
+        .filter(([f]) => has(k[f])).map(([f, l]) => signedUSD(k[f]) + " " + l);
+      if (spend.length) out.push({ cls: "acct-meta", text: "key spend " + spend.join(" · ") });
+      if (has(k.byok_usage_usd)) out.push({ cls: "acct-meta", text: "BYOK " + signedUSD(k.byok_usage_usd) + " lifetime (separate)" });
+      if (k.error) out.push({ cls: "line-warn", text: "key refresh failed: " + k.error });
+    } else {
+      out.push({ cls: "line-warn", text: "key usage unavailable" + (k.error ? ": " + k.error : "") });
+    }
+    return out;
+  }
+  // END prepaidLines
   const windowRank = (k) => k === "5h" ? 0 : k === "weekly" ? 1 : 2;
   function windowBar(a, w, now) {
     const box = el("div", "win");
@@ -1171,7 +1216,13 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
       { id: "ollama-cloud", provider: "ollama", healthy: true, cooldown_until: null, inflight: 0, reserve: {},
         windows: [win("weekly", 0.27, 120 * HOUR, 604800)], background_admissible: true, interactive_admissible: true,
         snapshot_age_s: 120, stale: false, error: null,
-        model_requests: { weekly: [{ model: "deepseek-v4.1-flash", requests: 4120 }, { model: "glm-5.3-flash", requests: 380 }] } }],
+        model_requests: { weekly: [{ model: "deepseek-v4.1-flash", requests: 4120 }, { model: "glm-5.3-flash", requests: 380 }] } },
+      { id: "openrouter", provider: "openrouter", healthy: true, cooldown_until: null, inflight: 0, reserve: {}, windows: [],
+        background_admissible: false, interactive_admissible: false, snapshot_age_s: 95, stale: false, error: null,
+        reason: "openrouter: openrouter account balance -$0.08 (credit exhausted)",
+        credits: { available: true, balance_usd: -0.076117902, total_credits_usd: 770.8176, total_usage_usd: 770.893717902, exhausted: true, age_s: 95, stale: false, error: null },
+        key: { available: true, unlimited: true, limit_usd: null, limit_remaining_usd: null, exhausted: false, usage_usd: 770.89,
+          usage_daily_usd: 1.25, usage_weekly_usd: 7.5, usage_monthly_usd: 30.25, byok_usage_usd: 0, age_s: 95, stale: false, error: null } }],
       clients: [
         { name: "claude-code", class: "interactive", host: "laptop", ingest: true },
         { name: "codex", class: "interactive", host: "vm1", ingest: false },

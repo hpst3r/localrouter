@@ -20,7 +20,7 @@ chat-completions→Responses translation for Codex.
 |---|---|---|
 | `internal/core` | Shared types + interfaces (frozen; architect-owned) | stdlib |
 | `internal/config` | YAML config load/validate (architect-owned) | core |
-| `internal/quota` | Codex + Ollama + Claude quota fetchers, poller, passive header observation | core |
+| `internal/quota` | Codex + Ollama + Claude + OpenRouter quota fetchers, poller, passive header observation | core |
 | `internal/policy` | Admission gate, reserves, in-flight leases, cooldowns, account selection | core |
 | `internal/ledger` | SQLite request ledger, summaries, pricing table + cost | core |
 | `internal/auth` | Codex OAuth device login, token store, single-flight refresh; static API keys | core |
@@ -666,6 +666,76 @@ and wide (browser). Sections:
   seen in data (e.g. "claude-code"), each with class badge, host, tokens, cost,
   requests for the current range and a 24h sparkline; click = drill down
   `client=<name>`.
+
+## OpenRouter (prepaid account)
+
+`provider: openrouter` (`core.ProviderOpenRouter`). Config: `api_key_file` or
+`api_key_env` required; `base_url` default `https://openrouter.ai/api/v1`;
+`cost_basis` default `metered`; optional `management_key_file` /
+`management_key_env` (openrouter only; paths expanded like other key files);
+`reserve` must be empty (no 5h/weekly windows). Inference is forwarded like
+`openai_compat` (`<base_url>/chat/completions`, `<base_url>/responses`).
+
+Quota (`internal/quota`), both endpoints derived from the account `base_url`
+so credentials only go to that host, polled with the normal interval plus
+debounced post-request / urgent refreshes:
+
+- `GET <base_url>/credits` → `{data:{total_credits, total_usage}}`, both
+  required non-negative finite numbers. `core.Credits{TotalCreditsUSD,
+  TotalUsageUSD, BalanceUSD = credits - usage (signed), FetchedAt, Err}`.
+  Uses the management credential (a separate `auth.Manager`, supplied via
+  `quota.Options.ManagementCredentials`) when configured, else the inference
+  credential. 403 without a management key → `Err` "management key required";
+  explicit management-key failures are reported as such (401 invalidates and
+  retries once, management key only).
+- `GET <base_url>/key` (inference credential only) → `core.KeyUsage`.
+  `limit` and `limit_remaining` must be present (null = no cap; zero kept);
+  a finite `limit` with a null `limit_remaining` (or a null `limit` with a
+  finite `limit_remaining`) is a contradictory pair rejected as malformed, and
+  an invalid response never marks the account healthy or available.
+  `usage` required ≥ 0; `usage_daily|weekly|monthly`, `byok_usage*` optional
+  (nil when absent/null, never 0), must be ≥ 0; `include_byok_in_limit`,
+  `is_free_tier` optional bools; `limit_reset` optional string
+  (`daily|weekly|monthly` → `LimitResetAt` = next 00:00 UTC / Monday / 1st;
+  informational only, see policy below).
+  Unknown fields (label, deprecated `rate_limit`) ignored; BYOK never summed
+  into `usage`; remaining is never derived from lifetime usage.
+- Each part keeps last-good values, its own `FetchedAt`, and `Err` on failure;
+  a successful `/key` never refreshes or clears `/credits`. Before the first
+  success a part has zero `FetchedAt` (unknown). `Snapshot.FetchedAt` = the
+  oldest successful part; `Snapshot.Err` joins part errors. No windows, no
+  `Allowed`. Error strings never include bodies or credentials.
+
+Policy: a known `BalanceUSD <= 0`, or a known key cap with
+`LimitRemainingUSD <= 0`, denies both classes regardless of staleness. The
+predicted cap reset (`LimitResetAt`) is informational only: reaching it never
+restores spending credit, so a stale exhausted cap keeps denying both classes
+until a later successful `/key` response observes a positive
+`LimitRemainingUSD`; only such a fresh observation reopens the gate (the
+periodic response recomputes `LimitResetAt` for display only). A key reset
+never overrides account exhaustion. An unknown or malformed key part never
+denies on its own (no invented exhaustion), so unknown parts follow the normal
+stale rule (no reserve → allow; upstream 402 is the backstop). Upstream 402 on
+an openrouter account: proxy fails over (no bytes sent yet; streamed/completed
+responses are never repeated), outcome carries the `Retry-After` hint, policy
+cools down for `max(60s, hint)` and requests an urgent refresh. A 402 cooldown
+clears early only when a balance fetched after it is positive and above the
+balance known at the 402. Other providers' 402 handling is unchanged.
+
+Control status adds, for openrouter accounts only, `credits:{available,
+balance_usd, total_credits_usd, total_usage_usd, exhausted, age_s, stale,
+error}` (amounts null when unavailable) and `key:{available, unlimited,
+limit_usd, limit_remaining_usd, limit_reset, limit_reset_at, exhausted,
+usage_usd, usage_{daily,weekly,monthly}_usd, byok_usage{,_daily,_weekly,
+_monthly}_usd, include_byok_in_limit, is_free_tier, age_s, stale, error}`.
+`key.limit_reset_at` is informational (predicted reset, display only): status
+`key.exhausted` follows the same authoritative rule as admission and stays
+true for a zero-remaining cap even after that predicted reset passes, until a
+fresh `/key` response observes a positive `limit_remaining`. An unknown key
+part is never reported exhausted.
+The widget shows the signed balance (e.g. `-$0.08`; a non-zero amount below one
+cent keeps its sign as `<$0.01` / `-<$0.01` rather than rounding to `$0.00`),
+"unavailable" rather than $0, and "unlimited" for a null cap.
 
 ## Engineering constraints
 
