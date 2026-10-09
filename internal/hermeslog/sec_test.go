@@ -2,6 +2,7 @@ package hermeslog
 
 import (
 	"context"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -134,5 +135,49 @@ func TestSecPermanentRejectDoesNotStall(t *testing.T) {
 	}
 	if st, err := c.ScanOnce(context.Background()); err != nil || st.Dropped != 0 || st.Recorded != 0 {
 		t.Fatalf("rescan %+v %v", st, err)
+	}
+}
+
+// The raw last_seen is validated before the now fallback (Sol issue 7): a
+// negative value is skipped and rebased like other implausible rows; only an
+// absent (NULL or 0) value is recorded at now.
+func TestSecNegativeLastSeenSkipped(t *testing.T) {
+	home := t.TempDir()
+	db := mkdb(t, filepath.Join(home, "state.db"))
+	q := `INSERT INTO session_model_usage (session_id,model,billing_provider,api_call_count,input_tokens,output_tokens,last_seen) VALUES (?,'m','anthropic',1,10,5,?)`
+	exec(t, db, q, "negative", -123)
+	exec(t, db, q, "tiny-negative", -1e-9)
+	exec(t, db, q, "absent", nil)
+	exec(t, db, q, "zero", 0)
+	l := &memLedger{}
+	c := secCollector(t, home, l)
+	st, err := c.ScanOnce(context.Background())
+	if err != nil || st.Recorded != 2 || st.SkippedInvalid != 2 {
+		t.Fatalf("stats=%+v err=%v", st, err)
+	}
+	for _, r := range l.rows {
+		if r.Session != "absent" && r.Session != "zero" {
+			t.Fatalf("negative last_seen recorded: %+v", r)
+		}
+		if !r.StartedAt.Equal(secNow) {
+			t.Fatalf("absent last_seen time=%v", r.StartedAt)
+		}
+	}
+	// Rebased: not re-reported on the next scan.
+	if st, _ := c.ScanOnce(context.Background()); st.SkippedInvalid != 0 || st.Recorded != 0 {
+		t.Fatalf("rescan %+v", st)
+	}
+}
+
+// Non-finite and negative raw values are implausible at the helper level
+// (SQLite normally stores a bound NaN as NULL, which the query maps to 0).
+func TestSecNonFiniteLastSeenImplausible(t *testing.T) {
+	c := secCollector(t, t.TempDir(), &memLedger{})
+	counts := counters{Calls: 1, Input: 10}
+	for _, v := range []float64{math.NaN(), math.Inf(1), math.Inf(-1), -1} {
+		r := c.record("k", "default", "s", "m", "anthropic", "", "", "", "", v, counts, counts)
+		if c.implausible(counts, r, v) == "" {
+			t.Fatalf("last_seen %v accepted", v)
+		}
 	}
 }

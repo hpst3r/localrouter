@@ -343,8 +343,8 @@ func (a counters) inRange() bool {
 
 // implausible returns why a row must not be recorded, or "" if it is
 // plausible: cumulative counters out of range, a token total above
-// core.MaxRecordTokens, or a last_seen that is non-finite or outside
-// [now-400d, now+5m].
+// core.MaxRecordTokens, or a last_seen that is non-finite, negative or
+// outside [now-400d, now+5m].
 func (c *Collector) implausible(cur counters, rec core.RequestRecord, lastSeen float64) string {
 	if !cur.inRange() {
 		return "counters out of range"
@@ -355,7 +355,9 @@ func (c *Collector) implausible(cur counters, rec core.RequestRecord, lastSeen f
 			return "implausible usage"
 		}
 	}
-	if lastSeen > maxUnixSeconds || math.IsInf(lastSeen, 0) {
+	// Validate the raw value: only an absent last_seen (NULL, read as 0)
+	// falls back to now in record.
+	if math.IsNaN(lastSeen) || lastSeen < 0 || lastSeen > maxUnixSeconds || math.IsInf(lastSeen, 0) {
 		return "bad last_seen"
 	}
 	now := c.opts.Clock.Now()

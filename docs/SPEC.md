@@ -568,8 +568,9 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
   router are skipped. Counters that go backwards are rebased, not recorded.
 - Plausibility: a row is skipped (`Stats.SkippedInvalid`, logged without
   content) and rebased if any cumulative counter or token total is outside
-  [0, 1e12] (so delta arithmetic cannot overflow), or `last_seen` is
-  non-finite or outside [now-400d, now+5m]. A missing `last_seen` uses now.
+  [0, 1e12] (so delta arithmetic cannot overflow), or the raw `last_seen` is
+  non-finite, negative or outside [now-400d, now+5m]. Only a missing (NULL or
+  0) `last_seen` uses now.
   Increases from an implausible baseline are rebased, not recorded. Labels
   are bounded with `core.TruncateLabel`.
 - A ledger error with `Permanent() == true` drops the row (`Stats.Dropped`)
@@ -671,7 +672,15 @@ server's `/v1` with their own client keys.
   `quota_source: agent`, else 400. Passed to `SnapshotIngester`; a snapshot
   with `FetchedAt` <= the stored one is ignored (counted in
   `snapshots_ignored`). Snapshots with `FetchedAt` more than 5 minutes in the
-  future -> 400.
+  future -> 400. Bounds (else 400 `invalid_request`, nothing written): at
+  most 16 snapshots per request; per snapshot at most 16 windows with
+  distinct kinds matching `[a-z0-9_]{1,32}`, `used_frac` in [0,1],
+  `window_seconds` >= 0; `plan` and `source` at most `core.MaxLabelBytes`
+  and `error` at most `core.MaxErrorBytes`, valid UTF-8 without control
+  characters; `model_requests` at most 16 kinds (same kind pattern), each
+  with at most 256 entries whose `model` follows the label rule and
+  `requests` is in [0, 1e12]. `credits`, `key` and `allowed` (openrouter /
+  codex members) must be absent.
 - Response 200 `core.IngestResponse`. Ingest is idempotent: re-sending the
   same batch yields 200 with records_accepted counting submitted records (the
   ledger dedupes silently).

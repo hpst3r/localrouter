@@ -20,6 +20,12 @@ const (
 	maxIngestRecords = 1000
 	maxSnapshotSkew  = 5 * time.Minute
 	maxRecordAge     = 400 * 24 * time.Hour
+	// Snapshot bounds. Claude agent snapshots carry one snapshot with a
+	// handful of windows; the limits only stop schema pollution.
+	maxIngestSnapshots   = 16
+	maxSnapshotWindows   = 16
+	maxModelRequestKeys  = 16
+	maxModelRequestsPerK = 256
 	// QuotaSourceAgent marks claude accounts whose snapshots come from agents.
 	QuotaSourceAgent = "agent"
 )
@@ -154,6 +160,9 @@ func (s *Server) validateIngest(req *core.IngestRequest, client string) error {
 	if len(req.Records) > maxIngestRecords {
 		return reqErr("at most %d records per request", maxIngestRecords)
 	}
+	if len(req.Snapshots) > maxIngestSnapshots {
+		return reqErr("at most %d snapshots per request", maxIngestSnapshots)
+	}
 	claude := map[string]core.Account{}
 	for _, a := range s.deps.Accounts {
 		if a.Provider == core.ProviderClaude {
@@ -210,10 +219,18 @@ func (s *Server) validateIngest(req *core.IngestRequest, client string) error {
 		if snap.FetchedAt.After(limit) {
 			return reqErr("snapshots[%d]: fetched_at is more than 5 minutes in the future", i)
 		}
+		if err := validateSnapshotFields(i, snap); err != nil {
+			return err
+		}
+		kinds := make(map[string]bool, len(snap.Windows))
 		for j, win := range snap.Windows {
 			if !windowKindRE.MatchString(win.Kind) {
 				return reqErr("snapshots[%d].windows[%d]: kind must match [a-z0-9_]{1,32}", i, j)
 			}
+			if kinds[win.Kind] {
+				return reqErr("snapshots[%d].windows[%d]: duplicate kind %q", i, j, win.Kind)
+			}
+			kinds[win.Kind] = true
 			if math.IsNaN(win.UsedFrac) || win.UsedFrac < 0 || win.UsedFrac > 1 {
 				return reqErr("snapshots[%d].windows[%d]: used_frac must be between 0 and 1", i, j)
 			}
@@ -225,6 +242,48 @@ func (s *Server) validateIngest(req *core.IngestRequest, client string) error {
 		// every genuine snapshot until then look stale.
 		if snap.FetchedAt.After(now) {
 			snap.FetchedAt = now
+		}
+	}
+	return nil
+}
+
+// validateSnapshotFields bounds a snapshot's collections and free-form
+// fields (same text rules as validateRecordFields) and rejects members that
+// only openrouter/codex snapshots carry.
+func validateSnapshotFields(i int, snap *core.Snapshot) error {
+	if snap.Credits != nil || snap.Key != nil || snap.Allowed != nil {
+		return reqErr("snapshots[%d]: credits, key and allowed are not accepted from agents", i)
+	}
+	if len(snap.Windows) > maxSnapshotWindows {
+		return reqErr("snapshots[%d]: at most %d windows", i, maxSnapshotWindows)
+	}
+	if core.TruncateLabel(snap.Plan) != snap.Plan || core.TruncateLabel(snap.Source) != snap.Source {
+		return reqErr("snapshots[%d]: plan and source must be at most %d bytes of UTF-8 without control characters",
+			i, core.MaxLabelBytes)
+	}
+	if core.TruncateError(snap.Err) != snap.Err {
+		return reqErr("snapshots[%d]: error must be at most %d bytes of UTF-8 without control characters",
+			i, core.MaxErrorBytes)
+	}
+	if len(snap.ModelRequests) > maxModelRequestKeys {
+		return reqErr("snapshots[%d]: model_requests has at most %d window kinds", i, maxModelRequestKeys)
+	}
+	for k, counts := range snap.ModelRequests {
+		if !windowKindRE.MatchString(k) {
+			return reqErr("snapshots[%d].model_requests: kind must match [a-z0-9_]{1,32}", i)
+		}
+		if len(counts) > maxModelRequestsPerK {
+			return reqErr("snapshots[%d].model_requests[%q]: at most %d models", i, k, maxModelRequestsPerK)
+		}
+		for j, c := range counts {
+			if core.TruncateLabel(c.Model) != c.Model {
+				return reqErr("snapshots[%d].model_requests[%q][%d]: model must be at most %d bytes of UTF-8 without control characters",
+					i, k, j, core.MaxLabelBytes)
+			}
+			if c.Requests < 0 || c.Requests > core.MaxRecordTokens {
+				return reqErr("snapshots[%d].model_requests[%q][%d]: requests must be between 0 and %d",
+					i, k, j, core.MaxRecordTokens)
+			}
 		}
 	}
 	return nil
