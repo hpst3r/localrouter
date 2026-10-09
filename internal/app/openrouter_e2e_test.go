@@ -365,11 +365,14 @@ func TestE2EOpenRouterCreditsForbiddenWithoutManagementKey(t *testing.T) {
 	}
 }
 
-// A 402 from OpenRouter fails over to the next account, cools OpenRouter down
-// and triggers an urgent quota refresh.
+// A 402 from OpenRouter without proof of funds fails over to the next
+// account, cools OpenRouter down and triggers an urgent quota refresh. (With
+// a fresh positive balance the 402 is request-scoped and relayed instead.)
 func TestE2EOpenRouter402Failover(t *testing.T) {
-	e := newOREnv(t, true, true)
-	e.waitStatus("or", func(s orAccountStatus) bool { return s.Credits != nil && s.Credits.Available })
+	e := newOREnv(t, false, true)
+	e.f.set(func(f *fakeOpenRouter) { f.requireMgmt = true })
+	e.app.Quota.RequestRefresh("or", true)
+	e.waitStatus("or", func(s orAccountStatus) bool { return s.Credits != nil && s.Credits.Error != nil })
 	creditsBefore := len(e.f.seen("credits"))
 	e.f.set(func(f *fakeOpenRouter) { f.chatStatus = http.StatusPaymentRequired })
 
