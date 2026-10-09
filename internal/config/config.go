@@ -115,10 +115,33 @@ type ClientConfig struct {
 	Name    string `yaml:"name"`
 	Class   string `yaml:"class"`
 	KeyFile string `yaml:"key_file"`
+	// KeyFiles lists additional active key files so a client key can be
+	// rotated without downtime (every listed key authenticates as this
+	// client). Exactly one of key_file and key_files must be set; key_file
+	// keeps its original single-key meaning and default resolution.
+	KeyFiles []string `yaml:"key_files"`
 	// Host attributes this client's proxied requests to a machine.
 	Host string `yaml:"host"`
 	// Ingest lets this client's key push agent data to /control/v1/ingest.
 	Ingest bool `yaml:"ingest"`
+}
+
+// KeyPaths returns every configured key file for the client, in order, as a
+// copy the caller may keep (key_file first, then key_files). Callers build a
+// client name -> paths map to load keys; the copy protects the loaded config
+// from mutation.
+func (c ClientConfig) KeyPaths() []string {
+	if len(c.KeyFiles) == 0 {
+		if c.KeyFile == "" {
+			return nil
+		}
+		return []string{c.KeyFile}
+	}
+	out := make([]string, 0, len(c.KeyFiles)+1)
+	if c.KeyFile != "" {
+		out = append(out, c.KeyFile)
+	}
+	return append(out, c.KeyFiles...)
 }
 
 type AccountConfig struct {
@@ -225,6 +248,9 @@ func (c *Config) applyDefaults(baseDir string) {
 	}
 	for i := range c.Clients {
 		c.Clients[i].KeyFile = expand(c.Clients[i].KeyFile, baseDir)
+		for j := range c.Clients[i].KeyFiles {
+			c.Clients[i].KeyFiles[j] = expand(c.Clients[i].KeyFiles[j], baseDir)
+		}
 	}
 	if c.TLSCertFile != "" {
 		c.TLSCertFile = expand(c.TLSCertFile, baseDir)
@@ -399,8 +425,26 @@ func (c *Config) Validate() error {
 		if cl.Class != string(core.ClassInteractive) && cl.Class != string(core.ClassBackground) {
 			errs = append(errs, fmt.Errorf("client %s: class must be interactive or background", cl.Name))
 		}
-		if cl.KeyFile == "" {
-			errs = append(errs, fmt.Errorf("client %s: key_file required", cl.Name))
+		nfiles := 0
+		if cl.KeyFile != "" {
+			nfiles++
+		}
+		if len(cl.KeyFiles) > 0 {
+			nfiles++
+		}
+		if nfiles != 1 {
+			errs = append(errs, fmt.Errorf("client %s: exactly one of key_file or key_files is required", cl.Name))
+		}
+		seenKF := map[string]bool{}
+		for _, kf := range cl.KeyFiles {
+			if kf == "" {
+				errs = append(errs, fmt.Errorf("client %s: key_files entries must not be empty", cl.Name))
+				continue
+			}
+			if seenKF[kf] {
+				errs = append(errs, fmt.Errorf("client %s: duplicate key_files entry %s", cl.Name, kf))
+			}
+			seenKF[kf] = true
 		}
 		if strings.ContainsAny(cl.Host, " /\\") {
 			errs = append(errs, fmt.Errorf("client %s: host %q invalid", cl.Name, cl.Host))

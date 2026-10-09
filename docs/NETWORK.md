@@ -168,7 +168,7 @@ These checks have distinct meanings: `/healthz` is **liveness** (the process ans
 |---|---|
 | Connection refused or timeout | Service journal, network connectivity/access controls, bind address, port, host firewall. |
 | TLS validation error | URL name versus certificate SAN, chain/expiry, client CA trust. |
-| `401` | Missing/invalid bearer key; correct client key file; restart the server after replacing keys. |
+| `401` | Missing/invalid bearer key; correct client key file; `SIGHUP` the server after replacing keys (or restart it). |
 | `403` on `/healthz` or status | Host header not accepted. Add the actual URL's hostname/IP to `allowed_hosts`, validate, restart. |
 | `403` on ingest with an accepted Host | That key lacks `ingest: true`. Enable only for the intended agent and restart. |
 | `400` on ingest | Agent host/schema/account mismatch, invalid records, or clock skew. Inspect the sanitized agent/server errors; configured account IDs must agree. |
@@ -183,9 +183,15 @@ A fresh quota snapshot and recent host usage are separate signals: usage can pus
 
 ## Changes, keys, and upgrades
 
-- Server configuration, client keys, and in-memory pricing are loaded at startup. Validate and restart after changes. Restart agents after their key/config changes. `daemon-reload` is needed only when service units change.
-- To rotate a client key, generate a new file at a new path, securely distribute it, update the server client's `key_file` and client/agent configuration, then restart server and affected agents. A coordinated switch has a brief interruption; the server does not accept two keys for one client entry. Use a temporary separate client entry only if that extra identity/permissions are intentional.
-- To revoke a key, remove its client entry (or replace its key), validate, and restart the server. Removing the file alone does not evict the already loaded key. Existing in-flight requests are not continuously re-authenticated.
+- The reloadable subset of the server configuration (client keys and attributes, routes, per-account reserves, pricing table contents, policy knobs and concurrency limits) is re-read in place on `SIGHUP` — no restart, no dropped requests, no loss of quota/cooldown or token state. Everything else (listener, TLS material, `data_dir` and storage paths, `quota.poll_interval`, account topology and credentials, `cost_basis`, `host_name`, collectors, `control.require_auth`, structural timeouts) stays restart-only: a reload touching any of these is rejected whole and the running config keeps serving. Validate with `localrouter check`, then `kill -HUP` the server. Restart agents after their key/config changes. `daemon-reload` is needed only when service units change.
+- To rotate a client key without downtime, write the new key file and list both under `key_files` on the same client entry, `SIGHUP` the server (both keys authenticate for new requests), switch the client to the new key, then remove the old file and `SIGHUP` again. Each file holds exactly one raw key; `key_file` and `key_files` are mutually exclusive on a client, `key_files` entries must be distinct, and a duplicate key across clients is rejected. In-flight requests holding the old key finish; a revoked key is refused for new requests at the next reload.
+
+  ```bash
+  ~/.local/bin/localrouter check -config ~/.config/localrouter/config.yaml  # validate
+  kill -HUP "$(systemctl --user show -p MainPID --value localrouter)"        # reload in place
+  ```
+- A rejected reload rolls back automatically: nothing is published, so the last-good generation keeps serving and the generation number does not advance; there is no separate rollback command. Diagnose it from the sanitized last attempt at `GET /control/v1/diagnostics` → `reload:{generation, ok, at, reason?, restart_only?}` (`ok:false` with a `reason`, plus the offending key names for a restart-only change) and the `config reload rejected` journal line, which carries only `reason`, `restart_only` and `generation` — never the raw error, keys, tokens or secret paths. Correct the config and `SIGHUP` again.
+- To revoke a key, remove it from `key_files` (or remove the client entry) and `SIGHUP`. Deleting the file alone does not evict an already-loaded key. Existing in-flight requests are not continuously re-authenticated.
 - Rebuild/install the target binary and restart its service for upgrades. The server drains requests for up to 30 seconds on shutdown, then cuts remaining streams; schedule restarts accordingly.
 - The supplied Linux server unit permits writes only under `~/.config/localrouter`; the agent unit permits its default state directory. If moving `data_dir`, pricing files, or `state_dir`, create the destination with restrictive permissions and update the corresponding unit's `ReadWritePaths`. Read access to credentials/transcripts must also remain possible.
 

@@ -1,0 +1,236 @@
+name: Release
+
+# Only v* tags trigger a release. Nothing here tags, pushes, or publishes on
+# pull requests or branch pushes.
+"on":
+  push:
+    tags:
+      - "v*"
+
+# Least privilege by default; the two publishing jobs opt in below.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Gate 1: the ref must be a publishable release tag. This job only classifies
+  # the tag and is the ONLY producer of the version output everything else uses.
+  validate-tag:
+    name: validate tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+    steps:
+      - name: Validate v<semver> tag format -> version
+        id: parse
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # STRICT tag policy: only v<major>.<minor>.<patch> optionally followed
+          # by a SINGLE -<prerelease> part. This is a deliberate choice, enforced
+          # and documented:
+          #   * SemVer build metadata ("+<...>") is REJECTED. `+` is not a valid
+          #     character in an OCI tag grammar ([A-Za-z0-9_.-]{1,128}), so a tag
+          #     carrying metadata cannot be published to GHCR. Rather than invent
+          #     a lossy conversion (e.g. `+`->`-`) that would make the release tag
+          #     disagree with a GHCR tag of the same name, a metadata-bearing tag
+          #     fails the release loudly. Cut the release from the bare
+          #     vX.Y.Z[-prerelease] ref instead.
+          #   * Pre-release identifiers MAY contain dots (v1.2.3-rc.1). Dots are
+          #     legal in OCI tags, so the tag, the GHCR tag, and the version output
+          #     stay byte-identical.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "refusing release: tag '$TAG' is not a strict v<major>.<minor>.<patch>[-prerelease] tag" >&2
+            echo "  (build metadata after '+' is not a valid OCI image tag and is rejected)" >&2
+            exit 1
+          fi
+          version="${TAG#v}"
+          # Defence in depth: never emit a version that would be an invalid OCI
+          # tag; publish-image derives its tag from this exact value.
+          if [[ ${#version} -gt 128 ]] || [[ ! "$version" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "refusing release: derived version '$version' is not a valid OCI tag" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  # Gate 2 (fail-closed): find the image definition in the tree. The build
+  # FAILS if the root Containerfile is missing -- there is no silent skip and no
+  # invented optional build.
+  detect-containerfile:
+    name: detect Containerfile
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      path: ${{ steps.find.outputs.path }}
+    steps:
+      - name: Check out the tag (immutable ref)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Require the root Containerfile
+        id: find
+        run: |
+          set -euo pipefail
+          candidate="Containerfile"
+          if [ -f "$candidate" ]; then
+            echo "path=$candidate" >> "$GITHUB_OUTPUT"
+            echo "found $candidate"
+            exit 0
+          fi
+          echo "no Containerfile at the repository root; the image cannot be built from this tree" >&2
+          exit 1
+
+  # Packaging: gate vet + race tests BEFORE cross-compiling/releasing archives.
+  # No other job depends on it, so an unverified native build can no longer
+  # block, gate, or delay the image publish below.
+  build-native:
+    name: build native archives
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GOFLAGS: -p=2
+      GOMAXPROCS: "2"
+      # Finite bounds: no step may wedge a release run indefinitely.
+      GOTEST_TIMEOUT: 120s
+    steps:
+      - name: Check out the tag (immutable ref)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Gate - vet and race tests before packaging
+        timeout-minutes: 20
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go test -race -p 2 -count=1 -timeout "$GOTEST_TIMEOUT" ./...
+
+      - name: Build four native archives and SHA256SUMS
+        timeout-minutes: 15
+        env:
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          ./scripts/release.sh "${GITHUB_WORKSPACE}/dist" "$VERSION"
+
+      - name: Upload archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-archives
+          path: dist/*
+          if-no-files-found: error
+
+  # Image publication is blocked until the native vet/race gate passes.
+  publish-image:
+    name: publish multi-arch image
+    needs:
+      - validate-tag
+      - detect-containerfile
+      - build-native
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Check out the tag (immutable ref)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # Bounded parallelism: a single buildx builder whose NodeGroup caps every
+      # build at 2 concurrent buildkit workers. Configured inline (this workflow
+      # may only be the sole change) and passed to build-push-action via `builder`,
+      # so the limit applies no matter how buildx was set up.
+      - name: Set up Buildx (max 2 parallel buildkit workers)
+        uses: docker/setup-buildx-action@v3
+        with:
+          name: localrouter-release
+          buildkitd-config-inline: |
+            [worker.oci]
+              max-parallelism = 2
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push linux/amd64 + linux/arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ needs.detect-containerfile.outputs.path }}
+          builder: localrouter-release
+          platforms: linux/amd64,linux/arm64
+          # The Containerfile's `go build ... && /out/localrouter --help` runs
+          # under QEMU for arm64; --help is a clean, exit-0 smoke test there.
+          push: true
+          build-args: |
+            VERSION=${{ needs.validate-tag.outputs.version }}
+          tags: |
+            ${{ env.IMAGE }}:${{ needs.validate-tag.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.validate-tag.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=localrouter
+
+  # Publish the GitHub release LAST: it consumes the native archives (hence the
+  # build-native dependency) and runs concurrently with the image publish.
+  publish-release:
+    name: publish GitHub release
+    needs:
+      - validate-tag
+      - build-native
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          name: native-archives
+          path: dist
+
+      - name: Verify checksums before publishing
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -c SHA256SUMS
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS

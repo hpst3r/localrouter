@@ -31,6 +31,10 @@ clients:
   - name: me
     class: interactive
     key_file: keys/me.key
+    # For zero-downtime key rotation, list several single-key files instead
+    # (both authenticate as this client); key_file and key_files are mutually
+    # exclusive and each file holds exactly one raw key:
+    #   key_files: [keys/me-old.key, keys/me-new.key]
   - name: hermes
     class: interactive        # Hermes may send X-LocalRouter-Class: background
     key_file: keys/hermes.key

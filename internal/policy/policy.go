@@ -1,10 +1,12 @@
 package policy
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/core"
@@ -32,13 +34,41 @@ type Options struct {
 	Logger *slog.Logger
 }
 
-// Policy is the admission gate. It is safe for concurrent use.
-type Policy struct {
-	quota    core.QuotaSource
-	opts     Options
-	accounts map[string]core.Account
+// ErrTopologyChanged reports that a new generation's accounts differ from the
+// running generation's account topology. Account identity (id, provider,
+// base URL, quota source, cost basis) is fixed for the process lifetime, so
+// WithConfig refuses such a change rather than silently accepting it.
+var ErrTopologyChanged = errors.New("policy: account topology changed")
 
-	mu    sync.Mutex
+// ErrInvalidConfig reports a knob or reserve value outside its allowed range.
+var ErrInvalidConfig = errors.New("policy: invalid configuration")
+
+// cfg is one immutable configuration generation: the account map and the
+// admission knobs. WithConfig replaces it wholesale, and every reader loads it
+// once at call entry, so one request always sees exactly one coherent
+// generation. Nothing in cfg is ever mutated after publication.
+type cfg struct {
+	accounts map[string]core.Account
+	opts     Options
+}
+
+// Policy is the admission gate. It is safe for concurrent use.
+//
+// A Policy is a configuration view over persistent runtime state: mu and state
+// live for the whole process and are shared by every view that WithConfig
+// derives from this one. A hot reload therefore swaps cfg (accounts + knobs)
+// without rebuilding, dropping or double-counting the inflight counters and
+// cooldowns that leases from earlier generations still own.
+type Policy struct {
+	quota core.QuotaSource
+	// cur is the current immutable configuration generation.
+	cur atomic.Pointer[cfg]
+	// mu guards state and is shared by reference across views (it is a
+	// pointer, not a value, so WithConfig views contend on one lock).
+	mu *sync.Mutex
+	// state holds the persistent per-account runtime bookkeeping, shared by
+	// reference across views so an outstanding lease's Release finds its
+	// counter in any generation.
 	state map[string]*accountState
 }
 
@@ -57,37 +87,62 @@ var _ core.Policy = (*Policy)(nil)
 
 // New returns a Policy over the given accounts using quota for snapshots.
 func New(accounts []core.Account, quota core.QuotaSource, opts Options) *Policy {
-	if opts.StaleAfter <= 0 {
-		opts.StaleAfter = defaultStaleAfter
-	}
-	if opts.Clock == nil {
-		opts.Clock = core.SystemClock{}
-	}
-	if opts.Logger == nil {
-		opts.Logger = slog.New(slog.DiscardHandler)
-	}
+	opts = normalizeOptions(opts)
+	c := buildCfg(accounts, opts)
 	p := &Policy{
-		quota:    quota,
-		opts:     opts,
-		accounts: make(map[string]core.Account, len(accounts)),
-		state:    make(map[string]*accountState, len(accounts)),
+		quota: quota,
+		mu:    &sync.Mutex{},
+		state: make(map[string]*accountState, len(c.accounts)),
 	}
-	for _, a := range accounts {
-		p.accounts[a.ID] = a
-		p.state[a.ID] = &accountState{}
+	p.cur.Store(c)
+	for id := range c.accounts {
+		p.state[id] = &accountState{}
 	}
 	return p
+}
+
+// WithConfig derives a new configuration view (one hot-reload generation) that
+// carries the given accounts and knobs while sharing this Policy's runtime
+// state: the same mutex, inflight counters and cooldowns. Existing leases stay
+// valid and continue to decrement the shared counters through whichever view
+// released them, and a cooldown entered through any view is visible in all.
+//
+// Clock and Logger are process identity pinned by New and are carried over
+// unchanged; the reloadable knobs are StaleAfter, SafetyMargin and
+// InflightEstimate. Inputs are validated and cloned, so the caller may freely
+// reuse or mutate its slices and maps afterwards.
+//
+// WithConfig never mutates the receiver. It returns an error and mutates
+// nothing when the accounts are not the same topology as the running
+// generation (see ErrTopologyChanged) or a knob or reserve is out of range
+// (see ErrInvalidConfig).
+func (p *Policy) WithConfig(accounts []core.Account, opts Options) (*Policy, error) {
+	base := p.cur.Load()
+	if err := validateAccounts(base.accounts, accounts); err != nil {
+		return nil, err
+	}
+	if err := validateOptions(opts); err != nil {
+		return nil, err
+	}
+	opts.Clock = base.opts.Clock
+	opts.Logger = base.opts.Logger
+	opts = normalizeOptions(opts)
+
+	v := &Policy{quota: p.quota, mu: p.mu, state: p.state}
+	v.cur.Store(buildCfg(accounts, opts))
+	return v, nil
 }
 
 // Acquire selects the first admissible account from candidates (in order,
 // skipping exclude) and creates a lease on it. On denial the lease is nil and
 // the decision reason lists each candidate's rejection.
 func (p *Policy) Acquire(class core.Class, candidates []string, exclude map[string]bool) (core.Lease, core.Decision) {
+	c := p.cur.Load()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	id, dec := p.selectLocked(class, candidates, exclude)
+	id, dec := p.selectLocked(c, class, candidates, exclude)
 	if !dec.Allow {
-		p.opts.Logger.Info("policy denied", "class", class, "reason", dec.Reason)
+		c.opts.Logger.Info("policy denied", "class", class, "reason", dec.Reason)
 		return nil, dec
 	}
 	p.state[id].inflight++
@@ -96,28 +151,30 @@ func (p *Policy) Acquire(class core.Class, candidates []string, exclude map[stri
 
 // DryRun evaluates candidates like Acquire without creating a lease.
 func (p *Policy) DryRun(class core.Class, candidates []string) core.Decision {
+	c := p.cur.Load()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	_, dec := p.selectLocked(class, candidates, nil)
+	_, dec := p.selectLocked(c, class, candidates, nil)
 	return dec
 }
 
 // Status describes the admission state of one account.
 func (p *Policy) Status(accountID string) core.AccountState {
+	c := p.cur.Load()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	acct, ok := p.accounts[accountID]
+	acct, ok := c.accounts[accountID]
 	if !ok {
 		return core.AccountState{Reason: "unknown account"}
 	}
-	now := p.opts.Clock.Now()
+	now := c.opts.Clock.Now()
 	st := p.state[accountID]
 	snap, has := p.quota.Latest(accountID)
-	bgOK, bgReason := p.admitLocked(acct, core.ClassBackground, now)
-	inOK, inReason := p.admitLocked(acct, core.ClassInteractive, now)
+	bgOK, bgReason := p.admitLocked(c, acct, core.ClassBackground, now)
+	inOK, inReason := p.admitLocked(c, acct, core.ClassInteractive, now)
 	out := core.AccountState{
 		Inflight:              st.inflight,
-		Stale:                 p.isStale(snap, has, now),
+		Stale:                 p.isStale(c, snap, has, now),
 		BackgroundAdmissible:  bgOK,
 		InteractiveAdmissible: inOK,
 	}
@@ -133,20 +190,20 @@ func (p *Policy) Status(accountID string) core.AccountState {
 	return out
 }
 
-func (p *Policy) selectLocked(class core.Class, candidates []string, exclude map[string]bool) (string, core.Decision) {
-	now := p.opts.Clock.Now()
+func (p *Policy) selectLocked(c *cfg, class core.Class, candidates []string, exclude map[string]bool) (string, core.Decision) {
+	now := c.opts.Clock.Now()
 	var reasons []string
 	for _, id := range candidates {
 		if exclude[id] {
 			reasons = append(reasons, id+": excluded")
 			continue
 		}
-		acct, ok := p.accounts[id]
+		acct, ok := c.accounts[id]
 		if !ok {
 			reasons = append(reasons, id+": unknown account")
 			continue
 		}
-		if ok, why := p.admitLocked(acct, class, now); !ok {
+		if ok, why := p.admitLocked(c, acct, class, now); !ok {
 			reasons = append(reasons, id+": "+why)
 			continue
 		}
@@ -162,9 +219,10 @@ func (p *Policy) selectLocked(class core.Class, candidates []string, exclude map
 	return "", core.Decision{Reason: strings.Join(reasons, "; ")}
 }
 
-// admitLocked applies the admission rules to one account. It may clear an
-// expired or superseded cooldown. p.mu must be held.
-func (p *Policy) admitLocked(acct core.Account, class core.Class, now time.Time) (bool, string) {
+// admitLocked applies the admission rules to one account using configuration
+// generation c. It may clear an expired or superseded cooldown. p.mu must be
+// held.
+func (p *Policy) admitLocked(c *cfg, acct core.Account, class core.Class, now time.Time) (bool, string) {
 	st := p.state[acct.ID]
 	snap, has := p.quota.Latest(acct.ID)
 
@@ -188,7 +246,7 @@ func (p *Policy) admitLocked(acct core.Account, class core.Class, now time.Time)
 	}
 
 	background := class == core.ClassBackground
-	if p.isStale(snap, has, now) {
+	if p.isStale(c, snap, has, now) {
 		if background && hasReserve(acct) {
 			return false, "quota snapshot stale or missing; reserved account denies background"
 		}
@@ -203,9 +261,9 @@ func (p *Policy) admitLocked(acct core.Account, class core.Class, now time.Time)
 	margin := 0.0
 	if background {
 		leases++ // the request being admitted
-		margin = p.opts.SafetyMargin
+		margin = c.opts.SafetyMargin
 	}
-	load := float64(leases) * p.opts.InflightEstimate
+	load := float64(leases) * c.opts.InflightEstimate
 	for _, w := range snap.Windows {
 		used := effectiveUsed(w, now)
 		// A fully exhausted (unrolled) window refuses every class: the
@@ -231,18 +289,19 @@ func (p *Policy) admitLocked(acct core.Account, class core.Class, now time.Time)
 	return true, ""
 }
 
-func (p *Policy) isStale(snap core.Snapshot, has bool, now time.Time) bool {
-	return !has || now.Sub(snap.FetchedAt) > p.opts.StaleAfter
+func (p *Policy) isStale(c *cfg, snap core.Snapshot, has bool, now time.Time) bool {
+	return !has || now.Sub(snap.FetchedAt) > c.opts.StaleAfter
 }
 
 func (p *Policy) release(id string, o core.Outcome) {
-	now := p.opts.Clock.Now()
+	c := p.cur.Load()
+	now := c.opts.Clock.Now()
 	p.mu.Lock()
 	st := p.state[id]
 	if st.inflight > 0 {
 		st.inflight--
 	}
-	prepaid := p.accounts[id].Provider == core.ProviderOpenRouter
+	prepaid := c.accounts[id].Provider == core.ProviderOpenRouter
 	var until time.Time
 	switch o.Status {
 	case 429:
@@ -281,9 +340,90 @@ func (p *Policy) release(id string, o core.Outcome) {
 	p.mu.Unlock()
 
 	if !until.IsZero() {
-		p.opts.Logger.Info("account cooldown", "account", id, "status", o.Status, "until", until)
+		c.opts.Logger.Info("account cooldown", "account", id, "status", o.Status, "until", until)
 	}
 	p.quota.RequestRefresh(id, o.Status == 429 || prepaid && o.Status == 402)
+}
+
+// normalizeOptions fills in the process-identity and default values that are
+// pinned when a generation is built.
+func normalizeOptions(opts Options) Options {
+	if opts.StaleAfter <= 0 {
+		opts.StaleAfter = defaultStaleAfter
+	}
+	if opts.Clock == nil {
+		opts.Clock = core.SystemClock{}
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.DiscardHandler)
+	}
+	return opts
+}
+
+// buildCfg clones the caller's accounts (including each Reserve map) into one
+// immutable generation, so later caller mutation cannot reach the view.
+func buildCfg(accounts []core.Account, opts Options) *cfg {
+	m := make(map[string]core.Account, len(accounts))
+	for _, a := range accounts {
+		if a.Reserve != nil {
+			r := make(map[string]float64, len(a.Reserve))
+			for k, v := range a.Reserve {
+				r[k] = v
+			}
+			a.Reserve = r
+		}
+		m[a.ID] = a
+	}
+	return &cfg{accounts: m, opts: opts}
+}
+
+// validateAccounts rejects a topology change and any out-of-range reserve.
+// Account identity is restart-only, so only the reserve fractions may differ
+// between generations.
+func validateAccounts(existing map[string]core.Account, accounts []core.Account) error {
+	seen := make(map[string]bool, len(accounts))
+	for _, a := range accounts {
+		if a.ID == "" {
+			return fmt.Errorf("%w: empty account id", ErrInvalidConfig)
+		}
+		if seen[a.ID] {
+			return fmt.Errorf("%w: duplicate account id %q", ErrInvalidConfig, a.ID)
+		}
+		seen[a.ID] = true
+		prev, ok := existing[a.ID]
+		if !ok {
+			return fmt.Errorf("%w: account %q added", ErrTopologyChanged, a.ID)
+		}
+		if prev.Provider != a.Provider || prev.BaseURL != a.BaseURL ||
+			prev.QuotaSource != a.QuotaSource || prev.CostBasis != a.CostBasis {
+			return fmt.Errorf("%w: account %q identity changed", ErrTopologyChanged, a.ID)
+		}
+		for k, v := range a.Reserve {
+			if k != core.Window5h && k != core.WindowWeekly {
+				return fmt.Errorf("%w: account %s: reserve window %q must be 5h or weekly", ErrInvalidConfig, a.ID, k)
+			}
+			if v < 0 || v >= 1 {
+				return fmt.Errorf("%w: account %s: reserve %s must be in [0,1)", ErrInvalidConfig, a.ID, k)
+			}
+		}
+	}
+	for id := range existing {
+		if !seen[id] {
+			return fmt.Errorf("%w: account %q removed", ErrTopologyChanged, id)
+		}
+	}
+	return nil
+}
+
+// validateOptions rejects out-of-range reloadable knobs.
+func validateOptions(opts Options) error {
+	if opts.SafetyMargin < 0 || opts.SafetyMargin >= 1 {
+		return fmt.Errorf("%w: safety margin %v out of range [0,1)", ErrInvalidConfig, opts.SafetyMargin)
+	}
+	if opts.InflightEstimate < 0 || opts.InflightEstimate >= 1 {
+		return fmt.Errorf("%w: inflight estimate %v out of range [0,1)", ErrInvalidConfig, opts.InflightEstimate)
+	}
+	return nil
 }
 
 func effectiveUsed(w core.Window, now time.Time) float64 {

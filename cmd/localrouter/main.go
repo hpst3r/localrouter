@@ -104,11 +104,11 @@ func cmdCheck(args []string) error {
 	if err != nil {
 		return err
 	}
-	keyFiles := map[string]string{}
+	keyFiles := map[string][]string{}
 	for _, c := range cfg.Clients {
-		keyFiles[c.Name] = c.KeyFile
+		keyFiles[c.Name] = c.KeyPaths()
 	}
-	if _, err := auth.LoadClientKeys(keyFiles); err != nil {
+	if _, err := auth.LoadClientKeyFiles(keyFiles); err != nil {
 		return fmt.Errorf("client keys: %w", err)
 	}
 	fmt.Printf("config OK: %d clients, %d accounts, %d routes; data_dir=%s\n",
@@ -246,6 +246,11 @@ func cmdServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	// Record the resolved config path the running config came from so a SIGHUP
+	// re-reads exactly the same file. It is read after a successful load, so a
+	// parse failure never leaves a half-resolved path behind. The path is
+	// passed to Reload explicitly, so the app need not retain it.
+	cfgPath := fs.Lookup("config").Value.String()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	a, err := app.Build(cfg, logger, app.Overrides{})
 	if err != nil {
@@ -256,6 +261,22 @@ func cmdServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	a.Start(ctx)
+
+	// SIGHUP reloads the reloadable configuration subset in place. The trigger
+	// only exists on platforms that have SIGHUP; on Windows the loop is not
+	// started and the in-process reload seam remains callable. Reload is
+	// serialized inside the app, and the buffered channel coalesces a burst of
+	// rapid signals (last-wins) under normal Go semantics.
+	if sig := reloadSignal(); sig != nil {
+		if r := appReloader(a, logger); r != nil {
+			hup := make(chan os.Signal, 1)
+			signal.Notify(hup, sig)
+			// Stop restores the default SIGHUP disposition on shutdown; the
+			// loop exits with ctx, so no goroutine outlives the process.
+			defer signal.Stop(hup)
+			go reloadLoop(ctx, r, logger, cfgPath, hup)
+		}
+	}
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {

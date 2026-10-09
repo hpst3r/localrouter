@@ -83,7 +83,11 @@ type diagnosticsDoc struct {
 	Ready         bool               `json:"ready"`
 	Storage       storageHealth      `json:"storage"`
 	Inflight      core.InflightStats `json:"inflight"`
-	Accounts      []diagAccount      `json:"accounts"`
+	// Reload is the sanitized last reload attempt. It is present only when the
+	// reload seam is wired; a server without one omits the block rather than
+	// fabricating a generation.
+	Reload   *core.ReloadStatus `json:"reload,omitempty"`
+	Accounts []diagAccount      `json:"accounts"`
 }
 
 type storageHealth struct {
@@ -124,6 +128,7 @@ func (s *Server) diagnostics(w http.ResponseWriter, r *http.Request) {
 		Ready:         ready,
 		Storage:       sh,
 		Inflight:      s.inflightStats(),
+		Reload:        s.reloadStatus(),
 		Accounts:      make([]diagAccount, 0, len(s.deps.Accounts)),
 	}
 	for _, a := range s.deps.Accounts {
@@ -141,6 +146,20 @@ func (s *Server) inflightStats() core.InflightStats {
 		st.Clients = []core.ClientInflight{}
 	}
 	return st
+}
+
+// reloadStatus snapshots the last reload attempt for diagnostics. A nil seam
+// means no reload surface is wired: the block is omitted entirely rather than
+// reporting a fabricated generation 0. The returned copy is normalized so the
+// document never emits a secret or a non-UTC timestamp, and a nil RestartOnly
+// stays omitted (it is only set on a restart-only rejection).
+func (s *Server) reloadStatus() *core.ReloadStatus {
+	if s.deps.ReloadStatus == nil {
+		return nil
+	}
+	st := s.deps.ReloadStatus()
+	st.At = st.At.UTC()
+	return &st
 }
 
 func (s *Server) storageHealth() storageHealth {

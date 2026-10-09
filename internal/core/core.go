@@ -385,6 +385,28 @@ type InflightStats struct {
 	Clients      []ClientInflight `json:"clients"`
 }
 
+// ReloadStatus is the sanitized result of one configuration reload attempt,
+// surfaced by the authenticated diagnostics endpoint and CLI logs. It carries
+// no secrets: Reason is a fixed cause class and RestartOnly names config keys,
+// never values, key material or filesystem secret paths. On a failed attempt
+// Generation reports the still-serving generation (it does not advance), so a
+// reader can never observe a generation that is not the one serving requests.
+type ReloadStatus struct {
+	// Generation counts successful publishes: 1 after startup, +1 per
+	// accepted reload. It never lags the published handler.
+	Generation uint64 `json:"generation"`
+	// OK is true when the last attempt published a new generation.
+	OK bool `json:"ok"`
+	// At is when the last attempt was made (UTC in the diagnostics document).
+	At time.Time `json:"at"`
+	// Reason is a sanitized failure cause ("restart required", "busy",
+	// "config parse", …); empty on success. Never a raw error or secret path.
+	Reason string `json:"reason,omitempty"`
+	// RestartOnly lists the config keys that forced a rejection because they
+	// are applied only on restart (names, never values).
+	RestartOnly []string `json:"restart_only,omitempty"`
+}
+
 // Clock allows tests to control time.
 type Clock interface{ Now() time.Time }
 
