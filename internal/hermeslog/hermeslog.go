@@ -12,6 +12,11 @@
 //
 // Rows whose billing_base_url points at this router are skipped: that
 // traffic is already in the ledger from the proxy.
+//
+// Rows are held to the server's ingest bounds: counters and token totals in
+// [0, 1e12] and last_seen within [now-400d, now+5m]. Implausible rows are
+// skipped (Stats.SkippedInvalid) and rebased so they are not re-reported;
+// labels are bounded with core.TruncateLabel.
 package hermeslog
 
 import (
@@ -47,6 +52,7 @@ type Options struct {
 	SelfHosts    []string
 	StatePath    string
 	ScanInterval time.Duration
+	Clock        core.Clock // default core.SystemClock
 	Logger       *slog.Logger
 }
 
@@ -56,6 +62,12 @@ type Stats struct {
 	Rows        int
 	Recorded    int
 	SkippedSelf int
+	// SkippedInvalid counts rows not recorded because their counters or
+	// last_seen are implausible (see plausible).
+	SkippedInvalid int
+	// Dropped counts rows the ledger permanently rejected (an error with
+	// Permanent() == true); they are rebased so the scan can advance.
+	Dropped int
 }
 
 type counters struct {
@@ -96,6 +108,9 @@ func New(ledger core.Ledger, opts Options) *Collector {
 	}
 	if opts.Client == "" {
 		opts.Client = "hermes"
+	}
+	if opts.Clock == nil {
+		opts.Clock = core.SystemClock{}
 	}
 	c := &Collector{ledger: ledger, opts: opts, seen: map[string]counters{}}
 	c.loadState()
@@ -145,7 +160,7 @@ func (c *Collector) ScanOnce(ctx context.Context) (Stats, error) {
 			errs = append(errs, fmt.Errorf("profile %s: %w", db[0], err))
 		}
 	}
-	if st.Recorded > 0 {
+	if st.Recorded > 0 || st.SkippedInvalid > 0 || st.Dropped > 0 {
 		if err := c.saveState(); err != nil {
 			errs = append(errs, fmt.Errorf("save state: %w", err))
 		}
@@ -188,6 +203,7 @@ func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats)
 		rec core.RequestRecord
 	}
 	var todo []pending
+	skipped := 0
 	for rows.Next() {
 		var (
 			sess, model, prov, baseURL, mode, task, parent, repo, cwd, source string
@@ -205,9 +221,10 @@ func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats)
 			continue
 		}
 		key := strings.Join([]string{profile, sess, model, prov, baseURL, mode, task}, "\x1f")
-		prev := c.seen[key]
-		if prev.less(cur) {
-			// Counters went backwards (session rewritten/reset): rebase.
+		prev, had := c.seen[key]
+		if prev.less(cur) || !prev.inRange() {
+			// Counters went backwards (session rewritten/reset), or the last
+			// values seen were implausible: rebase without recording.
 			c.seen[key] = cur
 			continue
 		}
@@ -215,14 +232,35 @@ func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats)
 		if d.zero() {
 			continue
 		}
-		todo = append(todo, pending{key: key, cur: cur, rec: c.record(key, profile, sess, model, prov, task, parent, repo, cwd, lastSeen, cur, d)})
+		rec := c.record(key, profile, sess, model, prov, task, parent, repo, cwd, lastSeen, cur, d)
+		if why := c.implausible(cur, rec, lastSeen); why != "" {
+			// Rebase so the row is not re-reported every scan; only later
+			// increases from plausible counters are recorded.
+			c.seen[key] = cur
+			st.SkippedInvalid++
+			skipped++
+			c.opts.Logger.Debug("hermeslog: skipping implausible row", "profile", profile, "reason", why, "known", had)
+			continue
+		}
+		todo = append(todo, pending{key: key, cur: cur, rec: rec})
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	if skipped > 0 {
+		c.opts.Logger.Info("hermeslog: skipped implausible rows", "profile", profile, "rows", skipped)
+	}
 	for _, p := range todo {
 		if err := c.ledger.Record(ctx, p.rec); err != nil {
-			return err // state for later rows not advanced; retried next scan
+			var pe interface{ Permanent() bool }
+			if !errors.As(err, &pe) || !pe.Permanent() {
+				return err // state for later rows not advanced; retried next scan
+			}
+			// Rejected as invalid; resending cannot succeed.
+			c.opts.Logger.Warn("hermeslog: ledger rejected record; dropping", "profile", profile, "id", p.rec.ID, "err", err)
+			c.seen[p.key] = p.cur
+			st.Dropped++
+			continue
 		}
 		c.seen[p.key] = p.cur
 		st.Recorded++
@@ -233,8 +271,8 @@ func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats)
 func (c *Collector) record(key, profile, sess, model, prov, task, parent, repo, cwd string, lastSeen float64, cur, d counters) core.RequestRecord {
 	idSrc := fmt.Sprintf("%s\x1f%d/%d/%d/%d/%d/%d", key, cur.Calls, cur.Input, cur.Output, cur.CacheRead, cur.CacheWrite, cur.Reasoning)
 	sum := sha256.Sum256([]byte(idSrc))
-	ts := time.Now().UTC()
-	if lastSeen > 0 && !math.IsNaN(lastSeen) {
+	ts := c.opts.Clock.Now().UTC()
+	if lastSeen > 0 && lastSeen <= maxUnixSeconds {
 		sec, frac := math.Modf(lastSeen)
 		ts = time.Unix(int64(sec), int64(frac*1e9)).UTC()
 	}
@@ -259,11 +297,11 @@ func (c *Collector) record(key, profile, sess, model, prov, task, parent, repo, 
 		ID:         "hermes:" + hex.EncodeToString(sum[:])[:32],
 		StartedAt:  ts,
 		FinishedAt: ts,
-		Client:     client,
+		Client:     core.TruncateLabel(client),
 		Class:      core.ClassInteractive,
 		Route:      "hermes",
-		Model:      model,
-		Provider:   prov,
+		Model:      core.TruncateLabel(model),
+		Provider:   core.TruncateLabel(prov),
 		AccountID:  c.account(prov, model),
 		Status:     200,
 		Usage: core.Usage{
@@ -276,11 +314,55 @@ func (c *Collector) record(key, profile, sess, model, prov, task, parent, repo, 
 			ReasoningTokens:          d.Reasoning,
 		},
 		UsageKnown: true,
-		Session:    sess,
-		Task:       project,
-		Agent:      agent,
+		Session:    core.TruncateLabel(sess),
+		Task:       core.TruncateLabel(project),
+		Agent:      core.TruncateLabel(agent),
 		Host:       c.opts.Host,
 	}
+}
+
+// Plausibility bounds, matching the server's ingest validation.
+const (
+	maxFuture = 5 * time.Minute
+	maxAge    = 400 * 24 * time.Hour
+	// maxUnixSeconds bounds last_seen before conversion to int64 (year 5138);
+	// larger values and +Inf are implausible rather than converted.
+	maxUnixSeconds = 1e11
+)
+
+// inRange reports whether every counter is within [0, core.MaxRecordTokens].
+// Deltas between two in-range counters cannot overflow.
+func (a counters) inRange() bool {
+	for _, v := range []int64{a.Calls, a.Input, a.Output, a.CacheRead, a.CacheWrite, a.Reasoning} {
+		if v < 0 || v > core.MaxRecordTokens {
+			return false
+		}
+	}
+	return true
+}
+
+// implausible returns why a row must not be recorded, or "" if it is
+// plausible: cumulative counters out of range, a token total above
+// core.MaxRecordTokens, or a last_seen that is non-finite or outside
+// [now-400d, now+5m].
+func (c *Collector) implausible(cur counters, rec core.RequestRecord, lastSeen float64) string {
+	if !cur.inRange() {
+		return "counters out of range"
+	}
+	u := rec.Usage
+	for _, v := range []int64{u.InputTokens, u.CachedInputTokens, u.CacheCreationInputTokens, u.OutputTokens, u.ReasoningTokens} {
+		if v < 0 || v > core.MaxRecordTokens {
+			return "implausible usage"
+		}
+	}
+	if lastSeen > maxUnixSeconds || math.IsInf(lastSeen, 0) {
+		return "bad last_seen"
+	}
+	now := c.opts.Clock.Now()
+	if rec.StartedAt.IsZero() || rec.StartedAt.After(now.Add(maxFuture)) || rec.StartedAt.Before(now.Add(-maxAge)) {
+		return "timestamp out of range"
+	}
+	return ""
 }
 
 func (c *Collector) account(prov, model string) string {

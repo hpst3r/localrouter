@@ -24,8 +24,9 @@
 // PermanentError with Permanent() == true (e.g. *agent.HTTPError for
 // 400/413/422) instead bisects the chunk, records the accepted records, and
 // drops only the rejected ones (Stats.Dropped), so the file still advances.
-// Lines the server would reject (negative or >1e12 usage, no timestamp) are
-// skipped at parse time.
+// Lines the server would reject (negative or >1e12 usage, missing timestamp
+// or one outside [now-400d, now+5m]) are skipped at parse time. Labels
+// (model, session, project, client) are bounded with core.TruncateLabel.
 //
 // Each API message is recorded once its usage is final, under the ID
 // "claude:" + hex(sha256(message.id + ":" + requestId))[:32], so re-ingestion
