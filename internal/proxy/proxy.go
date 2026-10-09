@@ -44,6 +44,21 @@ type Deps struct {
 	Authenticate func(bearer string) (core.Client, bool)
 	Clock        core.Clock
 	Logger       *slog.Logger
+	// Limiter bounds concurrent inference requests. It is consulted after
+	// authentication and before the request body is read, and the slot is held
+	// until the response (including any stream and every failover attempt) has
+	// fully ended. Nil means unlimited.
+	Limiter Limiter
+}
+
+// Limiter bounds how many inference requests may be active at once. It is
+// satisfied by internal/connlim.Controller; the proxy depends on the behaviour
+// rather than the concrete type so the limit lives at the inbound edge.
+type Limiter interface {
+	// Acquire reserves a slot for client, reporting false when the limit is
+	// saturated. The returned release must be called exactly once however the
+	// request ends.
+	Acquire(client string) (release func(), ok bool)
 }
 
 // Options tune proxy behaviour.
@@ -207,6 +222,19 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 		class = core.ClassBackground
 	}
 
+	// Concurrency admission happens after authentication (unknown clients
+	// cannot burn slots) and before the body is read (a rejected request does
+	// no work). The slot is held until forward returns, i.e. for the whole
+	// response including streams, aborts and every failover attempt.
+	if p.deps.Limiter != nil {
+		release, ok := p.deps.Limiter.Acquire(client.Name)
+		if !ok {
+			writeConcurrencyLimit(w, r)
+			return
+		}
+		defer release()
+	}
+
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, p.opts.MaxBodyBytes))
 	if err != nil {
 		var mbe *http.MaxBytesError
@@ -345,6 +373,20 @@ func writeError(w http.ResponseWriter, status int, msg, typ string) {
 func writeUnauthorized(w http.ResponseWriter) {
 	w.Header().Set("WWW-Authenticate", `Bearer realm="localrouter"`)
 	writeError(w, http.StatusUnauthorized, "localrouter: invalid or missing client key", "invalid_request_error")
+}
+
+// concurrencyRetryAfter is the Retry-After hint for a saturated concurrency
+// limit. It is short: a slot frees as soon as any in-flight request finishes.
+const concurrencyRetryAfter = "1"
+
+// writeConcurrencyLimit rejects a request refused by the concurrency limiter.
+// The error names the concurrency limit explicitly (type and message) so it is
+// never mistaken for a quota/admission rejection, and advertises Retry-After.
+func writeConcurrencyLimit(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Retry-After", concurrencyRetryAfter)
+	writeError(w, http.StatusTooManyRequests,
+		"localrouter: concurrency limit reached; retry shortly",
+		"concurrency_limit_exceeded")
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

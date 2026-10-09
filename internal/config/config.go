@@ -33,6 +33,8 @@ type Config struct {
 	Quota       QuotaConfig      `yaml:"quota"`
 	Policy      PolicyConfig     `yaml:"policy"`
 	Control     ControlConfig    `yaml:"control"`
+	Limits      LimitsConfig     `yaml:"limits"`
+	Timeouts    TimeoutsConfig   `yaml:"timeouts"`
 	Clients     []ClientConfig   `yaml:"clients"`
 	Accounts    []AccountConfig  `yaml:"accounts"`
 	Routes      []RouteConfig    `yaml:"routes"`
@@ -81,6 +83,32 @@ type PolicyConfig struct {
 
 type ControlConfig struct {
 	RequireAuth bool `yaml:"require_auth"`
+}
+
+// LimitsConfig bounds how many inference requests may be active at once.
+// Zero (the default) means unlimited, which keeps the feature backwards
+// compatible; negative values are rejected.
+type LimitsConfig struct {
+	// MaxConcurrent is the global cap on active inference requests. 0 = unlimited.
+	MaxConcurrent int `yaml:"max_concurrent"`
+	// MaxConcurrentPerClient caps a single authenticated client. Clients not
+	// listed here are limited only by the global cap. 0 = unlimited.
+	MaxConcurrentPerClient map[string]int `yaml:"max_concurrent_per_client"`
+}
+
+// TimeoutsConfig bounds inbound request handling. Every value must be
+// positive (0 selects the default; negative is rejected). These are inbound
+// read/idle deadlines only: there is deliberately no overall write or request
+// timeout, which would truncate healthy long-lived SSE streams.
+type TimeoutsConfig struct {
+	// Header bounds reading request headers and the request line.
+	Header Duration `yaml:"header"`
+	// Body bounds reading a request body (inference, ingest and admit).
+	Body Duration `yaml:"body"`
+	// Idle is the keep-alive idle timeout between requests on a connection.
+	Idle Duration `yaml:"idle"`
+	// Shutdown is how long a graceful shutdown drains in-flight requests.
+	Shutdown Duration `yaml:"shutdown"`
 }
 
 type ClientConfig struct {
@@ -176,6 +204,18 @@ func (c *Config) applyDefaults(baseDir string) {
 	}
 	if c.Policy.MaxFailovers == 0 {
 		c.Policy.MaxFailovers = 2
+	}
+	if c.Timeouts.Header == 0 {
+		c.Timeouts.Header = Duration(10 * time.Second)
+	}
+	if c.Timeouts.Body == 0 {
+		c.Timeouts.Body = Duration(30 * time.Second)
+	}
+	if c.Timeouts.Idle == 0 {
+		c.Timeouts.Idle = Duration(120 * time.Second)
+	}
+	if c.Timeouts.Shutdown == 0 {
+		c.Timeouts.Shutdown = Duration(30 * time.Second)
 	}
 	for i := range c.Clients {
 		c.Clients[i].KeyFile = expand(c.Clients[i].KeyFile, baseDir)
@@ -317,6 +357,27 @@ func (c *Config) Validate() error {
 	if c.Policy.InflightEstimate < 0 || c.Policy.InflightEstimate >= 1 {
 		errs = append(errs, errors.New("policy.inflight_estimate must be in [0,1)"))
 	}
+	if c.Limits.MaxConcurrent < 0 {
+		errs = append(errs, errors.New("limits.max_concurrent must not be negative (0 = unlimited)"))
+	}
+	for name, lim := range c.Limits.MaxConcurrentPerClient {
+		if lim < 0 {
+			errs = append(errs, fmt.Errorf("limits.max_concurrent_per_client[%s] must not be negative (0 = unlimited)", name))
+		}
+	}
+	for _, to := range []struct {
+		name string
+		d    Duration
+	}{
+		{"header", c.Timeouts.Header},
+		{"body", c.Timeouts.Body},
+		{"idle", c.Timeouts.Idle},
+		{"shutdown", c.Timeouts.Shutdown},
+	} {
+		if to.d < 0 {
+			errs = append(errs, fmt.Errorf("timeouts.%s must not be negative", to.name))
+		}
+	}
 	if len(c.Clients) == 0 {
 		errs = append(errs, errors.New("at least one client is required"))
 	}
@@ -334,6 +395,11 @@ func (c *Config) Validate() error {
 		}
 		if strings.ContainsAny(cl.Host, " /\\") {
 			errs = append(errs, fmt.Errorf("client %s: host %q invalid", cl.Name, cl.Host))
+		}
+	}
+	for name := range c.Limits.MaxConcurrentPerClient {
+		if !seenC[name] {
+			errs = append(errs, fmt.Errorf("limits.max_concurrent_per_client names unknown client %q", name))
 		}
 	}
 	accts := map[string]bool{}

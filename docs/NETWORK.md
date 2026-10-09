@@ -12,7 +12,7 @@ See [README](../README.md) for the build and basic setup, [server example](../co
 - `allowed_hosts` checks the HTTP Host header to protect browsers against DNS rebinding. **It is not a source-IP ACL.** Enforce access with network access controls and the host firewall.
 - **Use HTTPS for all networked deployments.** HTTP is possible, but should only ever be considered when an encrypted network overlay (such as Tailscale or NetBird) protects the entire client-to-router connection. Do not publish this listener to the Internet.
 - The widget stores its bearer key in browser localStorage. Use a trusted browser profile; clear the saved key/site storage on shared machines. The key retains its normal inference/ingestion permissions.
-- Body-size limits and upstream timeouts exist, but there is no hard per-client rate/concurrency cap or explicit inbound body-read/idle timeout. Trusted clients and restricted reachability remain important.
+- Body-size limits, optional per-client/global inference concurrency limits (`limits`), and inbound read/idle timeouts (`timeouts`) exist, but there is no rate limiter. Trusted clients and restricted reachability remain important.
 - Claude inference remains on the official Claude CLI. Agents read Claude credentials locally for quota polling; they send usage metadata and snapshots, not Claude tokens or transcript content, to the router.
 
 ## 1. Prepare the router
@@ -127,8 +127,13 @@ The following shell examples assume curl and Python 3, an HTTPS URL with a certi
 ROUTER_URL=https://router.example.com:8787
 KEY_FILE="$HOME/.config/localrouter/agent.key"
 
-# 200 + "ok": HTTPS reachability only, no authentication/provider test.
+# 200 + "ok": liveness only — the process is answering. Says nothing about
+# readiness, authentication, or upstream/provider health.
 curl --fail-with-body --silent --show-error "$ROUTER_URL/healthz"
+
+# 200 {"ready":true}: local readiness (willing to serve + storage ping ok).
+# Still says nothing about upstream provider health; 503 means not ready.
+curl --fail-with-body --silent --show-error "$ROUTER_URL/readyz"
 
 # 401: shared control data is not accessible without a key.
 curl --silent --show-error --output /dev/null --write-out '%{http_code}\n' \
@@ -153,7 +158,9 @@ python3 -c 'import pathlib,sys; k=pathlib.Path(sys.argv[1]).read_text().strip();
   --class background --account claude-max --json
 ```
 
-The key-to-curl helper assumes an unmodified `localrouter keygen` key. `admit` exits 0 for allow, 1 for deny, and 2 for an error. Open the widget at the same base URL and enter a valid key. For inference, use `<base URL>/v1` and the appropriate interactive/background client key. A real model request is a separate, quota-consuming acceptance test; `/healthz`, `/v1/models`, and `admit` do not prove upstream inference works.
+The key-to-curl helper assumes an unmodified `localrouter keygen` key. `admit` exits 0 for allow, 1 for deny, and 2 for an error. Open the widget at the same base URL and enter a valid key. For inference, use `<base URL>/v1` and the appropriate interactive/background client key.
+
+These checks have distinct meanings: `/healthz` is **liveness** (the process answers), while `/readyz` is **local readiness** (willing to serve and local storage healthy). An upstream outage does not make the router locally unready; inspect account health, freshness, and reasons in status or diagnostics instead. Only a successful real model request verifies **upstream inference**. That test consumes quota; `/healthz`, `/readyz`, `/v1/models`, and `admit` do not substitute for it.
 
 ## Troubleshooting
 
@@ -168,6 +175,8 @@ The key-to-curl helper assumes an unmodified `localrouter keygen` key. `admit` e
 | Stale Claude quota | Agent running? `quota_interval` enabled? Correct account with `quota_source: agent`? Claude login/token current? Clocks synchronized? Run the official Claude CLI to refresh its own credentials. |
 | Missing usage | Correct projects directory, agent key/account, journal errors, successful batches and intact source transcripts. Allow a scan interval/finalization delay for recent messages. |
 | Background denied | Reserve/cooldown/exhausted window or stale reserved account; inspect status reason. Interactive may still be admissible. |
+| `429` `concurrency_limit_exceeded` | Inference concurrency `limits` reached (global or per-client). Retry after the `Retry-After` hint; raise the limit only if intended. Not a quota/admission denial. |
+| `/readyz` returns 503 while `/healthz` is ok | Local readiness failed (shutting down or storage ping error). Inspect diagnostics `storage`; upstream health is unrelated. |
 | Writes fail only under systemd | Custom data/state paths are outside the supplied sandbox's `ReadWritePaths`. |
 
 A fresh quota snapshot and recent host usage are separate signals: usage can push while quota polling fails, and quota can refresh on a host with no new transcript usage.

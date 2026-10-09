@@ -13,6 +13,20 @@ policy:
   inflight_estimate: 0.01 # assumed fraction consumed per in-flight request
   max_failovers: 2
 
+# Concurrency limits and inbound timeouts are optional; the values below are
+# the defaults. Both reject negative values at load; 0 means unlimited / use
+# the default.
+limits:
+  max_concurrent: 0              # global cap on active inference requests; 0 = unlimited
+  # max_concurrent_per_client:   # per-client caps keyed by registered client name
+  #   me: 4                      # 0 = unlimited for that client
+
+timeouts:
+  header: 10s                    # request header/request-line read deadline
+  body: 30s                      # request body read deadline (lifted once the body is read)
+  idle: 120s                     # keep-alive idle timeout between requests
+  shutdown: 30s                  # graceful drain budget on shutdown
+
 clients:
   - name: me
     class: interactive

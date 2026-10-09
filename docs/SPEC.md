@@ -142,6 +142,28 @@ Failover: proxy may retry on the next admissible account ONLY if no response
 bytes were sent to the client and status was 429/401/403/5xx-before-body.
 Max 2 failovers. Each attempt is a separate ledger row.
 
+## Concurrency limits and inbound timeouts
+
+`limits.max_concurrent` (global) and `limits.max_concurrent_per_client`
+(map of registered client name → cap) bound how many inference requests may be
+active at once. 0 (the default) means unlimited; negative values are rejected
+at load, as is a `max_concurrent_per_client` entry naming an unknown client. A
+request's slot is acquired **after authentication and before the request body
+is read**, and held for the entire request — including any streamed response
+and every failover attempt — so it is released only when the request truly
+ends. A refused request returns `429` with
+`{"error":{"type":"concurrency_limit_exceeded"}}` and `Retry-After: 1` without
+contacting an upstream, and the condition is distinct from a quota/admission
+denial. Non-inference surfaces (`/v1/models`, `/control/v1/ingest`, control
+endpoints) are not counted.
+
+`timeouts.header|body|idle|shutdown` bound inbound handling: `header` is the
+`ReadHeaderTimeout`, `body` is a read deadline lifted as soon as the body is
+fully read (so it never truncates a long-lived SSE response), `idle` is the
+keep-alive `IdleTimeout`, and `shutdown` is the graceful-drain budget. There is
+deliberately no overall write or request timeout. A value of 0 selects the
+default (10s / 30s / 120s / 30s); negative values are rejected.
+
 ## Ledger
 
 SQLite (pure Go `modernc.org/sqlite`), WAL, file `<data_dir>/localrouter.db`.
@@ -236,7 +258,17 @@ key.
 - `GET /` → single embedded HTML page (no external assets/CDNs), the
   analytics dashboard (see "Widget" below); polls every 30s while the tab is
   visible.
-- `GET /healthz` → `ok`.
+- `GET /healthz` → `ok` (liveness only: the process is answering).
+- `GET /readyz` → `{"ready":true|false}` (unauthenticated, minimal; 503 when
+  not ready). Readiness is local — the process is willing to serve and local
+  storage answers a bounded ping. It deliberately says nothing about upstream
+  provider health; an upstream outage is not a local readiness failure.
+- `GET /control/v1/diagnostics` (auth like `status`) → `{schema_version, now,
+  ready, storage:{configured, ok, error?}, inflight:{global_limit,
+  global_active, global_peak, clients:[{name, limit, active}]},
+  accounts:[{id, provider, healthy, stale, cooldown, reason,
+  snapshot_age_s}]}`. Authenticated diagnostics; a limit of 0 means unlimited;
+  no keys, secret paths, prompt content or per-account quota windows.
 
 ## Logging
 

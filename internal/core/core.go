@@ -319,6 +319,22 @@ type Route struct {
 	Background    []string
 }
 
+// ClientInflight is one client's concurrency usage. Limit 0 means unlimited.
+type ClientInflight struct {
+	Name   string `json:"name"`
+	Limit  int    `json:"limit"`
+	Active int    `json:"active"`
+}
+
+// InflightStats is a snapshot of inference concurrency, reported by the
+// authenticated diagnostics endpoint. GlobalLimit 0 means unlimited.
+type InflightStats struct {
+	GlobalLimit  int              `json:"global_limit"`
+	GlobalActive int              `json:"global_active"`
+	GlobalPeak   int              `json:"global_peak"`
+	Clients      []ClientInflight `json:"clients"`
+}
+
 // Clock allows tests to control time.
 type Clock interface{ Now() time.Time }
 

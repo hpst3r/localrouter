@@ -12,13 +12,18 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/hpst3r/localrouter/internal/auth"
 	"github.com/hpst3r/localrouter/internal/claudelog"
 	"github.com/hpst3r/localrouter/internal/config"
+	"github.com/hpst3r/localrouter/internal/connlim"
 	"github.com/hpst3r/localrouter/internal/control"
 	"github.com/hpst3r/localrouter/internal/core"
 	"github.com/hpst3r/localrouter/internal/hermeslog"
+	"github.com/hpst3r/localrouter/internal/httpguard"
 	"github.com/hpst3r/localrouter/internal/ledger"
 	"github.com/hpst3r/localrouter/internal/policy"
 	"github.com/hpst3r/localrouter/internal/proxy"
@@ -35,6 +40,15 @@ type Overrides struct {
 	Clock          core.Clock
 }
 
+// Timeouts are the resolved inbound server deadlines. They are read from
+// config (with finite defaults) and applied by Serve.
+type Timeouts struct {
+	Header   time.Duration // request line + headers
+	Body     time.Duration // reading a request body (inference, ingest, admit)
+	Idle     time.Duration // keep-alive idle between requests
+	Shutdown time.Duration // graceful drain budget
+}
+
 // App is a fully wired LocalRouter instance.
 type App struct {
 	Handler http.Handler
@@ -46,6 +60,30 @@ type App struct {
 	ClaudeLog *claudelog.Collector
 	// HermesLog is nil unless hermes_logs.enabled.
 	HermesLog *hermeslog.Collector
+
+	// Limiter is the shared inference concurrency controller. It bounds active
+	// requests at the proxy and is reported to diagnostics. Non-nil even when
+	// no limit is configured (then unlimited).
+	Limiter *connlim.Controller
+	// BodyGuard applies the configured body-read deadline around Handler.
+	BodyGuard *httpguard.BodyTimeout
+	// Timeouts are the deadlines Serve applies.
+	Timeouts Timeouts
+	// TLSCertFile and TLSKeyFile, when set, make Serve terminate TLS.
+	TLSCertFile, TLSKeyFile string
+	// Logger is the server logger.
+	Logger *slog.Logger
+
+	serving atomic.Bool
+
+	// srvMu guards the one-shot Serve lifecycle fields below. Serve publishes
+	// an active server to at most one caller; Shutdown may run concurrently on
+	// any goroutine, so a.srv is never read, and started/stopped are never
+	// mutated, without holding srvMu.
+	srvMu   sync.Mutex
+	srv     *http.Server
+	started bool
+	stopped bool
 }
 
 // StaticKeys maps non-codex accounts to their key sources.
@@ -150,9 +188,14 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		Clock:            clock,
 		Logger:           logger,
 	})
+	lim, err := connlim.New(cfg.Limits.MaxConcurrent, cfg.Limits.MaxConcurrentPerClient)
+	if err != nil {
+		return nil, fmt.Errorf("concurrency limits: %w", err)
+	}
 	px := proxy.New(proxy.Deps{
 		Accounts: acctMap, Routes: routes, Creds: creds, Quota: qm, Policy: pol,
 		Ledger: led, Authenticate: authenticate, Clock: clock, Logger: logger,
+		Limiter: lim,
 	}, proxy.Options{MaxFailovers: cfg.Policy.MaxFailovers})
 	ctlDeps := control.Deps{
 		Accounts: accounts, Quota: qm, Policy: pol, Ledger: led, Routes: routes,
@@ -165,6 +208,16 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		ctlDeps.Ingester = ing
 		ctlDeps.IsSnapshotStale = func(err error) bool { return errors.Is(err, quota.ErrSnapshotStale) }
 	}
+	// Diagnostics and readiness seams (owned by control). Storage is installed
+	// only when the ledger actually exposes a bounded ping, so this wiring
+	// keeps compiling across the control/ledger work and self-connects as soon
+	// as it lands.
+	if p, ok := any(led).(control.StoragePinger); ok {
+		ctlDeps.Storage = p
+	}
+	ctlDeps.Inflight = inflightReporter{lim}
+	var a *App
+	ctlDeps.Ready = func() bool { return a != nil && a.Serving() }
 	ctl := control.New(ctlDeps, control.Options{RequireAuth: cfg.Control.RequireAuth, StaleAfter: cfg.Policy.StaleAfter.D()})
 
 	mux := http.NewServeMux()
@@ -177,7 +230,18 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		allowed = cfg.AllowedHosts
 	}
 	h := HostGuard(allowed, mux)
-	a := &App{Handler: h, Quota: qm, Policy: pol, Ledger: led, Auth: creds}
+	a = &App{
+		Handler: h, Quota: qm, Policy: pol, Ledger: led, Auth: creds,
+		Limiter: lim, BodyGuard: httpguard.NewBodyTimeout(cfg.Timeouts.Body.D()),
+		Timeouts: Timeouts{
+			Header:   cfg.Timeouts.Header.D(),
+			Body:     cfg.Timeouts.Body.D(),
+			Idle:     cfg.Timeouts.Idle.D(),
+			Shutdown: cfg.Timeouts.Shutdown.D(),
+		},
+		TLSCertFile: cfg.TLSCertFile, TLSKeyFile: cfg.TLSKeyFile, Logger: logger,
+	}
+	a.serving.Store(true)
 	if cfg.ClaudeLogs.Enabled {
 		a.ClaudeLog = claudelog.New(led, claudelog.Options{
 			Dir:          cfg.ClaudeLogs.Dir,
@@ -219,6 +283,17 @@ func selfHosts(listen string) []string {
 		}
 	}
 	return out
+}
+
+// inflightReporter adapts the concurrency controller to the control server's
+// diagnostics seam without the control package depending on connlim.
+type inflightReporter struct{ c *connlim.Controller }
+
+func (r inflightReporter) InflightStats() core.InflightStats {
+	if r.c == nil {
+		return core.InflightStats{}
+	}
+	return r.c.Stats()
 }
 
 // Start begins background quota polling until ctx is cancelled.
