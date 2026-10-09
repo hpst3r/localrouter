@@ -170,7 +170,33 @@ type Outcome struct {
 	UsageKnown    bool
 	BytesToClient int64
 	ResetAt       time.Time // from 429 handling if known
+	// RequestScoped marks a failure caused by this request rather than by the
+	// account (e.g. an unaffordable max_tokens 402 while the balance is known
+	// positive, a moderation 403, or a 429 without account-exhaustion
+	// evidence). The policy must not put the account into cooldown for it,
+	// so one client cannot lock every other client out of an account.
+	RequestScoped bool
 }
+
+// Input bounds shared by every ledger writer (proxy, ingest, local
+// collectors) so no path accepts values another path would reject.
+const (
+	// MaxLabelBytes bounds free-form labels (session, task, agent, model,
+	// route, class) stored in the ledger. Longer values are truncated on a
+	// UTF-8 boundary by trusted local writers and rejected at ingest.
+	MaxLabelBytes = 128
+	// MaxErrorBytes bounds a stored error string.
+	MaxErrorBytes = 256
+	// MaxRecordTokens bounds each usage token field of one record.
+	MaxRecordTokens int64 = 1_000_000_000_000
+	// MaxReportedCostUSD bounds a provider-reported per-request cost.
+	// Larger (or non-finite/negative) values are treated as unusable.
+	MaxReportedCostUSD = 1e6
+	// MaxPricePerMTokUSD bounds any configured or imported per-1M-token price.
+	MaxPricePerMTokUSD = 1e6
+	// AnalyticsMaxBreakdown caps AnalyticsResult.Breakdown.
+	AnalyticsMaxBreakdown = 200
+)
 
 // Lease is an admitted in-flight request on one account.
 type Lease interface {
@@ -341,8 +367,11 @@ type AnalyticsResult struct {
 	Group         string            `json:"group"`
 	Filters       map[string]string `json:"filters"`
 	Totals        UsageRow          `json:"totals"`
-	// Breakdown has every group key in range (not truncated), ranked.
-	Breakdown []UsageRow `json:"breakdown"`
+	// Breakdown has the highest-ranked group keys in range, at most
+	// AnalyticsMaxBreakdown of them; BreakdownOmitted counts the rest (their
+	// usage is still included in Totals and the "other" series).
+	Breakdown        []UsageRow `json:"breakdown"`
+	BreakdownOmitted int        `json:"breakdown_omitted"`
 	// Series has the top N keys in rank order, then AnalyticsOtherKey if any.
 	Series []AnalyticsSeries `json:"series"`
 }
