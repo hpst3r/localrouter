@@ -150,7 +150,11 @@ func (a *App) Serving() bool { return a.serving.Load() }
 
 // BeginShutdown marks the router not-ready. It is idempotent and safe to call
 // from any goroutine.
-func (a *App) BeginShutdown() { a.serving.Store(false) }
+func (a *App) BeginShutdown() {
+	a.srvMu.Lock()
+	a.serving.Store(false)
+	a.srvMu.Unlock()
+}
 
 // BodyGuardFor builds the body-read guard for a timeout. It exists so callers
 // that construct an App by hand (tests) share the wiring defaults.

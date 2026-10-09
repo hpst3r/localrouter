@@ -1,0 +1,47 @@
+# Build-context exclusions for the LocalRouter container image (Containerfile).
+# Syntax matches .dockerignore: git-style patterns, last match wins.
+
+# VCS metadata and local tooling state.
+.git
+.gitignore
+.containerignore
+.env
+.env.*
+**/.env
+**/.env.*
+*.key
+**/*.key
+*.pem
+**/*.pem
+**/*.db
+**/*.db-wal
+**/*.db-shm
+/dist/
+**/bin/
+**/dist/
+/localrouter
+
+# Secrets and local state must never enter an image layer. Client keys, OAuth
+# tokens, ledgers/pricing state and run dirs live outside the source tree.
+keys/
+tokens/
+.runs/
+**/keys/
+**/tokens/
+*.db
+*.db-wal
+*.db-shm
+
+# Build/release output.
+/bin/
+*.tar.gz
+*.exe
+
+# Docs and briefs are not needed to compile the binary.
+docs/
+*.md
+
+# Editor and OS clutter.
+*.swp
+*~
+.DS_Store

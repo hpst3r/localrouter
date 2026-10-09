@@ -38,7 +38,9 @@ timeouts:                           # optional; 0 selects the default, negatives
   shutdown: 30s
 
 clients:
-  # Interactive (people at keyboards)
+  # Interactive (people at keyboards). A client may list several single-key
+  # files under key_files instead of key_file to rotate a key without downtime
+  # (key_file and key_files are mutually exclusive). Reload with SIGHUP.
   - { name: laptop,    class: interactive, host: laptop, key_file: keys/laptop.key, ingest: true }
   - { name: mac,       class: interactive, host: mac,    key_file: keys/mac.key,    ingest: true }
   # Background (worker VMs, subagents, cron)
