@@ -1,12 +1,17 @@
 # LocalRouter MVP — Specification (contract for all packages)
 
-LocalRouter is a single Go binary: a loopback OpenAI-compatible proxy that
-selects an upstream subscription account per request, enforces per-account
-quota reserves by workload class, records token usage + estimated cost in
-SQLite, and exposes a small read API + status widget.
+LocalRouter is a single Go binary: an OpenAI-compatible proxy that selects an
+upstream subscription account per request, enforces per-account quota reserves
+by workload class, records token usage + estimated cost in SQLite, and exposes
+a small read API + analytics dashboard. It listens on loopback by default; an
+optional network mode (`allow_non_loopback`) serves trusted remote clients.
+HTTPS is the recommended transport for all networked use.
+
+For deployment, security assumptions, and maintenance procedures, see
+[Network deployment and operations](NETWORK.md).
 
 Non-goals for MVP: context composition, local tokenization/estimation,
-forecasting engine, Prometheus, trace explorer, multi-user auth, TLS,
+forecasting engine, Prometheus, trace explorer, multi-user auth,
 chat-completions→Responses translation for Codex.
 
 ## Packages and ownership
@@ -15,23 +20,32 @@ chat-completions→Responses translation for Codex.
 |---|---|---|
 | `internal/core` | Shared types + interfaces (frozen; architect-owned) | stdlib |
 | `internal/config` | YAML config load/validate (architect-owned) | core |
-| `internal/quota` | Codex + Ollama quota fetchers, poller, passive header observation | core |
+| `internal/quota` | Codex + Ollama + Claude quota fetchers, poller, passive header observation | core |
 | `internal/policy` | Admission gate, reserves, in-flight leases, cooldowns, account selection | core |
 | `internal/ledger` | SQLite request ledger, summaries, pricing table + cost | core |
 | `internal/auth` | Codex OAuth device login, token store, single-flight refresh; static API keys | core |
 | `internal/proxy` | HTTP inference surface, client auth, forwarding, SSE usage capture, failover | core |
 | `internal/control` | `/control/v1/*` JSON API + embedded HTML widget | core |
+| `internal/claudelog` | Claude Code transcript collector (local, and on each host via the agent) | core |
+| `internal/hermeslog` | Hermes `state.db` per-model usage importer (read-only) | core |
+| `internal/agent` | `localrouter agent` push loops (transcript usage + Claude quota) | core |
+| `internal/app` | Wiring: builds every component, Host guard, self-host detection | all |
 | `cmd/localrouter` | Wiring + CLI (architect-owned) | all |
 
-Packages MUST import only `core` (and `config` where noted by architect) —
-never each other. Use fakes of `core` interfaces in tests.
+Library packages import only `core`; they never import each other. The
+wiring/CLI layer is the exception: `internal/app` imports every library package
+to build the object graph and is imported by `cmd/localrouter`, which also
+wires `internal/agent`, `internal/claudelog`, and `internal/quota`. Tests may
+import sibling packages (e.g. the `agent` tests use `claudelog` and `control`).
+Use fakes of `core` interfaces where isolation is needed.
 
 ## Wire surfaces
 
 Listen default `127.0.0.1:8787`. Refuse non-loopback bind unless
 `allow_non_loopback: true`.
 
-Inference (client bearer required, `Authorization: Bearer <client key>`):
+Inference requires the client key in the `Authorization` header, using the
+`Bearer` scheme:
 
 - `POST /v1/responses` — Responses API. For `provider: codex` upstream is
   `https://chatgpt.com/backend-api/codex/responses`. For `provider: ollama`
@@ -44,7 +58,9 @@ Inference (client bearer required, `Authorization: Bearer <client key>`):
 Body is forwarded verbatim except:
 - `chat/completions` with `"stream": true`: set
   `stream_options.include_usage = true` (preserve other stream_options).
-- Codex `/responses`: no body changes.
+- Codex `/responses`: normalize the body per upstream attempt by removing
+  `max_output_tokens`, `max_tokens`, `max_completion_tokens`, and `metadata`,
+  and forcing `store: false` (required by the Codex backend).
 
 Request headers forwarded: `Content-Type`, `Accept`, `OpenAI-Beta`,
 `session_id`, `conversation_id`, `x-request-id`. Client `Authorization` is
@@ -68,7 +84,8 @@ account down to 0% (until upstream refuses).
 `core.Window{Kind, UsedFrac 0..1, ResetAt, WindowSeconds}`; kinds `5h`, `weekly`.
 
 Codex: `GET https://chatgpt.com/backend-api/wham/usage` with
-`Authorization: Bearer <access>`, `ChatGPT-Account-Id: <id>`,
+the access token in `Authorization` using the `Bearer` scheme,
+`ChatGPT-Account-Id: <id>`,
 `User-Agent: codex-cli`. Map `rate_limit.primary_window` → `5h`,
 `secondary_window` → `weekly`; `used_percent/100`; `reset_at` (unix
 seconds) or `now + reset_after_seconds`; `limit_window_seconds`.
@@ -81,7 +98,8 @@ Codex passive observation: responses from `chatgpt.com` carry headers
 (any may be absent). The proxy hands headers to `QuotaSource.ObserveHeaders`.
 
 Ollama Cloud: `GET https://ollama.com/api/usage` with
-`Authorization: Bearer <api key>`. `limits.session.usage` → `5h`,
+the API key in `Authorization` using the `Bearer` scheme.
+`limits.session.usage` → `5h`,
 `limits.weekly.usage` → `weekly`; values are ALREADY 0–1 fractions. No
 reset time: `ResetAt` zero, `WindowSeconds` 18000 / 604800.
 
@@ -178,12 +196,12 @@ contention). `localrouter login <account-id>` runs the device flow:
   within 5 min (JWT `exp`) or after a 401. Single-flight per account;
   persist rotated refresh token atomically (write temp + fsync + rename,
   mode 0600) BEFORE returning the new access token.
-- Credential headers: `Authorization: Bearer <access>`,
+- Credential headers: `Authorization` (access token with the `Bearer` scheme),
   `ChatGPT-Account-Id: <id>`, `originator: codex_cli_rs`.
 - Store: `<data_dir>/tokens/<account-id>.json`, dir 0700, file 0600.
 
 Ollama / openai_compat: static key from `api_key_file` (preferred) or
-`api_key_env`. Header `Authorization: Bearer <key>`.
+`api_key_env`. Send the key in `Authorization` using the `Bearer` scheme.
 
 Client keys: `clients[].key_file` containing the raw key; compared in
 constant time. Keys never logged or returned.
@@ -198,18 +216,26 @@ key.
   provider, healthy, cooldown_until, inflight, reserve:{"5h":0.1,...},
   windows:[{kind, used_frac, remaining_frac, reset_at, window_seconds}],
   background_admissible, interactive_admissible, snapshot_age_s, stale,
-  error, reason}]}` — `healthy` = no active cooldown and no fetch error;
-  `reason` = policy explanation when a class is not admissible; each window
-  also carries `rolled` (reset passed, used reported as 0).
-- `GET /control/v1/usage?since=24h&group=account|model|class|client` →
-  rows `{key, requests, input_tokens, cached_input_tokens, output_tokens,
-  reasoning_tokens, cost_usd, unknown_usage_requests}`.
-- `POST /control/v1/admit` body `{class, model}` → dry-run
-  `{decision: allow|deny, account_id, reason}` (does NOT create a lease).
-- `GET /` → single embedded HTML page (no external assets/CDNs), polls
-  `/control/v1/status` and `/control/v1/usage?since=24h&group=account`
-  every 15s; per account: bars for 5h/weekly remaining with a reserve marker,
-  reset countdown, health; summary tokens + cost for 24h/7d.
+  error, reason, model_requests}], clients:[{name, class, host, ingest}]}` —
+  `healthy` = no active cooldown and no fetch error; `reason` = policy
+  explanation when a class is not admissible; each window also carries
+  `rolled` (reset passed, used reported as 0). `clients` lists every
+  registered client in config order (never key material).
+- `GET /control/v1/usage?since=24h&group=account` → rows `{key, requests,
+  input_tokens, cached_input_tokens, cache_creation_input_tokens,
+  output_tokens, reasoning_tokens, cost_usd, unknown_usage_requests,
+  unpriced_requests}`. `group` accepts any summary dimension:
+  `account|model|class|client|host|route|task|agent` (default `account`).
+- `GET /control/v1/analytics` and `GET /control/v1/analytics/dimensions` →
+  time series + drill-down (see "Analytics" below); auth like `usage`.
+- `POST /control/v1/admit` body `{class, model}` or `{class, account}` →
+  dry-run `{decision: allow|deny, account_id, reason}` (does NOT create a
+  lease).
+- `POST /control/v1/ingest` — agent push endpoint (see "Multi-host"); always
+  requires a client key whose client has `ingest: true`.
+- `GET /` → single embedded HTML page (no external assets/CDNs), the
+  analytics dashboard (see "Widget" below); polls every 30s while the tab is
+  visible.
 - `GET /healthz` → `ok`.
 
 ## Logging
@@ -253,7 +279,8 @@ running through the official `claude` CLI.
   `expiresAt` has passed, skip the fetch and set `Err = "claude token expired;
   run claude to refresh"` (keep last-good windows).
 - `GET https://api.anthropic.com/api/oauth/usage` with headers
-  `Authorization: Bearer <token>`, `anthropic-beta: oauth-2025-04-20`,
+  `Authorization` (access token with the `Bearer` scheme),
+  `anthropic-beta: oauth-2025-04-20`,
   `Accept: application/json`, `User-Agent: claude-code/<ver>` (configurable,
   default `claude-code/2.1.0`).
 - Mapping (utilization is a PERCENT 0–100): `five_hour` → `5h`,
@@ -293,7 +320,9 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
   `OutputTokens = output_tokens`,
   `ReasoningTokens = output_tokens_details.thinking_tokens` (0 if absent).
   Skip `model == "<synthetic>"` and entries with all-zero usage.
-- Record fields: Client "claude-code", Class "interactive", Route "claude",
+- Record fields: Client `claude_logs.client` (default "claude-code"; the
+  server overwrites it with the authenticated client name for ingested
+  records — see "Per registered client"), Class "interactive", Route "claude",
   Provider "claude", AccountID = claude_logs.account, Model = message.model,
   StartedAt = FinishedAt = timestamp, Status 200, UsageKnown true,
   Session = sessionId, Task = project dir name, Agent = "subagent" if
@@ -327,34 +356,46 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
 - `POST /control/v1/admit` also accepts `{class, account}` (instead of
   `model`): dry-run that single account. Exactly one of model/account.
 - `localrouter admit --class background --account claude-max [--url
-  http://127.0.0.1:8787] [--json]`: calls the control API; exit 0 = allow,
-  1 = deny (prints reason), 2 = error/unreachable. Clients use it as a gate,
-  e.g. before launching background Claude workers.
+  http://127.0.0.1:8787] [--json] [--key-file PATH]`: calls the control API;
+  `--key-file` supplies the client key when `control.require_auth` is on.
+  Exit 0 = allow, 1 = deny (prints reason), 2 = error/unreachable. Clients
+  use it as a gate, e.g. before launching background Claude workers.
 
 ## Multi-host (central server + per-host agents)
 
-One `localrouter serve` runs centrally (mesh-reachable). Each host that runs
-Claude Code runs `localrouter agent`, which pushes Claude transcript usage and
+One `localrouter serve` runs centrally, reachable by trusted clients over HTTPS.
+Each host that runs Claude Code runs `localrouter agent`, which pushes Claude transcript usage and
 Claude quota snapshots to the server. Hosts' Hermes/other clients use the
 server's `/v1` with their own client keys.
 
 ### Server network mode (config)
 
+- Server config default `os.UserConfigDir()/localrouter/config.yaml` (Linux/BSD
+  `~/.config/localrouter/config.yaml`; macOS `~/Library/Application
+  Support/localrouter/config.yaml`); `-config PATH` overrides it on every
+  server subcommand that loads configuration (serve, check, login, pricing,
+  and ledger); `admit` instead takes `--url` and `--key-file`.
 - `allow_non_loopback: true` permits a non-loopback `listen`, and REQUIRES
   `control.require_auth: true` (validated).
 - Host-header guard stays ON in network mode: accept loopback names plus
   `allowed_hosts` entries (case-insensitive exact match on the host part;
   IP literals compared as IPs). Unknown Host -> 403. (Blocks DNS rebinding.)
-- Optional TLS: `tls_cert_file` + `tls_key_file` (both or neither) ->
-  `ListenAndServeTLS`. Mesh (WireGuard) traffic is already encrypted, so TLS
-  is optional.
+- Optional TLS: `tls_cert_file` + `tls_key_file` (both or neither; validated).
+  The server binds its own listener (`net.Listen`) and serves with
+  `http.Server.ServeTLS(ln, cert, key)` (with a 10s `ReadHeaderTimeout`), so
+  TLS is explicit per listener rather than `ListenAndServeTLS`. Configure TLS
+  for networked use. HTTP remains technically possible, but should only ever
+  be considered over an encrypted network overlay protecting the entire
+  client-to-router connection.
 - The widget (`GET /`) stays unauthenticated but its data endpoints require a
   key (it already prompts for one and stores it in localStorage).
 
 ### Clients: host + ingest
 
 - `clients[].host` attributes the client's proxied requests: proxy sets
-  `RequestRecord.Host = client.Host` (empty -> "").
+  `RequestRecord.Host = client.Host`, defaulting to `host_name` when the
+  client's `host` is empty (usage from un-attributed clients happens on this
+  machine).
 - `clients[].ingest: true` allows that key to call `POST /control/v1/ingest`.
   Other keys -> 403. (Ingest keys may also be normal inference keys.)
 
@@ -372,10 +413,12 @@ server's `/v1` with their own client keys.
   `core.IngestRequest` (max 4 MiB, `schema_version` must be 1, `host`
   non-empty, `[A-Za-z0-9._-]{1,64}`).
 - The server OVERWRITES each record's `Host` with the request's `host`
-  (agents cannot attribute to another host... except via their own `host`
-  string; trust model: ingest keys are trusted hosts) and FORCES
-  `Client="claude-code"`, `Provider="claude"`; records whose `AccountID` is
-  not a configured claude account -> whole request 400 (no partial writes).
+  (the agent simply claims its own `host` label, validated as
+  `[A-Za-z0-9._-]{1,64}`; trust model: ingest keys are trusted hosts), sets
+  `Client = <authenticated client name>` (the key that pushed the batch, not
+  whatever the agent claimed), and FORCES `Route="claude"`, `Provider="claude"`;
+  records whose `AccountID` is not a configured claude account -> whole
+  request 400 (no partial writes).
   Records must have non-empty ID, `UsageKnown=true`, non-negative usage;
   otherwise 400.
 - Snapshots: each must name a configured claude account with
@@ -399,10 +442,12 @@ server's `/v1` with their own client keys.
 
 ### `localrouter agent`
 
-Runs on each host. Config file (default `~/.config/localrouter/agent.yaml`):
+Runs on each host. Config file default `os.UserConfigDir()/localrouter/agent.yaml`
+(Linux/BSD `~/.config/localrouter/agent.yaml`; macOS
+`~/Library/Application Support/localrouter/agent.yaml`):
 
 ```yaml
-server: https://router.tail:8787     # or http:// on the mesh
+server: https://router.example.com:8787     # recommended for networked clients
 host: vm1                            # [A-Za-z0-9._-]{1,64}
 key_file: ~/.config/localrouter/agent.key   # client key with ingest: true
 account: claude-max                  # claude account id on the server
@@ -415,7 +460,7 @@ credentials:                         # how to read the Claude Code token (read-o
   # invalid username maps to "claude-code-user"). With CLAUDE_CONFIG_DIR set,
   # Claude Code appends "-<sha256(dir)[:8]>" to the service name.
 push_interval: 1m                    # default
-quota_interval: 5m                   # default; 0 disables quota push
+quota_interval: 5m                   # default; 0s disables quota push (duration)
 state_dir: ~/.local/state/localrouter-agent   # default (darwin: ~/Library/Application Support/localrouter-agent)
 ```
 
@@ -435,8 +480,9 @@ state_dir: ~/.local/state/localrouter-agent   # default (darwin: ~/Library/Appli
   (account default $USER, matching Claude Code; stdout is the same JSON as
   the file). Never write; never print the token; errors are
   sanitized.
-- Exponential backoff (cap 5m) on server errors; logs never contain tokens,
-  prompts, or file paths beyond the project dir name.
+- Exponential backoff on server errors: the delay never drops below the
+  loop's interval and is capped at `max(5m, interval)`; logs never contain
+  tokens, prompts, or file paths beyond the project dir name.
 - `localrouter agent -config PATH [--once]`: `--once` = one scan + one quota
   push then exit (for testing/cron).
 
@@ -526,7 +572,8 @@ to LocalRouter only through the documented control API.
 - `GET /control/v1/analytics/dimensions?range=30d` -> `{"dimensions":
   {"host":[{"key":..,"requests":..,"tokens":..}],...}}` distinct values per
   dimension in range (top 50 each, ranked by tokens) for filter dropdowns.
-- `/control/v1/usage?group=` additionally accepts route, task, agent.
+- `/control/v1/usage?group=` accepts any summary dimension (account, model,
+  class, client, host, route, task, agent).
 
 ### Widget (internal/control/static/index.html, single file, no external
 loads; CSP unchanged: inline script/style only, connect-src 'self')
@@ -590,7 +637,7 @@ and wide (browser). Sections:
 
 ## Engineering constraints
 
-- Go 1.26, module `github.com/hpst3r/localrouter`.
+- Go 1.26.8 or newer (see `go.mod`), module `github.com/hpst3r/localrouter`.
 - Allowed deps: `gopkg.in/yaml.v3`, `modernc.org/sqlite`,
   `golang.org/x/sync`. Nothing else without architect approval.
 - `go vet ./...` and `go test -race ./...` must pass.

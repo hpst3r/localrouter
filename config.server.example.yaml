@@ -1,13 +1,16 @@
 # LocalRouter CENTRAL SERVER example (multi-host). Copy to
 # ~/.config/localrouter/config.yaml on the always-on router box.
 # Every host runs `localrouter agent` (see agent.example.yaml) for Claude Code
-# usage + quota, and points its Hermes/clients at http://<router>:8787/v1.
+# usage + quota, and points its Hermes/clients at https://router.example.com:8787/v1.
 
-listen: 100.64.0.10:8787          # mesh IP (Tailscale/NetBird); never a public IP
+listen: 192.0.2.10:8787           # replace with the intended interface address
 allow_non_loopback: true
-allowed_hosts: [router, router.tail.example.ts.net, 100.64.0.10]   # Host headers accepted
-# tls_cert_file: tls/cert.pem     # optional; WireGuard already encrypts mesh traffic
-# tls_key_file: tls/key.pem
+allowed_hosts: [router.example.com, 192.0.2.10]   # Host headers accepted; not a network ACL
+tls_cert_file: tls/cert.pem       # provision certificate/key and client trust before starting
+tls_key_file: tls/key.pem
+# Use HTTPS for networked clients. HTTP is possible, but should only ever be
+# considered over an encrypted network overlay protecting the entire path.
+# See docs/NETWORK.md for setup and access restrictions.
 data_dir: ~/.config/localrouter
 
 control:
