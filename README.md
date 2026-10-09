@@ -1,6 +1,7 @@
 # LocalRouter
 
-Loopback OpenAI-compatible LLM gateway. One binary that:
+OpenAI-compatible LLM gateway, loopback by default and optionally shared across
+trusted machines on an encrypted mesh. One binary that:
 
 - authenticates local clients with per-client keys,
 - selects an upstream subscription account per request,
@@ -9,9 +10,15 @@ Loopback OpenAI-compatible LLM gateway. One binary that:
 - records token usage and estimated cost in SQLite (never prompt/response content),
 - serves a status API and a small embedded usage widget.
 
-See `docs/SPEC.md` for the authoritative behavior.
+See [the specification](docs/SPEC.md) for the behavior contract and
+[Network deployment and operations](docs/NETWORK.md) for secure central-server
+setup, remote verification, key rotation, troubleshooting, and backup/restore.
 
 ## Build
+
+Requires Go 1.26.8 or newer (see `go.mod`). Build/install snippets below target
+Linux unless marked otherwise; macOS agent installation and explicit config
+paths are covered in [the network guide](docs/NETWORK.md#2-prepare-each-agent-host).
 
 ```bash
 GOFLAGS=-p=4 go build -o bin/localrouter ./cmd/localrouter
@@ -88,22 +95,36 @@ Router box:
 ```bash
 cp config.server.example.yaml ~/.config/localrouter/config.yaml   # set listen IP + allowed_hosts
 for k in laptop mac vm1 vm2 laptop-bg mac-bg; do localrouter keygen ~/.config/localrouter/keys/$k.key; done
-localrouter check && systemctl --user enable --now localrouter
+~/.local/bin/localrouter check -config ~/.config/localrouter/config.yaml
+# Install the binary/unit and upstream credentials as described above first.
+systemctl --user enable --now localrouter
+# If already running, restart it to load the changed config:
+systemctl --user restart localrouter
 ```
 
 Network mode requires `control.require_auth: true`; the widget asks for a key
 once and remembers it in the browser. Requests with a Host header that is
 not loopback or in `allowed_hosts` are refused (DNS-rebinding protection).
+`allowed_hosts` is **not a network ACL**: restrict reachability using mesh ACLs
+and the host firewall, and bind to the specific mesh IP. HTTP is appropriate
+only within the encrypted mesh; use HTTPS on an ordinary LAN. This is a
+trusted-fleet service, not a public/multi-tenant gateway: valid keys can read
+shared control data, and ingest-enabled clients are trusted reporters. The
+widget stores its key in browser localStorage.
 
-Each host (copy that host's key from the router to `~/.config/localrouter/agent.key`, mode 0600):
+Each host: first install a binary for that OS/architecture at
+`~/.local/bin/localrouter`; it is not distributed by the router. Create
+`~/.config/localrouter` and securely copy that host's key from the router to
+`~/.config/localrouter/agent.key` (mode 0600). Then:
 
 ```bash
 cp agent.example.yaml ~/.config/localrouter/agent.yaml           # set server + host
-localrouter agent -config ~/.config/localrouter/agent.yaml --once   # test
+~/.local/bin/localrouter agent -config ~/.config/localrouter/agent.yaml --once   # test
 # Linux:
-install -Dm644 deploy/localrouter-agent.service ~/.config/systemd/user/
+install -Dm644 deploy/localrouter-agent.service ~/.config/systemd/user/localrouter-agent.service
 systemctl --user daemon-reload && systemctl --user enable --now localrouter-agent
-# macOS: see deploy/org.wporter.localrouter-agent.plist (reads the Keychain read-only)
+# macOS: create ~/Library/LaunchAgents and ~/Library/Logs, then follow
+# deploy/org.wporter.localrouter-agent.plist (reads the Keychain read-only)
 ```
 
 Point each host's Hermes at `http://<router>:8787/v1` with its interactive key,
@@ -111,15 +132,32 @@ and delegation/cron at its `-bg` key. Agents buffer nothing in memory beyond a
 scan: if the router is down, they do not advance their transcript offsets and
 re-send later (records are deduplicated by ID).
 
+Before relying on the deployment, run the [remote acceptance checks](docs/NETWORK.md#3-verify-from-a-remote-client).
+A successful `check` or `/healthz` does not verify upstream inference.
+Server config/client keys are loaded at startup; validate and restart after
+changing them. Agents also need a restart after config/key changes.
+
+For authenticated quota gating from a client:
+
+```bash
+~/.local/bin/localrouter admit --url http://100.64.0.10:8787 \
+  --key-file ~/.config/localrouter/agent.key \
+  --class background --account claude-max --json
+```
+
+Exit codes: 0 allow, 1 deny, 2 error. This is a dry run, not an inference call
+or a reservation of quota.
+
 ## Pricing
 
 Costs are only computed for models present in `pricing.yaml` (USD per 1M tokens).
 LocalRouter ships no prices. To import LiteLLM's public table:
 
 ```bash
-curl -fsSLo /tmp/prices.json \
+mkdir -p ~/.config/localrouter
+curl -fsSLo ~/.config/localrouter/litellm-prices.json \
   https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
-bin/localrouter pricing import /tmp/prices.json
+bin/localrouter pricing import ~/.config/localrouter/litellm-prices.json
 ```
 
 Hand-maintained overrides and aliases live in `pricing.local.yaml` next to
