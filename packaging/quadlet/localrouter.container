@@ -1,0 +1,73 @@
+# LocalRouter — HTTP gateway (rootless Quadlet user unit)
+#
+# Install: copy to ~/.config/containers/systemd/localrouter.container, then
+#          systemctl --user daemon-reload
+#
+# Runs as an EXPLICIT non-root UID 1000 (not container UID 0): `keep-id` maps
+# host uid/gid 1000 -> container uid/gid 1000, and User=/Group= run the image
+# process as that same uid, so operator-owned read-only mounts (config, secrets,
+# TLS) and the writable state dir are readable/writable without root.
+#
+# NO PublishPort directive here. LocalRouter HTTP stays entirely inside its
+# private netns on 0.0.0.0:8787. `PublishPort=127.0.0.1::8787` is NOT used: that
+# form publishes a random host port; only the NGINX unit publishes a host port.
+#
+# Required router config keys (operator-supplied /etc/localrouter/config.yaml):
+#   listen: 0.0.0.0:8787
+#   allow_non_loopback: true            # required for the networked bind
+#   control.require_auth: true          # required whenever allow_non_loopback
+#   allowed_hosts: [router.example.com] # the public hostname NGINX forwards
+#   data_dir: /var/lib/localrouter      # EXPLICIT (do not rely on $HOME)
+# The image itself must ship CA certificates for provider HTTPS.
+
+[Unit]
+Description=LocalRouter quota-aware LLM gateway (HTTP, private netns)
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+# Operator: replace VERSION with a real, published tag before installing.
+Image=ghcr.io/hpst3r/localrouter:VERSION
+ContainerName=localrouter
+Network=localrouter.network
+NetworkAlias=localrouter
+
+# Explicit non-root identity. keep-id:uid=1000,gid=1000 maps the invoking host
+# uid/gid 1000 to container uid/gid 1000; User=/Group= select that uid inside.
+UserNS=keep-id:uid=1000,gid=1000
+User=1000
+Group=1000
+
+# Read-only config, read-only secrets, ONE writable state root.
+Volume=%h/.local/share/localrouter/etc:/etc/localrouter:ro,Z
+Volume=%h/.local/share/localrouter/secrets:/run/secrets:ro,Z
+Volume=%h/.local/share/localrouter/state:/var/lib/localrouter:rw,Z
+
+Exec=serve -config /etc/localrouter/config.yaml
+
+# Hardening: read-only rootfs, no capabilities, no privilege escalation.
+ReadOnly=true
+ReadOnlyTmpfs=true
+DropCapability=ALL
+NoNewPrivileges=true
+
+# Graceful drain: `serve` drains in-flight streams up to 30s then stops.
+StopTimeout=45
+
+# Readiness: GET /readyz on the router itself (never a proxied upstream call).
+# The binary does not sd_notify, so Notify= is deliberately NOT set.
+HealthCmd=wget -q -O /dev/null http://127.0.0.1:8787/readyz
+HealthInterval=30s
+HealthStartPeriod=20s
+HealthRetries=3
+HealthTimeout=5s
+
+# Config hot-reload: `serve` handles SIGHUP (in-process config reload).
+ReloadSignal=SIGHUP
+
+[Service]
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,25 @@
+# LocalRouter — dedicated outbound bridge (rootless Quadlet user unit)
+#
+# Install: copy to ~/.config/containers/systemd/localrouter.network, then
+#          systemctl --user daemon-reload
+#
+# A dedicated bridge with a SEPARATE network namespace is used so LocalRouter
+# and NGINX do not share the host netns. It is a NORMAL (non-internal) bridge:
+# LocalRouter must reach external inference providers over HTTPS, so
+# Internal=true MUST NOT be set here.
+#
+# Note (podman-systemd.unit(5)): stopping the generated service does not remove
+# the podman network, and updating an existing network is not supported. To
+# change network options, run `podman network rm localrouter` before reloading
+# the unit.
+
+[Unit]
+Description=LocalRouter dedicated outbound bridge (separate netns)
+
+[Network]
+# -> podman network `localrouter`; referenced from containers as
+#    `Network=localrouter.network`
+NetworkName=localrouter
+Driver=bridge
+# Normal outbound connectivity for provider HTTPS. Explicitly NOT internal.
+Internal=false

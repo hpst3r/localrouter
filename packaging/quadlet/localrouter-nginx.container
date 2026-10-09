@@ -1,0 +1,73 @@
+# LocalRouter — TLS termination (NGINX, the ONLY host publisher)
+#
+# Install: copy to ~/.config/containers/systemd/localrouter-nginx.container,
+#          copy packaging/nginx/localrouter.conf to
+#          ~/.local/share/localrouter/nginx/localrouter.conf, then
+#          systemctl --user daemon-reload
+#
+# Rootless podman cannot bind host port 443 (unprivileged port start = 1024),
+# so the default published port is 8443. This unit is the ONLY one with a
+# PublishPort; LocalRouter never publishes a host port.
+#
+# TLS cert/key are mounted READ-ONLY and owned by the operator; they live in the
+# tls template dir only. The router container never receives cert/key mounts.
+# Certificate renewal is operator-managed: after replacing the files run
+#   systemctl --user reload localrouter-nginx   # -> nginx -s reload (re-reads certs)
+#
+# Runs as explicit non-root UID 1000 (see the router unit for the keep-id
+# rationale). NGINX writes only to tmpfs (pid + cache), so the read-only rootfs
+# is sufficient.
+
+[Unit]
+Description=LocalRouter TLS termination (NGINX unprivileged)
+Wants=localrouter.service localrouter-network.service
+After=localrouter.service localrouter-network.service
+
+[Container]
+Image=docker.io/nginxinc/nginx-unprivileged:1.30.5-alpine
+ContainerName=localrouter-nginx
+Network=localrouter.network
+NetworkAlias=localrouter-nginx
+
+# The ONLY host publication in this deployment. Rootless 8443.
+PublishPort=8443:8443
+
+# Operator-supplied server block and operator-provisioned cert/key (tls.crt,
+# tls.key), both read-only.
+Volume=%h/.local/share/localrouter/nginx/localrouter.conf:/etc/nginx/conf.d/default.conf:ro,Z
+Volume=%h/.local/share/localrouter/tls:/etc/nginx/tls:ro,Z
+
+# Explicit non-root identity (host uid 1000 <-> container uid 1000).
+UserNS=keep-id:uid=1000,gid=1000
+User=1000
+Group=1000
+
+# Hardening: read-only rootfs, no capabilities, no privilege escalation.
+ReadOnly=true
+ReadOnlyTmpfs=true
+DropCapability=ALL
+NoNewPrivileges=true
+
+# NGINX needs a writable pid dir and cache: tmpfs for those only.
+Tmpfs=/tmp
+Tmpfs=/var/cache/nginx
+
+StopTimeout=45
+
+# Readiness: GET /readyz served LOCALLY by NGINX (location = /readyz), so the
+# probe never depends on the LocalRouter upstream. The binary is not notified.
+HealthCmd=wget -q -O /dev/null http://127.0.0.1:8081/readyz
+HealthInterval=30s
+HealthStartPeriod=10s
+HealthRetries=3
+HealthTimeout=5s
+
+# Config/cert reload: run `nginx -s reload` inside the container (via podman exec).
+ReloadCmd=/usr/sbin/nginx -s reload
+
+[Service]
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
