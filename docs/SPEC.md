@@ -60,7 +60,8 @@ semantics, and rejected with 400 `invalid_request_error` (never forwarded)
 unless it is a single UTF-8 JSON object (no trailing data) with no duplicate
 top-level keys and no top-level key equal to `model`/`stream` only
 case-insensitively (e.g. `MODEL`, `Stream`). `model` must be a non-empty
-string; `stream`, if present, a boolean. Nested values are not inspected
+string; `stream`, if present, a boolean or `null` (an omitted optional, read
+as false). Nested values are not inspected
 beyond syntax. The route is chosen from that `model`, so the upstream reads
 the same model and stream mode that was routed.
 
@@ -166,8 +167,13 @@ not all pass. `inflight(A)` counts open leases.
 Lease release reports outcome {HTTP status, usage known?, bytes streamed}.
 Failover: proxy may retry on the next admissible account ONLY if no response
 bytes were sent to the client and status was 429/401/403/5xx-before-body
-(OpenRouter: also an account-level 402; never a 403 or request-scoped 402).
-Max 2 failovers. Each attempt is a separate ledger row.
+(OpenRouter: also 402; never a 403). Max 2 failovers. Each attempt is a
+separate ledger row. Every upstream body read before relaying (buffering a
+retryable error body, classifying an OpenRouter 402, draining before an
+auth retry) uses the stream idle timeout (300s): if no bytes arrive for that
+long the upstream request is aborted, the ledger row records `upstream idle
+timeout reading error body`, and the bytes read so far are failed over or
+relayed as the answer.
 
 ## Concurrency limits and inbound timeouts
 
@@ -252,7 +258,8 @@ responses stay JSON-encodable.
   do not clear the observation.
 - A token count that is negative or above 1e12 (`core.MaxRecordTokens`) in
   any usage record makes the response's usage unknown (`usage_known = false`)
-  rather than storing it.
+  rather than storing it. Cached input is clamped to at most input, and
+  reasoning to at most output (usage stays known).
 - Client disconnect or missing usage ⇒ `usage_known = false`; lease still
   released. An already observed provider cost is retained alongside the
   transport/request error, independently of token knowledge; for an interrupted
@@ -932,18 +939,19 @@ periodic response recomputes `LimitResetAt` for display only). A key reset
 never overrides account exhaustion. An unknown or malformed key part never
 denies on its own (no invented exhaustion), so unknown parts follow the normal
 stale rule (no reserve → allow; upstream 402 is the backstop). Upstream 402 on
-an openrouter account is request-scoped when funds are proven: either the
-latest snapshot has credits fetched within the last 10 minutes with a positive
-balance and no exhausted key cap, or (when the snapshot does not show a
-non-positive balance or exhausted key cap) the 402 body states a positive
-affordable amount (OpenRouter's "... but can only afford N." with N > 0;
-accounts without a management key never learn their balance). That 402
-(e.g. an unaffordable `max_tokens`) is relayed to
-the client as the final answer, with no failover (every account would answer
-the same, so a replay only amplifies) and no cooldown. Any other 402 is
-account-level: proxy fails over (no bytes sent yet; streamed/completed
-responses are never repeated), outcome carries the `Retry-After` hint, policy
-cools down for `max(60s, hint)` and requests an urgent refresh. A 402 cooldown
+an openrouter account whose body is OpenRouter's affordability preflight
+(the message contains "requires more credits, or fewer max_tokens" or "can
+only afford N", any N including 0: a large prompt or expensive model can
+make it 0) is request-scoped: no cooldown and no urgent refresh, but it
+still fails over (another key may have more credit), bounded by the failover
+limit; if every candidate answers so, the client gets the last 402. Any other
+402 ("Insufficient credits", an unknown or empty body, or a body that
+stalls past the idle timeout), and any 402 while the snapshot shows a known
+non-positive balance or exhausted key cap, is account-level: proxy fails
+over (no bytes sent yet; streamed/completed responses are never repeated),
+outcome carries the `Retry-After` hint, policy cools down for `max(60s,
+hint)` and requests an urgent refresh. A recent positive balance never makes
+a 402 request-scoped: it does not prove current funds. A 402 cooldown
 clears early only when a balance fetched after it is positive and above the
 balance known at the 402. Other providers' 402 handling is unchanged.
 OpenRouter 403 (moderation-flagged input) is final and request-scoped: relayed
