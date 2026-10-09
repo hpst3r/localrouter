@@ -4,8 +4,8 @@ LocalRouter is a single Go binary: an OpenAI-compatible proxy that selects an
 upstream subscription account per request, enforces per-account quota reserves
 by workload class, records token usage + estimated cost in SQLite, and exposes
 a small read API + analytics dashboard. It listens on loopback by default; an
-optional network mode (`allow_non_loopback`) serves mesh hosts, optionally over
-TLS.
+optional network mode (`allow_non_loopback`) serves trusted remote clients.
+HTTPS is the recommended transport for all networked use.
 
 For deployment, security assumptions, and maintenance procedures, see
 [Network deployment and operations](NETWORK.md).
@@ -363,8 +363,8 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
 
 ## Multi-host (central server + per-host agents)
 
-One `localrouter serve` runs centrally (mesh-reachable). Each host that runs
-Claude Code runs `localrouter agent`, which pushes Claude transcript usage and
+One `localrouter serve` runs centrally, reachable by trusted clients over HTTPS.
+Each host that runs Claude Code runs `localrouter agent`, which pushes Claude transcript usage and
 Claude quota snapshots to the server. Hosts' Hermes/other clients use the
 server's `/v1` with their own client keys.
 
@@ -383,8 +383,10 @@ server's `/v1` with their own client keys.
 - Optional TLS: `tls_cert_file` + `tls_key_file` (both or neither; validated).
   The server binds its own listener (`net.Listen`) and serves with
   `http.Server.ServeTLS(ln, cert, key)` (with a 10s `ReadHeaderTimeout`), so
-  TLS is explicit per listener rather than `ListenAndServeTLS`. Mesh
-  (WireGuard) traffic is already encrypted, so TLS is optional.
+  TLS is explicit per listener rather than `ListenAndServeTLS`. Configure TLS
+  for networked use. HTTP remains technically possible, but should only ever
+  be considered over an encrypted network overlay protecting the entire
+  client-to-router connection.
 - The widget (`GET /`) stays unauthenticated but its data endpoints require a
   key (it already prompts for one and stores it in localStorage).
 
@@ -445,7 +447,7 @@ Runs on each host. Config file default `os.UserConfigDir()/localrouter/agent.yam
 `~/Library/Application Support/localrouter/agent.yaml`):
 
 ```yaml
-server: https://router.tail:8787     # or http:// on the mesh
+server: https://router.example.com:8787     # recommended for networked clients
 host: vm1                            # [A-Za-z0-9._-]{1,64}
 key_file: ~/.config/localrouter/agent.key   # client key with ingest: true
 account: claude-max                  # claude account id on the server

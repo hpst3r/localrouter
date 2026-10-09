@@ -1,6 +1,6 @@
 # Network deployment and operations
 
-For networked operation, LocalRouter currently supports ONLY a central server shared by **trusted machines**. The recommended deployment binds to a specific Tailscale/NetBird mesh IP, with mesh ACLs restricting who can connect. This is not a public or multi-tenant gateway. High-availability has NOT been tested and was not a design goal for this MVP.
+For networked operation, LocalRouter currently supports ONLY a central server shared by **trusted machines**. Use HTTPS for networked clients, bind to the intended interface, and restrict access to authorized devices with network access controls and a host firewall. This is not a public or multi-tenant gateway. High-availability has NOT been tested and was not a design goal for this MVP.
 
 See [README](../README.md) for the build and basic setup, [server example](../config.server.example.yaml), [agent example](../agent.example.yaml), and [SPEC](SPEC.md) for the implementation contract.
 
@@ -9,8 +9,8 @@ See [README](../README.md) for the build and basic setup, [server example](../co
 - Inference always requires a client bearer key. Network mode also requires `control.require_auth: true`.
 - Any valid client key can read shared status and usage data. There are no per-client visibility or per-account inference permissions beyond workload class and configured routes.
 - `ingest: true` is a trusted reporting permission, not host/account isolation. That client can report usage for any configured Claude account and snapshots for any Claude account with `quota_source: agent`. The request's `host` is a client-supplied label; the server attributes records to the authenticated client name.
-- `allowed_hosts` checks the HTTP Host header to protect browsers against DNS rebinding. **It is not a source-IP ACL.** Enforce access with the mesh ACL/firewall.
-- Plain HTTP is appropriate only when the entire path is inside the encrypted mesh or another protected tunnel (though you should use HTTPS regardless). On an ordinary LAN, use HTTPS. Do not publish this listener to the Internet.
+- `allowed_hosts` checks the HTTP Host header to protect browsers against DNS rebinding. **It is not a source-IP ACL.** Enforce access with network access controls and the host firewall.
+- **Use HTTPS for all networked deployments.** HTTP is possible, but should only ever be considered when an encrypted network overlay (such as Tailscale or NetBird) protects the entire client-to-router connection. Do not publish this listener to the Internet.
 - The widget stores its bearer key in browser localStorage. Use a trusted browser profile; clear the saved key/site storage on shared machines. The key retains its normal inference/ingestion permissions.
 - Body-size limits and upstream timeouts exist, but there is no hard per-client rate/concurrency cap or explicit inbound body-read/idle timeout. Trusted clients and restricted reachability remain important.
 - Claude inference remains on the official Claude CLI. Agents read Claude credentials locally for quota polling; they send usage metadata and snapshots, not Claude tokens or transcript content, to the router.
@@ -31,14 +31,16 @@ chmod 600 ~/.config/localrouter/config.yaml
 Do not overwrite an existing working config without saving it first. Edit the copied config:
 
 ```yaml
-listen: 100.64.0.10:8787
+listen: 192.0.2.10:8787
 allow_non_loopback: true
-allowed_hosts: [router, router.tail.example.ts.net, 100.64.0.10]
+allowed_hosts: [router.example.com, 192.0.2.10]
+tls_cert_file: tls/cert.pem
+tls_key_file: tls/key.pem
 control:
   require_auth: true
 ```
 
-Replace the example IP/names with the router's actual mesh address and names clients will use. Bind to the mesh IP rather than `0.0.0.0`. Permit TCP 8787 only from the intended devices through your mesh ACLs and any applicable host firewall; do not add a broad public-interface firewall exception or port-forward.
+Replace the documentation-only IP/hostname with the router's actual interface address and names clients will use. Bind to that address rather than `0.0.0.0`. Permit TCP 8787 only from intended devices through network access controls and the host firewall; do not add a broad public-interface firewall exception or port-forward. Provision the TLS files and client trust as described under [HTTPS setup](#https-setup) before starting the service. The server example enables both TLS settings; replace its example paths/address before use.
 
 Generate a distinct key for every configured client:
 
@@ -70,9 +72,9 @@ journalctl --user -u localrouter -n 50 --no-pager
 ss -ltn 'sport = :8787'
 ```
 
-If already running, use `systemctl --user restart localrouter` after changing the config. `enable --now` alone does not reload a running process. For unattended startup without a login session, arrange user lingering (`loginctl enable-linger`; authorization may be required). Make sure the mesh interface is available; startup failures are visible in the journal.
+If already running, use `systemctl --user restart localrouter` after changing the config. `enable --now` alone does not reload a running process. For unattended startup without a login session, arrange user lingering (`loginctl enable-linger`; authorization may be required). Make sure the configured interface address is available; startup failures are visible in the journal.
 
-### HTTPS outside the mesh
+### HTTPS setup
 
 Provision a certificate whose subject alternative names cover the hostname/IP clients use. Put it and its private key somewhere the service user can read, preferably under the configuration directory; protect the private key with mode 0600. Configure both:
 
@@ -119,13 +121,13 @@ Agents retry when the server is unavailable. Successful batches are deduplicated
 
 ## 3. Verify from a remote client
 
-The following shell examples assume curl and Python 3, a mesh URL, and the client's key at the default agent path. Change the URL/path as appropriate. The authenticated curl commands read the key through stdin config rather than exposing it in curl's command-line arguments. Do not use shell tracing (`set -x`) around credential handling.
+The following shell examples assume curl and Python 3, an HTTPS URL with a certificate trusted by the client, and the client's key at the default agent path. Change the URL/path as appropriate. The authenticated curl commands read the key through stdin config rather than exposing it in curl's command-line arguments. Do not use shell tracing (`set -x`) around credential handling.
 
 ```bash
-ROUTER_URL=http://100.64.0.10:8787
+ROUTER_URL=https://router.example.com:8787
 KEY_FILE="$HOME/.config/localrouter/agent.key"
 
-# 200 + "ok": HTTP reachability only, no authentication/provider test.
+# 200 + "ok": HTTPS reachability only, no authentication/provider test.
 curl --fail-with-body --silent --show-error "$ROUTER_URL/healthz"
 
 # 401: shared control data is not accessible without a key.
@@ -157,7 +159,7 @@ The key-to-curl helper assumes an unmodified `localrouter keygen` key. `admit` e
 
 | Symptom | Check |
 |---|---|
-| Connection refused or timeout | Service journal, mesh connection/ACL, bind address, port, host firewall. |
+| Connection refused or timeout | Service journal, network connectivity/access controls, bind address, port, host firewall. |
 | TLS validation error | URL name versus certificate SAN, chain/expiry, client CA trust. |
 | `401` | Missing/invalid bearer key; correct client key file; restart the server after replacing keys. |
 | `403` on `/healthz` or status | Host header not accepted. Add the actual URL's hostname/IP to `allowed_hosts`, validate, restart. |
