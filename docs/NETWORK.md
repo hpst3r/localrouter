@@ -1,6 +1,6 @@
 # Network deployment and operations
 
-LocalRouter supports a central server shared by **trusted machines**. The recommended deployment binds to a specific Tailscale/NetBird mesh IP, with mesh ACLs restricting who can connect. This is not a public or multi-tenant gateway.
+For networked operation, LocalRouter currently supports ONLY a central server shared by **trusted machines**. The recommended deployment binds to a specific Tailscale/NetBird mesh IP, with mesh ACLs restricting who can connect. This is not a public or multi-tenant gateway. High-availability has NOT been tested and was not a design goal for this MVP.
 
 See [README](../README.md) for the build and basic setup, [server example](../config.server.example.yaml), [agent example](../agent.example.yaml), and [SPEC](SPEC.md) for the implementation contract.
 
@@ -10,7 +10,7 @@ See [README](../README.md) for the build and basic setup, [server example](../co
 - Any valid client key can read shared status and usage data. There are no per-client visibility or per-account inference permissions beyond workload class and configured routes.
 - `ingest: true` is a trusted reporting permission, not host/account isolation. That client can report usage for any configured Claude account and snapshots for any Claude account with `quota_source: agent`. The request's `host` is a client-supplied label; the server attributes records to the authenticated client name.
 - `allowed_hosts` checks the HTTP Host header to protect browsers against DNS rebinding. **It is not a source-IP ACL.** Enforce access with the mesh ACL/firewall.
-- Plain HTTP is appropriate only when the entire path is inside the encrypted mesh or another protected tunnel. On an ordinary LAN, use HTTPS. Do not publish this listener to the Internet.
+- Plain HTTP is appropriate only when the entire path is inside the encrypted mesh or another protected tunnel (though you should use HTTPS regardless). On an ordinary LAN, use HTTPS. Do not publish this listener to the Internet.
 - The widget stores its bearer key in browser localStorage. Use a trusted browser profile; clear the saved key/site storage on shared machines. The key retains its normal inference/ingestion permissions.
 - Body-size limits and upstream timeouts exist, but there is no hard per-client rate/concurrency cap or explicit inbound body-read/idle timeout. Trusted clients and restricted reachability remain important.
 - Claude inference remains on the official Claude CLI. Agents read Claude credentials locally for quota polling; they send usage metadata and snapshots, not Claude tokens or transcript content, to the router.

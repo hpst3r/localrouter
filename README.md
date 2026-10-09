@@ -1,7 +1,7 @@
 # LocalRouter
 
-OpenAI-compatible LLM gateway, loopback by default and optionally shared across
-trusted machines on an encrypted mesh. One binary that:
+OpenAI-compatible LLM gateway, loopback by default and optionally shared between
+"trusted" machines. Does not currently support authentication. One binary that:
 
 - authenticates local clients with per-client keys,
 - selects an upstream subscription account per request,
@@ -108,9 +108,9 @@ not loopback or in `allowed_hosts` are refused (DNS-rebinding protection).
 `allowed_hosts` is **not a network ACL**: restrict reachability using mesh ACLs
 and the host firewall, and bind to the specific mesh IP. HTTP is appropriate
 only within the encrypted mesh; use HTTPS on an ordinary LAN. This is a
-trusted-fleet service, not a public/multi-tenant gateway: valid keys can read
-shared control data, and ingest-enabled clients are trusted reporters. The
-widget stores its key in browser localStorage.
+trusted-fleet/"homelab" service, and is absolutely not a public/multi-tenant gateway:
+valid keys can read shared control data, and ingest-enabled clients are trusted
+reporters. The widget stores its key in browser localStorage.
 
 Each host: first install a binary for that OS/architecture at
 `~/.local/bin/localrouter`; it is not distributed by the router. Create
