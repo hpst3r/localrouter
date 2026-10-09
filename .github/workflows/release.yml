@@ -72,7 +72,7 @@ jobs:
       path: ${{ steps.find.outputs.path }}
     steps:
       - name: Check out the tag (immutable ref)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.ref }}
           persist-credentials: false
@@ -106,17 +106,28 @@ jobs:
       GOTEST_TIMEOUT: 120s
     steps:
       - name: Check out the tag (immutable ref)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
           persist-credentials: false
 
+      # No Actions cache in the release build: GOMODCACHE/GOCACHE entries saved
+      # by branch CI runs are not re-verified against go.sum, so a poisoned
+      # cache would flow into the published archives. Modules are fetched
+      # fresh and checked with `go mod verify`.
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
+
+      - name: Verify module checksums
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          go mod download
+          go mod verify
 
       - name: Gate - vet and race tests before packaging
         timeout-minutes: 20
@@ -136,7 +147,7 @@ jobs:
           ./scripts/release.sh "${GITHUB_WORKSPACE}/dist" "$VERSION"
 
       - name: Upload archives
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: native-archives
           path: dist/*
@@ -150,42 +161,58 @@ jobs:
       - detect-containerfile
       - build-native
     runs-on: ubuntu-latest
+    # Publishing jobs run in the `release` environment so the repository owner
+    # can require reviewer approval and restrict it to protected v* tags
+    # (repository settings; see docs/CONTAINERS.md).
+    environment: release
     permissions:
       contents: read
       packages: write
+      # Sigstore-signed build provenance for the pushed image digest.
+      id-token: write
+      attestations: write
     env:
       IMAGE: ghcr.io/${{ github.repository }}
     steps:
       - name: Check out the tag (immutable ref)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.ref }}
           persist-credentials: false
 
+      # The binfmt helper runs privileged; pin it by index digest
+      # (tonistiigi/binfmt:qemu-v10.2.3) and skip the Actions image cache.
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
+          cache-image: false
 
       # Bounded parallelism: a single buildx builder whose NodeGroup caps every
       # build at 2 concurrent buildkit workers. Configured inline (this workflow
       # may only be the sole change) and passed to build-push-action via `builder`,
-      # so the limit applies no matter how buildx was set up.
+      # so the limit applies no matter how buildx was set up. The buildkit
+      # image is pinned by index digest (moby/buildkit:v0.34.0).
       - name: Set up Buildx (max 2 parallel buildkit workers)
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         with:
           name: localrouter-release
+          driver-opts: image=docker.io/moby/buildkit@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c
+          cache-binary: false
           buildkitd-config-inline: |
             [worker.oci]
               max-parallelism = 2
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push linux/amd64 + linux/arm64
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ${{ needs.detect-containerfile.outputs.path }}
@@ -204,19 +231,45 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.title=localrouter
 
+      # Provenance is bound to the multi-arch index digest and pushed to GHCR
+      # next to the image. Verify with:
+      #   gh attestation verify oci://ghcr.io/hpst3r/localrouter@sha256:<digest> --repo hpst3r/localrouter
+      # Storage records are an org-only API, so they are not created.
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Record image digest
+        env:
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          echo "Image: ${IMAGE}:${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pin by digest: ${IMAGE}@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+
   # Publish the GitHub release LAST: it consumes the native archives (hence the
-  # build-native dependency) and runs concurrently with the image publish.
+  # build-native dependency) and runs concurrently with the image publish. No
+  # repository code runs here: download, verify, attest, upload.
   publish-release:
     name: publish GitHub release
     needs:
       - validate-tag
       - build-native
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write
+      # Sigstore-signed build provenance for the archives and SHA256SUMS.
+      id-token: write
+      attestations: write
     steps:
       - name: Download archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: native-archives
           path: dist
@@ -227,10 +280,28 @@ jobs:
           cd dist
           sha256sum -c SHA256SUMS
 
-      - name: Publish release assets
-        uses: softprops/action-gh-release@v2
+      # Verify with: gh attestation verify <archive> --repo hpst3r/localrouter
+      - name: Attest archive provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          tag_name: ${{ github.ref_name }}
-          files: |
+          subject-path: |
             dist/*.tar.gz
             dist/SHA256SUMS
+
+      # The runner's preinstalled gh CLI replaces a third-party release action.
+      # A new release is named after the tag, has an empty body and is neither
+      # a draft nor a prerelease. If a release for the tag already exists, its
+      # metadata is left alone and same-named assets are replaced.
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          files=(dist/*.tar.gz dist/SHA256SUMS)
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" --clobber "${files[@]}"
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes "" "${files[@]}"
+          fi

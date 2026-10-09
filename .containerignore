@@ -31,6 +31,30 @@ tokens/
 *.db
 *.db-wal
 *.db-shm
+*.db-*
+**/*.db-*
+*.crt
+**/*.crt
+*.p12
+**/*.p12
+
+# Live configs, credential JSON (Codex auth.json, Claude .credentials.json)
+# and local test runs. The build needs only go.mod, go.sum, cmd/ and internal/
+# (including the embedded internal/control/static/index.html); the
+# *.example.yaml templates are not matched.
+config.yaml
+**/config.yaml
+agent.yaml
+**/agent.yaml
+pricing.yaml
+**/pricing.yaml
+pricing.local.yaml
+**/pricing.local.yaml
+*.json
+**/*.json
+**/.runs/
+live-test/
+**/live-test/
 
 # Build/release output.
 /bin/

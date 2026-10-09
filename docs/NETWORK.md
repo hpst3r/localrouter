@@ -164,6 +164,77 @@ The key-to-curl helper assumes an unmodified `localrouter keygen` key. `admit` e
 
 These checks have distinct meanings: `/healthz` is **liveness** (the process answers), while `/readyz` is **local readiness** (willing to serve and local storage healthy). An upstream outage does not make the router locally unready; inspect account health, freshness, and reasons in status or diagnostics instead. Only a successful real model request verifies **upstream inference**. That test consumes quota; `/healthz`, `/readyz`, `/v1/models`, and `admit` do not substitute for it.
 
+## systemd sandbox
+
+Both Linux user units replace the home directory with an empty tmpfs
+(`ProtectHome=tmpfs`) and bind back only what the process needs:
+
+| Unit | Writable | Read-only |
+|---|---|---|
+| `localrouter.service` | `~/.config/localrouter` (config, default `data_dir`: ledger, Codex tokens, collector state) | `~/.config/localrouter/keys`, `~/.config/localrouter/tls`, `~/.claude`, `~/.hermes` (minus `.env`, `auth.json`), `~/.local/bin/localrouter` |
+| `localrouter-agent.service` | `~/.local/state/localrouter-agent` | `~/.config/localrouter`, `~/.claude`, `~/.local/bin/localrouter` |
+
+`~/.ssh`, browser profiles, cloud CLI credentials and everything else in the
+home directory are not visible. Because `data_dir` defaults to the config
+directory, the server can still rewrite `config.yaml`; setting `data_dir` to a
+separate directory (and binding it writable, below) lets the config directory
+become read-only. The units also set `PrivateDevices`, `ProtectKernel*`,
+`ProtectControlGroups`, `ProtectClock`, `ProtectHostname`, `RestrictNamespaces`,
+`RestrictSUIDSGID`, `MemoryDenyWriteExecute`, an empty `CapabilityBoundingSet`
+and `SystemCallFilter=@system-service`.
+
+Paths configured outside these (a custom `data_dir`, `tls_*_file`, pricing
+file, `claude_logs.dir`, `hermes_logs.home`, agent `state_dir`/`key_file`) need a
+drop-in, e.g. for the server:
+
+```bash
+systemctl --user edit localrouter
+```
+
+```ini
+[Service]
+# writable data dir elsewhere
+BindPaths=%h/.local/state/localrouter
+ReadWritePaths=%h/.local/state/localrouter
+# extra read-only input
+BindReadOnlyPaths=%h/certs/router
+```
+
+**Hosts without unprivileged user namespaces.** In a user unit the mount and
+kernel-protection options imply `PrivateUsers=yes`, which needs unprivileged
+user namespaces (`user.max_user_namespaces` > 0; on some kernels
+`kernel.unprivileged_userns_clone=1`). Without them the unit fails at start
+with status `226/NAMESPACE` (or `218/CAPABILITIES`) in
+`journalctl --user -u localrouter`. As a fallback, relax only what fails, with
+a drop-in rather than editing the shipped unit:
+
+```ini
+[Service]
+# fallback: no user namespaces available (no mount namespace either)
+ProtectHome=no
+ProtectSystem=no
+PrivateTmp=no
+PrivateDevices=no
+ProtectKernelTunables=no
+ProtectKernelModules=no
+ProtectKernelLogs=no
+ProtectControlGroups=no
+ProtectClock=no
+ProtectHostname=no
+CapabilityBoundingSet=~
+BindPaths=
+BindReadOnlyPaths=
+ReadWritePaths=
+ReadOnlyPaths=
+InaccessiblePaths=
+```
+
+The seccomp-based options (`SystemCallFilter`, `MemoryDenyWriteExecute`,
+`RestrictNamespaces`, `RestrictSUIDSGID`, `RestrictAddressFamilies`,
+`NoNewPrivileges`) do not need user namespaces and stay in effect. The fallback
+gives up all filesystem isolation (the process can read and write anything the
+user can); prefer enabling user namespaces.
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -179,7 +250,8 @@ These checks have distinct meanings: `/healthz` is **liveness** (the process ans
 | Background denied | Reserve/cooldown/exhausted window or stale reserved account; inspect status reason. Interactive may still be admissible. |
 | `429` `concurrency_limit_exceeded` | Inference concurrency `limits` reached (global or per-client). Retry after the `Retry-After` hint; raise the limit only if intended. Not a quota/admission denial. |
 | `/readyz` returns 503 while `/healthz` is ok | Local readiness failed (shutting down or storage ping error). Inspect diagnostics `storage`; upstream health is unrelated. |
-| Writes fail only under systemd | Custom data/state paths are outside the supplied sandbox's `ReadWritePaths`. |
+| Writes or reads fail only under systemd | Custom data/state/key/TLS paths are outside the paths the unit binds into its tmpfs home; add a drop-in ([systemd sandbox](#systemd-sandbox)). |
+| Unit fails with `226/NAMESPACE` or `218/CAPABILITIES` | No unprivileged user namespaces for the user unit sandbox; see [systemd sandbox](#systemd-sandbox). |
 
 A fresh quota snapshot and recent host usage are separate signals: usage can push while quota polling fails, and quota can refresh on a host with no new transcript usage.
 

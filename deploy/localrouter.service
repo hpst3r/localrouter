@@ -19,13 +19,43 @@ Nice=5
 StandardOutput=journal
 StandardError=journal
 
-# Hardening. Writes: only the LocalRouter data dir. Reads: Claude transcripts
-# and credentials (read-only by design; ProtectHome=read-only enforces it).
+# Hardening. The home directory is an empty tmpfs; only these paths exist:
+#   %h/.config/localrouter      rw  config + default data_dir (ledger, tokens,
+#                                   collector state); keys/ and tls/ are ro
+#   %h/.claude                  ro  claude_logs transcripts, claude credentials
+#   %h/.hermes                  ro  hermes_logs state.db (+ profiles/*)
+#   %h/.local/bin/localrouter   ro  the binary
+# Missing optional paths (leading '-') are skipped. A data_dir, pricing file
+# or collector dir outside these needs a drop-in, see docs/NETWORK.md.
+#
+# Several options below (ProtectKernel*, ProtectControlGroups, ProtectClock,
+# ProtectHostname, PrivateDevices, ProtectHome/ProtectSystem) imply
+# PrivateUsers=yes in a user unit and need unprivileged user namespaces. If
+# the unit fails with status 226/NAMESPACE or 218/CAPABILITIES, relax them
+# with the drop-in documented in docs/NETWORK.md ("systemd sandbox").
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ProtectHome=read-only
+ProtectHome=tmpfs
+BindPaths=%h/.config/localrouter
 ReadWritePaths=%h/.config/localrouter
+ReadOnlyPaths=-%h/.config/localrouter/keys -%h/.config/localrouter/tls
+BindReadOnlyPaths=%h/.local/bin/localrouter -%h/.claude -%h/.hermes
+# Hermes keeps its own provider secrets next to state.db; hide the usual ones.
+InaccessiblePaths=-%h/.hermes/.env -%h/.hermes/auth.json
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 LockPersonality=yes
 RestrictRealtime=yes

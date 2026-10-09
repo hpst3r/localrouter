@@ -1,26 +1,38 @@
 #!/usr/bin/env python3
 """Drive the dashboard in headless Chrome via CDP (stdlib only): collect JS
 errors, exercise hover/drill-down/zoom/legend, screenshot each state.
-Usage: cdp_check.py URL OUTDIR [width height] [dark]"""
-import base64, json, os, socket, subprocess, sys, time, urllib.request, struct, random
+Usage: cdp_check.py URL OUTDIR [width height] [dark]
+
+The Chrome profile is a private mkdtemp() directory (removed on exit) and the
+DevTools port is an OS-assigned ephemeral port on 127.0.0.1, read back from the
+profile's DevToolsActivePort file. Chrome's sandbox stays on; set
+CDP_NO_SANDBOX=1 only where it cannot start (e.g. some containers)."""
+import base64, json, os, shutil, socket, subprocess, sys, tempfile, time, urllib.request, struct
 
 url, out = sys.argv[1], sys.argv[2]
 w, h = (int(sys.argv[3]), int(sys.argv[4])) if len(sys.argv) > 4 else (1280, 1700)
 dark = len(sys.argv) > 5 and sys.argv[5] == "dark"
 os.makedirs(out, exist_ok=True)
-port = 9333 + random.randint(0, 500)
-prof = f"/tmp/cdp-prof-{port}"
-args = ["google-chrome", "--headless=new", "--disable-gpu", "--no-sandbox", f"--remote-debugging-port={port}",
+prof = tempfile.mkdtemp(prefix="cdp-prof-")
+args = ["google-chrome", "--headless=new", "--disable-gpu",
+        "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
         f"--user-data-dir={prof}", "--hide-scrollbars", f"--window-size={w},{h}", "about:blank"]
+if os.environ.get("CDP_NO_SANDBOX") == "1":
+    args.insert(1, "--no-sandbox")
 chrome = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 try:
+    ws_url = None
     for _ in range(50):
         try:
+            with open(os.path.join(prof, "DevToolsActivePort")) as f:
+                port = int(f.readline().strip())
             tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json"))
             ws_url = [t for t in tabs if t["type"] == "page"][0]["webSocketDebuggerUrl"]
             break
         except Exception:
             time.sleep(0.2)
+    if ws_url is None:
+        sys.exit("chrome DevTools endpoint did not come up")
     # minimal websocket client
     host, rest = ws_url[len("ws://"):].split("/", 1)
     hh, pp = host.split(":")
@@ -129,4 +141,4 @@ finally:
     chrome.terminate()
     try: chrome.wait(5)
     except Exception: chrome.kill()
-    subprocess.run(["rm", "-rf", prof])
+    shutil.rmtree(prof, ignore_errors=True)
