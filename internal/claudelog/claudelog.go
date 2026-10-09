@@ -29,9 +29,15 @@ const maxLineBytes = 8 << 20
 // call.
 const MaxBatch = 500
 
-// maxTokens bounds every usage field of a parsed record; larger values are
-// implausible and would be rejected by the server's ingest validation.
-const maxTokens = 1_000_000_000_000
+// Plausibility bounds matching the server's ingest validation: every usage
+// field is within [0, core.MaxRecordTokens] and StartedAt within
+// [now-maxAge, now+maxFuture].
+const (
+	maxFuture = 5 * time.Minute
+	maxAge    = 400 * 24 * time.Hour
+
+	whyTimestampRange = "timestamp out of range"
+)
 
 // maxIDLen bounds RequestRecord.ID (ours are always 39 bytes).
 const maxIDLen = 128
@@ -276,9 +282,13 @@ func (c *Collector) scanFile(ctx context.Context, path, rel string, st *Stats) (
 				st.Skipped++
 				return
 			}
-			if why := invalid(rec); why != "" {
+			if why := c.invalid(rec); why != "" {
 				st.Skipped++
-				c.opts.Logger.Warn("claudelog: skipping invalid usage", "project", task, "reason", why)
+				lvl := slog.LevelWarn
+				if why == whyTimestampRange {
+					lvl = slog.LevelDebug // old transcripts are expected, not suspicious
+				}
+				c.opts.Logger.Log(ctx, lvl, "claudelog: skipping invalid usage", "project", task, "reason", why)
 				return
 			}
 			p := next.pending
@@ -379,13 +389,13 @@ func isPermanent(err error) bool {
 }
 
 // invalid returns why rec would fail ingest validation, or "" if it is valid.
-func invalid(rec core.RequestRecord) string {
+func (c *Collector) invalid(rec core.RequestRecord) string {
 	u := rec.Usage
 	for _, v := range []int64{u.InputTokens, u.CachedInputTokens, u.CacheCreationInputTokens, u.OutputTokens, u.ReasoningTokens} {
 		if v < 0 {
 			return "negative usage"
 		}
-		if v > maxTokens {
+		if v > core.MaxRecordTokens {
 			return "implausible usage"
 		}
 	}
@@ -395,6 +405,10 @@ func invalid(rec core.RequestRecord) string {
 	if rec.StartedAt.IsZero() {
 		return "missing timestamp"
 	}
+	now := c.opts.Clock.Now()
+	if rec.StartedAt.After(now.Add(maxFuture)) || rec.StartedAt.Before(now.Add(-maxAge)) {
+		return whyTimestampRange
+	}
 	return ""
 }
 
@@ -403,7 +417,7 @@ func invalid(rec core.RequestRecord) string {
 func sumTokens(vs ...int64) int64 {
 	var s int64
 	for _, v := range vs {
-		if v < 0 || v > maxTokens {
+		if v < 0 || v > core.MaxRecordTokens {
 			return -1
 		}
 		s += v
@@ -519,10 +533,10 @@ func (c *Collector) parse(line []byte, task string) (key string, rec core.Reques
 		ID:         "claude:" + hex.EncodeToString(sum[:])[:32],
 		StartedAt:  ts,
 		FinishedAt: ts,
-		Client:     c.clientName(),
+		Client:     core.TruncateLabel(c.clientName()),
 		Class:      core.ClassInteractive,
 		Route:      "claude",
-		Model:      m.Model,
+		Model:      core.TruncateLabel(m.Model),
 		Provider:   core.ProviderClaude,
 		AccountID:  c.opts.AccountID,
 		Status:     200,
@@ -534,8 +548,8 @@ func (c *Collector) parse(line []byte, task string) (key string, rec core.Reques
 			ReasoningTokens:          thinking,
 		},
 		UsageKnown: true,
-		Session:    e.SessionID,
-		Task:       task,
+		Session:    core.TruncateLabel(e.SessionID),
+		Task:       core.TruncateLabel(task),
 		Agent:      agent,
 		Host:       c.opts.Host,
 	}
