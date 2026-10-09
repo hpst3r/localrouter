@@ -19,7 +19,7 @@ Three rootless Podman objects on one dedicated bridge:
 | Object | Role | Host port |
 |---|---|---|
 | `localrouter` (router) | HTTP gateway, private netns, `0.0.0.0:8787` | **none** |
-| `localrouter-nginx` | TLS terminator, the **only** host publisher | `8443` |
+| `localrouter-nginx` | TLS terminator, the **only** host publisher | `127.0.0.1:8443` (set your interface IP) |
 | `localrouter` network | normal (non-internal) bridge, separate netns | — |
 
 The router image is **HTTP only**. It never terminates TLS: the shipped
@@ -152,13 +152,67 @@ systemctl --user reload localrouter-nginx
 ## Image and version tag
 
 Podman uses `.containerignore` for build-context exclusions; Docker/Buildx uses
-`.dockerignore`. Each file independently excludes credentials, local databases,
-and build outputs. Podman gives `.containerignore` precedence when both exist.
+`.dockerignore`. Each file independently excludes credentials (keys, tokens,
+certs, credential JSON, live `config.yaml`/`agent.yaml`/pricing files), local
+databases, test-run dirs and build outputs. Podman gives `.containerignore`
+precedence when both exist. Only the build stage sees the context, but build
+caches and a `--target build` image keep it, so do not build from a tree that
+holds live secrets anyway.
+
+Base images (`golang`, `alpine`, `nginx-unprivileged`) are pinned as
+`tag@sha256:<index digest>`; the tag is informational. Dependabot proposes
+Containerfile digest bumps; the NGINX `Image=` in the Quadlet unit is updated
+by hand (`skopeo inspect --raw docker://<image>:<tag> | sha256sum`). The
+runtime `apk add ca-certificates` is not version-pinned, so the image is not
+bit-for-bit reproducible across rebuilds.
 
 The Quadlet unit references `ghcr.io/hpst3r/localrouter:VERSION`. **`VERSION` is a
-literal placeholder** — replace it with a real published tag before installing.
+literal placeholder** — replace it with a real published tag before installing,
+or better, with the digest (`Image=ghcr.io/hpst3r/localrouter@sha256:<digest>`)
+after verifying it as below. A tag can be re-pushed; a digest cannot.
 There is currently **no published release**, so no tag exists yet to point at;
 do not install the unit until a tag is available (see Verification status below).
+
+### Verifying releases
+
+The release workflow attaches a Sigstore-signed GitHub build provenance
+attestation to every archive, to `SHA256SUMS`, and to the pushed image index
+digest (stored in GHCR next to the image). The image digest is printed in the
+release run's summary; it can also be read from the registry:
+
+```bash
+skopeo inspect --raw docker://ghcr.io/hpst3r/localrouter:<version> | sha256sum
+```
+
+Verify before installing (GitHub CLI 2.49 or newer):
+
+```bash
+gh attestation verify oci://ghcr.io/hpst3r/localrouter@sha256:<digest> --repo hpst3r/localrouter
+gh attestation verify localrouter_<version>_linux_amd64.tar.gz --repo hpst3r/localrouter
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+`SHA256SUMS` alone only detects corruption: it is published next to the
+archives and can be replaced with them. Then pin the verified digest in
+`localrouter.container`.
+
+### Release workflow controls
+
+- Every action in `.github/workflows/` is pinned to a full commit SHA (with a
+  `# vX.Y.Z` comment), and the QEMU binfmt and buildkit helper images are pinned
+  by digest. CI fails if a pin is missing (`.github/scripts/check-pins.sh`).
+  Dependabot updates action SHAs weekly; bump the helper image digests in
+  `release.yml` by hand with `skopeo inspect --raw ... | sha256sum`.
+- The release build does not restore the Actions Go cache and runs
+  `go mod verify` before testing and packaging.
+- `publish-image` and `publish-release` run in the `release` GitHub
+  environment. **The repository owner must configure it** (Settings →
+  Environments → `release`): add required reviewers, and restrict deployment
+  to protected tags matching `v*` (with a tag protection/ruleset rule on `v*`).
+  Without that configuration the environment exists but enforces nothing; this
+  repository's settings have not been verified.
+- Only those two jobs hold write scopes (`packages: write` or `contents: write`,
+  plus `id-token: write` and `attestations: write` for attestations).
 
 ## Quadlet units and the systemd unit collision
 
@@ -207,10 +261,22 @@ this packaging.
 ## Ports and networking
 
 - **Rootless HTTPS defaults to 8443.** Rootless Podman cannot bind privileged
-  ports (unprivileged port start is 1024), so the edge publishes `8443:8443`.
+  ports (unprivileged port start is 1024), so the edge publishes port 8443.
   The router publishes **no** host port. Nothing in this packaging changes
   `net.ipv4.ip_unprivileged_port_start` or any other sysctl to reach 443; 443 is
   simply not used.
+- **Bind the edge to one interface.** The shipped unit has
+  `PublishPort=127.0.0.1:8443:8443`, reachable from the host only. **Replace
+  `127.0.0.1` with the LAN or overlay (Tailscale/WireGuard) interface IP**
+  clients use, e.g. `PublishPort=192.0.2.10:8443:8443`. Never use a bare
+  `8443:8443`: that binds every interface (`0.0.0.0` and `[::]`), including
+  public or Wi-Fi ones. The router's own `listen` cannot help here; it binds
+  `0.0.0.0` inside its private netns by design, so `PublishPort` is the only
+  bind control.
+- **A host firewall is still required.** Allow 8443 only from intended
+  clients. Rootless port forwarding hides the client source IP (NGINX and the
+  router see the forwarder's address), so neither can apply IP-based
+  restrictions; filtering must happen on the host.
 - **Egress.** The dedicated bridge is a **normal (non-internal)** bridge
   (`Internal=false`) precisely because the router must reach external inference
   providers over HTTPS. Do not set `Internal=true` here.
