@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -148,6 +149,90 @@ func maxTokens402(hits *atomic.Int32) http.HandlerFunc {
 		okJSON(w, r)
 	}
 }
+
+// affordable402 answers like OpenRouter's real affordability check: the
+// message states how many tokens the key can still afford.
+func affordable402(hits *atomic.Int32, afford int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		b, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(b), `"max_tokens":999999999`) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusPaymentRequired)
+			_, _ = fmt.Fprintf(w, `{"error":{"code":402,"message":"This request requires more credits, or fewer max_tokens. You requested up to 999999999 tokens, but can only afford %d. To increase, visit https://openrouter.ai/settings/keys"}}`, afford)
+			return
+		}
+		okJSON(w, r)
+	}
+}
+
+// Accounts without a management key never learn their balance, which is the
+// review PoC's setup. The 402 body itself proves funds ("can only afford N",
+// N > 0), so the request is still relayed without failover or cooldown, and
+// the relayed body is intact after the classifier peeked at it.
+func TestSecRequestScoped402WithoutBalance(t *testing.T) {
+	h := newHarness(t)
+	var hits1, hits2 atomic.Int32
+	h.upstream("or1", core.ProviderOpenRouter, affordable402(&hits1, 6937))
+	h.upstream("or2", core.ProviderOpenRouter, affordable402(&hits2, 6937))
+	singleRoute(h, "or1", "or2")
+	h.pol = policy.New([]core.Account{h.accounts["or1"], h.accounts["or2"]}, h.quota, policy.Options{Clock: fixedClock{testNow}})
+	h.start()
+
+	resp := h.post("/v1/chat/completions", bgKey, `{"model":"gpt-x","max_tokens":999999999,"messages":[]}`, nil)
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusPaymentRequired || !strings.Contains(string(body), "can only afford 6937") ||
+		!strings.HasSuffix(strings.TrimSpace(string(body)), "}}") {
+		t.Fatalf("bg status %d body %s", resp.StatusCode, body)
+	}
+	if hits1.Load()+hits2.Load() != 1 {
+		t.Fatalf("request replayed: or1=%d or2=%d", hits1.Load(), hits2.Load())
+	}
+	resp = h.post("/v1/chat/completions", clientKey, `{"model":"gpt-x","messages":[]}`, nil)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("interactive status %d: %s", resp.StatusCode, body)
+	}
+	if st := h.pol.Status("or1"); !st.CooldownUntil.IsZero() {
+		t.Fatalf("or1 cooled down: %+v", st)
+	}
+}
+
+// "can only afford 0" (or no affordable amount, or a known exhausted balance)
+// is the account being out of credit: cooldown and failover as before.
+func TestSecAffordZeroIsAccountLevel(t *testing.T) {
+	for name, tc := range map[string]struct {
+		afford int
+		snap   *core.Snapshot
+	}{
+		"afford zero":            {afford: 0},
+		"exhausted balance wins": {afford: 50, snap: ptrSnap(fundedSnapshot(0, testNow))},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t)
+			var hits, hitsB atomic.Int32
+			h.upstream("or", core.ProviderOpenRouter, affordable402(&hits, tc.afford))
+			h.upstream("b", core.ProviderOpenRouter, func(w http.ResponseWriter, r *http.Request) { hitsB.Add(1); okJSON(w, r) })
+			singleRoute(h, "or", "b")
+			if tc.snap != nil {
+				h.quota.setSnapshot("or", *tc.snap)
+			}
+			h.start()
+			resp := h.post("/v1/chat/completions", clientKey, `{"model":"gpt-x","max_tokens":999999999,"messages":[]}`, nil)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK || hitsB.Load() != 1 {
+				t.Fatalf("status %d, failover hits %d", resp.StatusCode, hitsB.Load())
+			}
+			if o := h.policy.leases[0].outcome; o.Status != 402 || o.RequestScoped {
+				t.Fatalf("outcome %+v", o)
+			}
+		})
+	}
+}
+
+func ptrSnap(s core.Snapshot) *core.Snapshot { return &s }
 
 // Adapted from the review PoC: a 402 while the balance is known positive is
 // the request's problem. It is relayed without failover and without a

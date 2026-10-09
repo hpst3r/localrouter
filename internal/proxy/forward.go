@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -162,7 +163,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		p.deps.Quota.ObserveHeaders(acctID, resp.Header)
 		status := resp.StatusCode
 
-		scoped, final := p.requestScoped(account, status)
+		scoped, final := p.requestScoped(account, status, resp)
 		if final {
 			// The same request would fail the same way on any account, so a
 			// replay elsewhere is only amplification: relay it as the answer.
@@ -218,7 +219,7 @@ const invalidateGap = 60 * time.Second
 // differently, so the response is relayed without credential refresh or
 // failover. Only OpenRouter distinguishes these; other providers' 401/403/429
 // stay account-level.
-func (p *Proxy) requestScoped(account core.Account, status int) (scoped, final bool) {
+func (p *Proxy) requestScoped(account core.Account, status int, resp *http.Response) (scoped, final bool) {
 	if account.Provider != core.ProviderOpenRouter {
 		return false, false
 	}
@@ -228,9 +229,18 @@ func (p *Proxy) requestScoped(account core.Account, status int) (scoped, final b
 		return true, true
 	case http.StatusPaymentRequired:
 		// With funds known to be available, a 402 is the request being
-		// unaffordable (e.g. max_tokens), not the account being empty.
+		// unaffordable (e.g. max_tokens), not the account being empty. Funds
+		// are known from a fresh positive balance, or (for accounts without
+		// a management key, whose balance is never fetched) from the 402
+		// itself stating a positive affordable token count.
 		snap, ok := p.deps.Quota.Latest(account.ID)
-		funded := ok && orFunded(snap, p.clock.Now())
+		if ok && orFunded(snap, p.clock.Now()) {
+			return true, true
+		}
+		if ok && orExhausted(snap) {
+			return false, false
+		}
+		funded := affordsTokens(peekBody(resp, maxFailureBody))
 		return funded, funded
 	case http.StatusTooManyRequests:
 		// A per-model or upstream-provider rate limit, unless the account
@@ -239,6 +249,31 @@ func (p *Proxy) requestScoped(account core.Account, status int) (scoped, final b
 		return !(ok && orExhausted(snap)), false
 	}
 	return false, false
+}
+
+// affordRE matches OpenRouter's affordability 402 ("... You requested up to
+// N tokens, but can only afford M."), whose positive M proves the key still
+// has spendable credit. Any other wording keeps the account-level handling.
+var affordRE = regexp.MustCompile(`can only afford ([0-9]{1,15})\b`)
+
+func affordsTokens(body []byte) bool {
+	m := affordRE.FindSubmatch(body)
+	if m == nil {
+		return false
+	}
+	n, err := strconv.ParseInt(string(m[1]), 10, 64)
+	return err == nil && n > 0
+}
+
+// peekBody reads up to limit bytes of resp.Body and puts them back in front of
+// the remainder, so the response can still be relayed or buffered unchanged.
+func peekBody(resp *http.Response, limit int64) []byte {
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, limit))
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(b), resp.Body), resp.Body}
+	return b
 }
 
 // orFunded reports a fresh, positive known balance with no exhausted key cap.

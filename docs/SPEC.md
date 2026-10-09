@@ -932,9 +932,13 @@ periodic response recomputes `LimitResetAt` for display only). A key reset
 never overrides account exhaustion. An unknown or malformed key part never
 denies on its own (no invented exhaustion), so unknown parts follow the normal
 stale rule (no reserve → allow; upstream 402 is the backstop). Upstream 402 on
-an openrouter account is request-scoped when the latest snapshot proves funds:
-credits fetched within the last 10 minutes with a positive balance and no
-exhausted key cap. That 402 (e.g. an unaffordable `max_tokens`) is relayed to
+an openrouter account is request-scoped when funds are proven: either the
+latest snapshot has credits fetched within the last 10 minutes with a positive
+balance and no exhausted key cap, or (when the snapshot does not show a
+non-positive balance or exhausted key cap) the 402 body states a positive
+affordable amount (OpenRouter's "... but can only afford N." with N > 0;
+accounts without a management key never learn their balance). That 402
+(e.g. an unaffordable `max_tokens`) is relayed to
 the client as the final answer, with no failover (every account would answer
 the same, so a replay only amplifies) and no cooldown. Any other 402 is
 account-level: proxy fails over (no bytes sent yet; streamed/completed
