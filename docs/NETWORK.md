@@ -166,74 +166,18 @@ These checks have distinct meanings: `/healthz` is **liveness** (the process ans
 
 ## systemd sandbox
 
-Both Linux user units replace the home directory with an empty tmpfs
-(`ProtectHome=tmpfs`) and bind back only what the process needs:
+Both Linux user units hide the home directory (`ProtectHome=tmpfs`) and bind back only what they need. The server gets `~/.config/localrouter` read-write (`keys/` and `tls/` read-only), plus `~/.claude`, `~/.hermes` and its binary read-only. The agent gets `~/.local/state/localrouter-agent` read-write, plus `~/.config/localrouter`, `~/.claude` and its binary read-only. Because the default `data_dir` is the config directory, the server can still rewrite `config.yaml`.
 
-| Unit | Writable | Read-only |
-|---|---|---|
-| `localrouter.service` | `~/.config/localrouter` (config, default `data_dir`: ledger, Codex tokens, collector state) | `~/.config/localrouter/keys`, `~/.config/localrouter/tls`, `~/.claude`, `~/.hermes` (minus `.env`, `auth.json`), `~/.local/bin/localrouter` |
-| `localrouter-agent.service` | `~/.local/state/localrouter-agent` | `~/.config/localrouter`, `~/.claude`, `~/.local/bin/localrouter` |
-
-`~/.ssh`, browser profiles, cloud CLI credentials and everything else in the
-home directory are not visible. Because `data_dir` defaults to the config
-directory, the server can still rewrite `config.yaml`; setting `data_dir` to a
-separate directory (and binding it writable, below) lets the config directory
-become read-only. The units also set `PrivateDevices`, `ProtectKernel*`,
-`ProtectControlGroups`, `ProtectClock`, `ProtectHostname`, `RestrictNamespaces`,
-`RestrictSUIDSGID`, `MemoryDenyWriteExecute`, an empty `CapabilityBoundingSet`
-and `SystemCallFilter=@system-service`.
-
-Paths configured outside these (a custom `data_dir`, `tls_*_file`, pricing
-file, `claude_logs.dir`, `hermes_logs.home`, agent `state_dir`/`key_file`) need a
-drop-in, e.g. for the server:
-
-```bash
-systemctl --user edit localrouter
-```
+Paths outside these (custom `data_dir`, TLS or pricing files, collector dirs, agent `state_dir`/`key_file`) need a drop-in (`systemctl --user edit localrouter`):
 
 ```ini
 [Service]
-# writable data dir elsewhere
 BindPaths=%h/.local/state/localrouter
 ReadWritePaths=%h/.local/state/localrouter
-# extra read-only input
 BindReadOnlyPaths=%h/certs/router
 ```
 
-**Hosts without unprivileged user namespaces.** In a user unit the mount and
-kernel-protection options imply `PrivateUsers=yes`, which needs unprivileged
-user namespaces (`user.max_user_namespaces` > 0; on some kernels
-`kernel.unprivileged_userns_clone=1`). Without them the unit fails at start
-with status `226/NAMESPACE` (or `218/CAPABILITIES`) in
-`journalctl --user -u localrouter`. As a fallback, relax only what fails, with
-a drop-in rather than editing the shipped unit:
-
-```ini
-[Service]
-# fallback: no user namespaces available (no mount namespace either)
-ProtectHome=no
-ProtectSystem=no
-PrivateTmp=no
-PrivateDevices=no
-ProtectKernelTunables=no
-ProtectKernelModules=no
-ProtectKernelLogs=no
-ProtectControlGroups=no
-ProtectClock=no
-ProtectHostname=no
-CapabilityBoundingSet=~
-BindPaths=
-BindReadOnlyPaths=
-ReadWritePaths=
-ReadOnlyPaths=
-InaccessiblePaths=
-```
-
-The seccomp-based options (`SystemCallFilter`, `MemoryDenyWriteExecute`,
-`RestrictNamespaces`, `RestrictSUIDSGID`, `RestrictAddressFamilies`,
-`NoNewPrivileges`) do not need user namespaces and stay in effect. The fallback
-gives up all filesystem isolation (the process can read and write anything the
-user can); prefer enabling user namespaces.
+If the unit fails with `226/NAMESPACE` or `218/CAPABILITIES`, the host lacks unprivileged user namespaces. Enable them, or as a last resort drop the filesystem isolation with a drop-in (`ProtectHome=no`, `ProtectSystem=no`, `PrivateTmp=no`, `PrivateDevices=no`, `ProtectKernelTunables=no`, `ProtectKernelModules=no`, `ProtectKernelLogs=no`, `ProtectControlGroups=no`, `ProtectClock=no`, `ProtectHostname=no`, `CapabilityBoundingSet=~`, and empty `BindPaths=`, `BindReadOnlyPaths=`, `ReadWritePaths=`, `ReadOnlyPaths=`, `InaccessiblePaths=`). The seccomp options stay in effect.
 
 ## Troubleshooting
 
