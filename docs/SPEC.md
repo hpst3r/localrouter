@@ -109,7 +109,12 @@ Codex passive observation: responses from `chatgpt.com` carry headers
 (any may be absent). The proxy hands headers to `QuotaSource.ObserveHeaders`.
 
 Ollama Cloud: `GET https://ollama.com/api/usage` with
-the API key in `Authorization` using the `Bearer` scheme.
+the API key in `Authorization` using the `Bearer` scheme, only when the
+account's `base_url` host equals the usage URL host (case-insensitive, port
+ignored); otherwise no request is made and the snapshot `Err` is
+`usage api: usage polling unavailable for non-ollama.com base_url`. All usage
+API requests (Codex, Ollama, Claude, OpenRouter) never follow redirects; a
+3xx is an `http 3xx` fetch error.
 `limits.session.usage` → `5h`,
 `limits.weekly.usage` → `weekly`; values are ALREADY 0–1 fractions. No
 reset time: `ResetAt` zero, `WindowSeconds` 18000 / 604800.
@@ -277,7 +282,11 @@ contention). `localrouter login <account-id>` runs the device flow:
   `grant_type=refresh_token, refresh_token, client_id` when access expires
   within 5 min (JWT `exp`) or after a 401. Single-flight per account;
   persist rotated refresh token atomically (write temp + fsync + rename,
-  mode 0600) BEFORE returning the new access token.
+  mode 0600) BEFORE returning the new access token. If that Save fails the
+  call returns an error but the new token set stays in memory (the old
+  refresh token is already consumed); the Save is retried on the next
+  `Credential` call, which returns the token once it is durable. No refresh
+  backoff applies to a persist failure.
 - Credential headers: `Authorization` (access token with the `Bearer` scheme),
   `ChatGPT-Account-Id: <id>`, `originator: codex_cli_rs`.
 - Store: `<data_dir>/tokens/<account-id>.json`, dir 0700, file 0600.
@@ -287,6 +296,15 @@ Ollama / openai_compat: static key from `api_key_file` (preferred) or
 
 Client keys: `clients[].key_file` containing the raw key; compared in
 constant time. Keys never logged or returned.
+
+Secret files (`core.CheckPrivateFile`: regular file, `mode & 0o077 == 0`):
+client key files, `api_key_file`, `management_key_file`, `tls_key_file`, and
+the agent `key_file`. The config file and `data_dir` must not be group/world
+writable (`core.CheckNotWritableByOthers`; a missing `data_dir` is allowed).
+`config.Config.CheckFiles` applies all of these; `localrouter check` fails and
+`localrouter serve` refuses to start on any violation. Upstream key files are
+also re-checked on every read (including cache hits). Windows: existence and
+regularity only.
 
 ## Control API (`internal/control`)
 
@@ -547,6 +565,10 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
   `--key-file` supplies the client key when `control.require_auth` is on.
   Exit 0 = allow, 1 = deny (prints reason), 2 = error/unreachable. Clients
   use it as a gate, e.g. before launching background Claude workers.
+  With `--key-file` and a plain `http://` URL to a non-loopback host, a
+  warning is printed to stderr (not refused). Redirects are not followed (a
+  3xx exits 2). On a shared host a stopped router's loopback port can be
+  bound by another local user, who would then receive the key.
 
 ## Multi-host (central server + per-host agents)
 
@@ -679,6 +701,10 @@ state_dir: ~/.local/state/localrouter-agent   # default (darwin: ~/Library/Appli
   tokens, prompts, or file paths beyond the project dir name.
 - `localrouter agent -config PATH [--once]`: `--once` = one scan + one quota
   push then exit (for testing/cron).
+- `key_file` must be a private regular file (0600); the error names neither
+  the key nor the path. The ingest client never follows redirects (a 3xx is a
+  transient `*HTTPError`, records are kept). A plain `http://` server URL to
+  a non-loopback host logs a startup warning (not refused).
 
 ### Acceptance tests (multi-host)
 

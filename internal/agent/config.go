@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hpst3r/localrouter/internal/core"
 	"gopkg.in/yaml.v3"
 )
 
@@ -204,9 +206,17 @@ func (c *Config) Validate() error {
 	return errors.Join(errs...)
 }
 
-// ReadKey reads a client key file, trimming whitespace. The key is never
-// included in errors.
+// ReadKey reads a client key file, trimming whitespace. The file must be a
+// regular file that is not group/world accessible (core.CheckPrivateFile).
+// Neither the key nor the path is included in errors.
 func ReadKey(path string) (string, error) {
+	if err := core.CheckPrivateFile("key_file", path); err != nil {
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			return "", fmt.Errorf("key_file: %w", pe.Err)
+		}
+		return "", errors.New(strings.Replace(err.Error(), " "+path, "", 1))
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("key_file: %w", stripPath(err))
@@ -225,6 +235,27 @@ func stripPath(err error) error {
 		return pe.Err
 	}
 	return err
+}
+
+// InsecureServerURL reports whether server is a plain http:// URL to a
+// non-loopback host, which sends the client key unencrypted (acceptable only
+// over an encrypted overlay such as a tailnet; see docs/NETWORK.md).
+func InsecureServerURL(server string) bool {
+	u, err := url.Parse(server)
+	if err != nil || u.Scheme != "http" {
+		return false
+	}
+	return !IsLoopbackHost(u.Hostname())
+}
+
+// IsLoopbackHost reports whether host (no port) is "localhost" or a loopback
+// IP literal.
+func IsLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func absOr(p string) string {

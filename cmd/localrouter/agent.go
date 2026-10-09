@@ -49,6 +49,9 @@ func cmdAgent(args []string) error {
 		level = slog.LevelDebug
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	if agent.InsecureServerURL(cfg.Server) {
+		logger.Warn("agent: server is plain http to a non-loopback host; the client key is sent unencrypted. Use https unless the link is an encrypted overlay (see docs/NETWORK.md)")
+	}
 
 	client := agent.NewClient(cfg.Server, cfg.Host, key, &http.Client{Timeout: 30 * time.Second})
 	col := claudelog.New(agent.NewRemoteLedger(client), claudelog.Options{

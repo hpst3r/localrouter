@@ -83,10 +83,16 @@ type Client struct {
 
 // NewClient returns a Client for server (base URL), attributing pushes to
 // host and authenticating with key. hc nil uses a client with a 30s timeout.
+// Redirects are never followed: net/http re-sends Authorization to a
+// redirect on the same hostname regardless of port or scheme. A copy of hc
+// is used; hc itself is not modified.
 func NewClient(server, host, key string, hc *http.Client) *Client {
 	if hc == nil {
 		hc = &http.Client{Timeout: 30 * time.Second}
 	}
+	nr := *hc
+	nr.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	hc = &nr
 	return &Client{endpoint: strings.TrimRight(server, "/") + IngestPath, host: host, key: key, hc: hc}
 }
 
@@ -113,6 +119,11 @@ func (c *Client) Ingest(ctx context.Context, req core.IngestRequest) (core.Inges
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+		// Transient (not Permanent): records are kept until the URL is fixed.
+		return core.IngestResponse{}, &HTTPError{Status: resp.StatusCode,
+			Body: "server redirected; redirects are not followed (check the server URL)"}
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return core.IngestResponse{}, &HTTPError{Status: resp.StatusCode, Body: c.sanitize(b), Code: errorCode(b)}
 	}

@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/hpst3r/localrouter/internal/agent"
 )
 
 // exitError carries a process exit code: 1 = admission denied, 2 = usage
@@ -69,13 +71,19 @@ func runAdmit(args []string, stdout, stderr io.Writer) error {
 	}
 	body, _ := json.Marshal(req)
 	endpoint := strings.TrimRight(*base, "/") + "/control/v1/admit"
-	client := &http.Client{Timeout: *timeout}
+	// Never follow a redirect: net/http re-sends Authorization to the same
+	// hostname on any port.
+	client := &http.Client{Timeout: *timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	hreq, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return exitError{2, "admit: " + err.Error()}
 	}
 	hreq.Header.Set("Content-Type", "application/json")
 	if *keyFile != "" {
+		if agent.InsecureServerURL(*base) {
+			fmt.Fprintln(stderr, "admit: warning: --url is plain http to a non-loopback host; the client key is sent unencrypted (use https or an encrypted overlay)")
+		}
 		k, err := os.ReadFile(*keyFile)
 		if err != nil {
 			return exitError{2, "admit: reading key file: " + err.Error()}
@@ -102,6 +110,9 @@ func runAdmit(args []string, stdout, stderr io.Writer) error {
 			} `json:"error"`
 		}
 		msg := resp.Status
+		if resp.StatusCode >= 300 && resp.StatusCode <= 399 {
+			msg += " (redirect not followed; check --url)"
+		}
 		if json.Unmarshal(raw, &e) == nil && e.Error.Message != "" {
 			msg = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, e.Error.Message)
 		}

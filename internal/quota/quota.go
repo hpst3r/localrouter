@@ -294,7 +294,7 @@ func (m *Manager) fetch(ctx context.Context, acct core.Account) (core.Snapshot, 
 	case core.ProviderClaude:
 		return m.fetchClaude(ctx, acct.ID)
 	default:
-		return m.fetchOllama(ctx, acct.ID)
+		return m.fetchOllama(ctx, acct)
 	}
 }
 
