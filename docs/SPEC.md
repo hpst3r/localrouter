@@ -55,6 +55,15 @@ Inference requires the client key in the `Authorization` header, using the
   400 `{"error":{"message":"codex accounts only serve /v1/responses"}}`.
 - `GET /v1/models` — synthesized from config `routes[].models` (exact names).
 
+The body is parsed once, with the upstream's exact-key, case-sensitive
+semantics, and rejected with 400 `invalid_request_error` (never forwarded)
+unless it is a single UTF-8 JSON object (no trailing data) with no duplicate
+top-level keys and no top-level key equal to `model`/`stream` only
+case-insensitively (e.g. `MODEL`, `Stream`). `model` must be a non-empty
+string; `stream`, if present, a boolean. Nested values are not inspected
+beyond syntax. The route is chosen from that `model`, so the upstream reads
+the same model and stream mode that was routed.
+
 Body is forwarded verbatim except:
 - `chat/completions` with `"stream": true`: set
   `stream_options.include_usage = true` (preserve other stream_options).
@@ -70,6 +79,8 @@ stripped.
 
 Optional attribution headers from clients (stored, never forwarded):
 `X-LocalRouter-Session`, `X-LocalRouter-Task`, `X-LocalRouter-Agent`.
+Each is truncated to 128 bytes on a UTF-8 boundary, with invalid UTF-8 and
+control characters replaced by U+FFFD.
 `X-LocalRouter-Class: background` lets an interactive-class key downgrade
 itself; a background key can never upgrade.
 
@@ -130,7 +141,17 @@ Staleness: snapshot older than `policy.stale_after` (default 10m) or absent:
 
 Cooldown: after upstream 429 (or 401/403 after one refresh retry), the
 account is excluded until `max(reset_at of exhausted window, now+60s)`;
-cleared early if a fresh snapshot shows headroom.
+cleared early if a fresh snapshot shows headroom. A 401/403 triggers a
+credential refresh (`Invalidate` + retry on the same account) at most once
+per account per 60s; inside that window it is handled as an account-level
+failure without a refresh.
+
+Request-scoped failures never cool an account down: the proxy releases the
+lease with `Outcome.RequestScoped`, and policy then only decrements
+in-flight and requests a non-urgent refresh. Otherwise one client could lock
+every other class out of an account with a request that only fails for
+itself. Only OpenRouter answers are classified as request-scoped (see
+OpenRouter); codex/ollama/openai_compat 401/403/429 stay account-level.
 
 Selection: routes give an ordered account list per class. First admissible
 account wins. Admission is atomic with lease creation (mutex) to prevent the
@@ -139,7 +160,8 @@ not all pass. `inflight(A)` counts open leases.
 
 Lease release reports outcome {HTTP status, usage known?, bytes streamed}.
 Failover: proxy may retry on the next admissible account ONLY if no response
-bytes were sent to the client and status was 429/401/403/5xx-before-body.
+bytes were sent to the client and status was 429/401/403/5xx-before-body
+(OpenRouter: also an account-level 402; never a 403 or request-scoped 402).
 Max 2 failovers. Each attempt is a separate ledger row.
 
 ## Concurrency limits and inbound timeouts
@@ -211,10 +233,13 @@ Cost = (input−cached)·in + cached·cached_in + output·out, all /1e6.
   final chat chunk's top-level `usage`, the non-stream body's top-level `usage`,
   or a Responses terminal event's `response.usage`. The last meaningful final
   usage wins; costs are never summed per chunk. Captured only for OpenRouter.
-  An explicit 0 is valid; missing, `null`, non-numeric, negative, or non-finite
-  cost in the latest meaningful usage record clears any earlier intermediate
+  An explicit 0 is valid; missing, `null`, non-numeric, negative, non-finite,
+  or above-1e6 (`core.MaxReportedCostUSD`) cost in the latest meaningful usage record clears any earlier intermediate
   cost, without discarding that record's valid token counts. Usage-less chunks
   do not clear the observation.
+- A token count that is negative or above 1e12 (`core.MaxRecordTokens`) in
+  any usage record makes the response's usage unknown (`usage_known = false`)
+  rather than storing it.
 - Client disconnect or missing usage ⇒ `usage_known = false`; lease still
   released. An already observed provider cost is retained alongside the
   transport/request error, independently of token knowledge; for an interrupted
@@ -835,11 +860,22 @@ periodic response recomputes `LimitResetAt` for display only). A key reset
 never overrides account exhaustion. An unknown or malformed key part never
 denies on its own (no invented exhaustion), so unknown parts follow the normal
 stale rule (no reserve → allow; upstream 402 is the backstop). Upstream 402 on
-an openrouter account: proxy fails over (no bytes sent yet; streamed/completed
+an openrouter account is request-scoped when the latest snapshot proves funds:
+credits fetched within the last 10 minutes with a positive balance and no
+exhausted key cap. That 402 (e.g. an unaffordable `max_tokens`) is relayed to
+the client as the final answer, with no failover (every account would answer
+the same, so a replay only amplifies) and no cooldown. Any other 402 is
+account-level: proxy fails over (no bytes sent yet; streamed/completed
 responses are never repeated), outcome carries the `Retry-After` hint, policy
 cools down for `max(60s, hint)` and requests an urgent refresh. A 402 cooldown
 clears early only when a balance fetched after it is positive and above the
 balance known at the 402. Other providers' 402 handling is unchanged.
+OpenRouter 403 (moderation-flagged input) is final and request-scoped: relayed
+without credential refresh, failover or cooldown; 401 keeps the refresh-once,
+then account-level handling. OpenRouter 429 (per-model or upstream-provider
+rate limit) is request-scoped unless the snapshot shows a known non-positive
+balance or an exhausted key cap; it may still fail over to the next account
+(another key may not be limited), bounded by the failover limit.
 
 Control status adds, for openrouter accounts only, `credits:{available,
 balance_usd, total_credits_usd, total_usage_usd, exhausted, age_s, stale,

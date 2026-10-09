@@ -162,7 +162,16 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		p.deps.Quota.ObserveHeaders(acctID, resp.Header)
 		status := resp.StatusCode
 
-		if (status == http.StatusUnauthorized || status == http.StatusForbidden) && !authRetried {
+		scoped, final := p.requestScoped(account, status)
+		if final {
+			// The same request would fail the same way on any account, so a
+			// replay elsewhere is only amplification: relay it as the answer.
+			p.log.Info("upstream rejected request", "account", acctID, "class", req.class, "model", req.model, "status", status)
+			p.stream(w, r, req, resp, lease, rec, cancelUp, true)
+			return attemptResult{done: true}
+		}
+
+		if (status == http.StatusUnauthorized || status == http.StatusForbidden) && !authRetried && p.allowInvalidate(acctID) {
 			drain(resp)
 			authRetried = true
 			p.deps.Creds.Invalidate(acctID)
@@ -177,7 +186,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxFailureBody))
 			drain(resp)
 			f := &failure{status: status, header: resp.Header.Clone(), body: body}
-			out := core.Outcome{Status: status}
+			out := core.Outcome{Status: status, RequestScoped: scoped}
 			if wantsResetHint(account.Provider, status) {
 				out.ResetAt = resetHint(resp.Header, p.clock.Now())
 			}
@@ -189,9 +198,81 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			return attemptResult{failure: f}
 		}
 
-		p.stream(w, r, req, resp, lease, rec, cancelUp)
+		p.stream(w, r, req, resp, lease, rec, cancelUp, scoped)
 		return attemptResult{done: true}
 	}
+}
+
+// requestScopedFresh bounds how old a credits observation may be to count
+// as proof that an OpenRouter account still has funds. It matches the
+// policy's default StaleAfter.
+const requestScopedFresh = 10 * time.Minute
+
+// invalidateGap is the minimum interval between credential refreshes forced
+// by upstream 401/403 answers on one account.
+const invalidateGap = 60 * time.Second
+
+// requestScoped classifies an upstream status. scoped means the failure was
+// caused by this request, not the account, so policy must not cool the
+// account down; final additionally means no other account would answer
+// differently, so the response is relayed without credential refresh or
+// failover. Only OpenRouter distinguishes these; other providers' 401/403/429
+// stay account-level.
+func (p *Proxy) requestScoped(account core.Account, status int) (scoped, final bool) {
+	if account.Provider != core.ProviderOpenRouter {
+		return false, false
+	}
+	switch status {
+	case http.StatusForbidden:
+		// Moderation-flagged input; auth failures are 401.
+		return true, true
+	case http.StatusPaymentRequired:
+		// With funds known to be available, a 402 is the request being
+		// unaffordable (e.g. max_tokens), not the account being empty.
+		snap, ok := p.deps.Quota.Latest(account.ID)
+		funded := ok && orFunded(snap, p.clock.Now())
+		return funded, funded
+	case http.StatusTooManyRequests:
+		// A per-model or upstream-provider rate limit, unless the account
+		// itself is known exhausted. Another key may not be limited.
+		snap, ok := p.deps.Quota.Latest(account.ID)
+		return !(ok && orExhausted(snap)), false
+	}
+	return false, false
+}
+
+// orFunded reports a fresh, positive known balance with no exhausted key cap.
+func orFunded(s core.Snapshot, now time.Time) bool {
+	c := s.Credits
+	return c != nil && !c.FetchedAt.IsZero() && now.Sub(c.FetchedAt) <= requestScopedFresh &&
+		c.BalanceUSD > 0 && !keyCapExhausted(s.Key)
+}
+
+// orExhausted reports a known non-positive balance or an exhausted key cap.
+func orExhausted(s core.Snapshot) bool {
+	c := s.Credits
+	return c != nil && !c.FetchedAt.IsZero() && c.BalanceUSD <= 0 || keyCapExhausted(s.Key)
+}
+
+// keyCapExhausted mirrors the policy's rule: a known cap with no spend left.
+func keyCapExhausted(k *core.KeyUsage) bool {
+	return k != nil && !k.FetchedAt.IsZero() && k.LimitUSD != nil && k.LimitRemainingUSD != nil &&
+		*k.LimitRemainingUSD <= 0
+}
+
+// allowInvalidate reports whether an upstream 401/403 on accountID may force
+// a credential refresh now, and records it if so. At most one refresh per
+// account per invalidateGap, so a client cannot drive refresh traffic; a
+// later auth failure inside the gap is handled as an account-level failure.
+func (p *Proxy) allowInvalidate(accountID string) bool {
+	now := p.clock.Now()
+	p.invMu.Lock()
+	defer p.invMu.Unlock()
+	if last, ok := p.lastInvalidate[accountID]; ok && now.Sub(last) < invalidateGap {
+		return false
+	}
+	p.lastInvalidate[accountID] = now
+	return true
 }
 
 // noResponse either signals failover or, if none is allowed, answers 502.
@@ -232,8 +313,9 @@ func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cr
 
 // stream relays the upstream response to the client, capturing usage, then
 // releases the lease and records the ledger row. If no upstream bytes arrive
-// for StreamIdleTimeout, cancelUp aborts the upstream request.
-func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, resp *http.Response, lease core.Lease, rec core.RequestRecord, cancelUp context.CancelFunc) {
+// for StreamIdleTimeout, cancelUp aborts the upstream request. scoped is
+// passed to policy as Outcome.RequestScoped.
+func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, resp *http.Response, lease core.Lease, rec core.RequestRecord, cancelUp context.CancelFunc, scoped bool) {
 	defer resp.Body.Close()
 	ctx := r.Context()
 	rc := http.NewResponseController(w)
@@ -298,7 +380,7 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	if aborted || idledOut || readErr != nil {
 		known = false
 	}
-	out := core.Outcome{Status: resp.StatusCode, UsageKnown: known, BytesToClient: written}
+	out := core.Outcome{Status: resp.StatusCode, UsageKnown: known, BytesToClient: written, RequestScoped: scoped}
 	if wantsResetHint(rec.Provider, resp.StatusCode) {
 		out.ResetAt = resetHint(resp.Header, p.clock.Now())
 	}
@@ -352,6 +434,8 @@ func (p *Proxy) newRecord(req *request, account core.Account, failoverOf string)
 // record finalizes timing, logs a summary, and writes the ledger row. Ledger
 // failures are logged and never affect the response.
 func (p *Proxy) record(ctx context.Context, rec core.RequestRecord) {
+	// Errors can carry upstream/transport text: bound and sanitize them.
+	rec.Error = core.TruncateError(rec.Error)
 	rec.FinishedAt = p.clock.Now()
 	rec.LatencyMS = rec.FinishedAt.Sub(rec.StartedAt).Milliseconds()
 	p.log.Info("request",
@@ -402,8 +486,9 @@ func retryable(status int) bool {
 }
 
 // retryableFor adds provider-specific failover statuses to retryable. An
-// OpenRouter 402 (out of credit) is account-specific, so another account may
-// still serve; for other providers 402 stays a final answer.
+// account-level OpenRouter 402 (out of credit) is account-specific, so
+// another account may still serve; for other providers 402 stays a final
+// answer. Request-scoped final answers are filtered out before this check.
 func retryableFor(provider string, status int) bool {
 	return retryable(status) || provider == core.ProviderOpenRouter && status == http.StatusPaymentRequired
 }

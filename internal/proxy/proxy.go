@@ -6,13 +6,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hpst3r/localrouter/internal/core"
 )
@@ -24,7 +27,6 @@ const (
 
 	defaultMaxBodyBytes = 32 << 20
 	defaultMaxFailovers = 2
-	maxAttrLen          = 128
 
 	defaultResponseHeaderTimeout = 180 * time.Second
 	defaultStreamIdleTimeout     = 300 * time.Second
@@ -89,6 +91,9 @@ type Proxy struct {
 	models []string              // sorted
 	log    *slog.Logger
 	clock  core.Clock
+
+	invMu          sync.Mutex
+	lastInvalidate map[string]time.Time // by account; see allowInvalidate
 }
 
 // New builds a Proxy from its dependencies and options.
@@ -114,7 +119,8 @@ func New(deps Deps, opts Options) *Proxy {
 	if opts.HTTPClient == nil {
 		opts.HTTPClient = defaultHTTPClient(opts.ResponseHeaderTimeout)
 	}
-	p := &Proxy{deps: deps, opts: opts, routes: map[string]core.Route{}, log: deps.Logger, clock: deps.Clock}
+	p := &Proxy{deps: deps, opts: opts, routes: map[string]core.Route{}, log: deps.Logger, clock: deps.Clock,
+		lastInvalidate: map[string]time.Time{}}
 	if p.log == nil {
 		p.log = slog.Default()
 	}
@@ -245,12 +251,9 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 		writeError(w, http.StatusBadRequest, "localrouter: could not read request body", "invalid_request_error")
 		return
 	}
-	var head struct {
-		Model  string `json:"model"`
-		Stream bool   `json:"stream"`
-	}
-	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&head); err != nil || head.Model == "" {
-		writeError(w, http.StatusBadRequest, "localrouter: request body must be a JSON object with a model", "invalid_request_error")
+	head, err := parseHead(body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "localrouter: "+err.Error(), "invalid_request_error")
 		return
 	}
 	route, ok := p.routes[head.Model]
@@ -291,15 +294,81 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 		candidates: candidates,
 		body:       body,
 		header:     r.Header,
-		session:    truncate(r.Header.Get("X-LocalRouter-Session")),
-		task:       truncate(r.Header.Get("X-LocalRouter-Task")),
-		agent:      truncate(r.Header.Get("X-LocalRouter-Agent")),
+		session:    core.TruncateLabel(r.Header.Get("X-LocalRouter-Session")),
+		task:       core.TruncateLabel(r.Header.Get("X-LocalRouter-Task")),
+		agent:      core.TruncateLabel(r.Header.Get("X-LocalRouter-Agent")),
 	})
+}
+
+// requestHead is the routing-relevant part of a request body.
+type requestHead struct {
+	Model  string
+	Stream bool
+}
+
+var errBodyShape = errors.New("request body must be a single JSON object with a model")
+
+// parseHead reads "model" and "stream" from body with the exact-key,
+// case-sensitive semantics the upstream uses, and rejects any body the
+// upstream could read differently: anything but a single UTF-8 JSON object,
+// duplicate top-level keys, or a top-level key that matches "model"/"stream"
+// only case-insensitively (encoding/json struct decoding would match it).
+// model must be a non-empty string and stream, if present, a boolean. Nested
+// values are only checked for syntax. A body that passes is unambiguous, so
+// it can be forwarded unchanged.
+func parseHead(body []byte) (requestHead, error) {
+	var h requestHead
+	if !utf8.Valid(body) {
+		return h, errors.New("request body must be UTF-8 JSON")
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return h, errBodyShape
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return h, errBodyShape
+		}
+		key, _ := tok.(string)
+		if seen[key] {
+			return h, fmt.Errorf("duplicate key %q in request body", core.TruncateLabel(key))
+		}
+		seen[key] = true
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return h, errBodyShape
+		}
+		switch {
+		case key == "model":
+			if raw[0] != '"' || json.Unmarshal(raw, &h.Model) != nil {
+				return h, errors.New("model must be a string")
+			}
+		case key == "stream":
+			if (raw[0] != 't' && raw[0] != 'f') || json.Unmarshal(raw, &h.Stream) != nil {
+				return h, errors.New("stream must be a boolean")
+			}
+		case strings.EqualFold(key, "model"), strings.EqualFold(key, "stream"):
+			return h, fmt.Errorf("ambiguous key %q in request body", core.TruncateLabel(key))
+		}
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return h, errBodyShape
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return h, errBodyShape
+	}
+	if h.Model == "" {
+		return h, errBodyShape
+	}
+	return h, nil
 }
 
 // rewriteBody applies the only permitted body edits: the upstream model name
 // and, for streaming chat completions, stream_options.include_usage=true.
-// When no edit is needed the body is returned unchanged.
+// When no edit is needed the body is returned unchanged. body must have
+// passed parseHead (no duplicate keys), so the map round trip loses nothing.
 func rewriteBody(body []byte, upstreamModel string, forceUsage bool) ([]byte, error) {
 	if upstreamModel == "" && !forceUsage {
 		return body, nil
@@ -342,13 +411,6 @@ func marshalNoEscape(v any) ([]byte, error) {
 		return nil, err
 	}
 	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), nil
-}
-
-func truncate(s string) string {
-	if len(s) > maxAttrLen {
-		return s[:maxAttrLen]
-	}
-	return s
 }
 
 func newID() string {

@@ -6,6 +6,9 @@
 // streams the response back while extracting token usage from SSE or JSON
 // bodies, fails over to the next account on 429/401/403/5xx before any byte
 // reaches the client, and records one core.RequestRecord per attempt.
+// OpenRouter failures caused by the request itself (moderation 403, a 402
+// while funds are known, a non-exhaustion 429) are reported to policy as
+// request-scoped so they never cool the account down.
 //
 // Public API wired by cmd/localrouter:
 //
