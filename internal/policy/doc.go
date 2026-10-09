@@ -27,6 +27,7 @@
 // so N concurrent background requests near the floor cannot all pass.
 //
 // Acquire evaluates and creates the lease under a single mutex. Leases are
-// release-once. Releasing with status 429 (or 401/403) puts the account in
-// cooldown; a newer snapshot showing headroom clears it early.
+// release-once. Releasing with status 429 (or 401/403, or 402 on OpenRouter)
+// puts the account in cooldown; a newer snapshot showing headroom clears it
+// early. An Outcome with RequestScoped set never starts a cooldown.
 package policy

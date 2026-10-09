@@ -303,8 +303,11 @@ func (p *Policy) release(id string, o core.Outcome) {
 	}
 	prepaid := c.accounts[id].Provider == core.ProviderOpenRouter
 	var until time.Time
-	switch o.Status {
-	case 429:
+	// A request-scoped failure says nothing about the account; cooling it
+	// down would let one client lock every other client out of it.
+	switch status := o.Status; {
+	case o.RequestScoped:
+	case status == 429:
 		until = now.Add(cooldownMin)
 		if o.ResetAt.After(until) {
 			until = o.ResetAt
@@ -314,9 +317,9 @@ func (p *Policy) release(id string, o core.Outcome) {
 				until = r
 			}
 		}
-	case 401, 403:
+	case status == 401 || status == 403:
 		until = now.Add(cooldownMin)
-	case 402:
+	case status == 402:
 		// Payment required: OpenRouter's out-of-credit answer. Other
 		// providers keep their previous (no cooldown) handling.
 		if prepaid {
@@ -342,7 +345,9 @@ func (p *Policy) release(id string, o core.Outcome) {
 	if !until.IsZero() {
 		c.opts.Logger.Info("account cooldown", "account", id, "status", o.Status, "until", until)
 	}
-	p.quota.RequestRefresh(id, o.Status == 429 || prepaid && o.Status == 402)
+	// Only account-level failures earn an urgent refresh: a client-triggerable
+	// request-scoped failure must not bypass the refresh gap.
+	p.quota.RequestRefresh(id, !o.RequestScoped && (o.Status == 429 || prepaid && o.Status == 402))
 }
 
 // normalizeOptions fills in the process-identity and default values that are
