@@ -34,7 +34,7 @@
 # readability and is ignored when a digest is present. Dependabot (docker
 # ecosystem) proposes digest bumps. To update by hand:
 #   skopeo inspect --raw docker://docker.io/library/golang:<tag> | sha256sum
-FROM docker.io/library/golang:1.26.8-alpine@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c AS build
+FROM docker.io/library/golang:1.27.0-alpine@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc AS build
 
 # Static binary; bounded parallelism matches the release contract.
 ENV CGO_ENABLED=0 \
