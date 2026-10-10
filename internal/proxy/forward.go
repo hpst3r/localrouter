@@ -56,6 +56,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 	exclude := map[string]bool{}
 	var (
 		prevID    string
+		rootID    string // record ID of the first attempt; the request correlation ID
 		pending   *failure
 		lastErr   string
 		failovers int
@@ -92,7 +93,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 			return
 		}
 		acctID := lease.AccountID()
-		res := p.attempt(w, r, req, lease, &prevID, failovers < p.opts.MaxFailovers)
+		res := p.attempt(w, r, req, lease, &prevID, &rootID, failovers < p.opts.MaxFailovers)
 		if res.done {
 			return
 		}
@@ -119,8 +120,9 @@ func (l *onceLease) Release(o core.Outcome) {
 
 // attempt sends the request to the leased account, retrying the same account
 // once after a 401/403 with a refreshed credential. It always releases the
-// lease, and records one ledger row per upstream try.
-func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, lease core.Lease, prevID *string, canFailover bool) attemptResult {
+// lease, records one ledger row per upstream try, and emits one structured
+// completion event per try.
+func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, lease core.Lease, prevID, rootID *string, canFailover bool) attemptResult {
 	ctx := r.Context()
 	acctID := lease.AccountID()
 	account, ok := p.deps.Accounts[acctID]
@@ -137,13 +139,29 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		defer cancelUp()
 		rec := p.newRecord(req, account, *prevID)
 		*prevID = rec.ID
+		if *rootID == "" {
+			*rootID = rec.ID
+		}
+		ev := attemptEvent{
+			requestID: *rootID,
+			attemptID: rec.ID,
+			prevID:    rec.FailoverOf,
+			client:    req.client.Name,
+			account:   account.ID,
+			provider:  account.Provider,
+			class:     req.class,
+		}
 
 		cred, err := p.deps.Creds.Credential(ctx, acctID)
 		if err != nil {
 			p.log.Warn("credential unavailable", "account", acctID, "err", err)
 			lease.Release(core.Outcome{})
 			rec.Error = "credential unavailable"
-			p.record(ctx, rec)
+			rec = p.record(ctx, rec)
+			ev.outcome = outcomeTransportError
+			ev.failoverEligible = canFailover
+			ev.latencyMS = rec.LatencyMS
+			p.emitAttempt(ev)
 			return p.noResponse(w, canFailover, "upstream credential unavailable")
 		}
 		rec.UpstreamIdentity = cred.Identity
@@ -188,14 +206,21 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			if ctx.Err() != nil {
 				lease.Release(core.Outcome{})
 				rec.Error = "client disconnected"
-				p.recordBudget(ctx, rec)
+				rec = p.recordBudget(ctx, rec)
+				ev.outcome = outcomeClientCancelled
+				ev.latencyMS = rec.LatencyMS
+				p.emitAttempt(ev)
 				return attemptResult{done: true}
 			}
 			msg := sanitizeErr(err)
 			p.log.Warn("upstream transport error", "account", acctID, "model", req.model, "err", msg)
 			lease.Release(core.Outcome{})
 			rec.Error = "upstream transport error: " + msg
-			p.recordBudget(ctx, rec)
+			rec = p.recordBudget(ctx, rec)
+			ev.outcome = outcomeTransportError
+			ev.failoverEligible = canFailover
+			ev.latencyMS = rec.LatencyMS
+			p.emitAttempt(ev)
 			return p.noResponse(w, canFailover, "upstream unreachable")
 		}
 		p.deps.Quota.ObserveHeaders(acctID, resp.Header)
@@ -215,8 +240,14 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			rec.Status = status
 			rec.Error = errIdleErrorBody
 			p.log.Warn("upstream idle timeout reading error body", "account", acctID, "model", req.model, "status", status)
-			p.recordBudget(ctx, rec)
-			if canFailover && retryableFor(account.Provider, status) {
+			rec = p.recordBudget(ctx, rec)
+			eligible := canFailover && retryableFor(account.Provider, status)
+			ev.status = status
+			ev.outcome = outcomeUpstreamError
+			ev.failoverEligible = eligible
+			ev.latencyMS = rec.LatencyMS
+			p.emitAttempt(ev)
+			if eligible {
 				return attemptResult{failure: f}
 			}
 			relayFailure(w, f)
@@ -226,7 +257,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			// The same request would fail the same way on any account, so a
 			// replay elsewhere is only amplification: relay it as the answer.
 			p.log.Info("upstream rejected request", "account", acctID, "class", req.class, "model", req.model, "status", status)
-			p.stream(w, r, req, resp, lease, rec, cancelUp, true)
+			p.stream(w, r, req, resp, lease, rec, cancelUp, true, ev)
 			return attemptResult{done: true}
 		}
 
@@ -238,7 +269,12 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			rec.Status = status
 			rec.Error = "upstream " + strconv.Itoa(status) + "; retrying with refreshed credential"
 			p.log.Info("upstream auth rejected; refreshing credential", "account", acctID, "status", status)
-			p.recordBudget(ctx, rec)
+			rec = p.recordBudget(ctx, rec)
+			ev.status = status
+			ev.outcome = outcomeUpstreamError
+			ev.authRetry = true
+			ev.latencyMS = rec.LatencyMS
+			p.emitAttempt(ev)
 			continue
 		}
 
@@ -256,11 +292,16 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 				rec.Error = errIdleErrorBody
 			}
 			p.log.Info("upstream failure; failing over", "account", acctID, "class", req.class, "model", req.model, "status", status)
-			p.recordBudget(ctx, rec)
+			rec = p.recordBudget(ctx, rec)
+			ev.status = status
+			ev.outcome = outcomeUpstreamError
+			ev.failoverEligible = true
+			ev.latencyMS = rec.LatencyMS
+			p.emitAttempt(ev)
 			return attemptResult{failure: f}
 		}
 
-		p.stream(w, r, req, resp, lease, rec, cancelUp, scoped)
+		p.stream(w, r, req, resp, lease, rec, cancelUp, scoped, ev)
 		return attemptResult{done: true}
 	}
 }
@@ -454,10 +495,10 @@ func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cr
 }
 
 // stream relays the upstream response to the client, capturing usage, then
-// releases the lease and records the ledger row. If no upstream bytes arrive
-// for StreamIdleTimeout, cancelUp aborts the upstream request. scoped is
-// passed to policy as Outcome.RequestScoped.
-func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, resp *http.Response, lease core.Lease, rec core.RequestRecord, cancelUp context.CancelFunc, scoped bool) {
+// releases the lease, records the ledger row and emits the completion event.
+// If no upstream bytes arrive for StreamIdleTimeout, cancelUp aborts the
+// upstream request. scoped is passed to policy as Outcome.RequestScoped.
+func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, resp *http.Response, lease core.Lease, rec core.RequestRecord, cancelUp context.CancelFunc, scoped bool, ev attemptEvent) {
 	defer resp.Body.Close()
 	ctx := r.Context()
 	rc := http.NewResponseController(w)
@@ -546,19 +587,28 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	switch {
 	case aborted:
 		rec.Error = "client disconnected"
+		ev.outcome = outcomeClientCancelled
 	case idledOut:
 		p.log.Warn("upstream stream idle timeout", "account", rec.AccountID, "model", req.model)
 		rec.Error = "stream idle timeout"
+		ev.outcome = outcomeTransportError
 	case readErr != nil:
 		rec.Error = "upstream stream error: " + sanitizeErr(readErr)
+		ev.outcome = outcomeTransportError
 	case resp.StatusCode >= 400:
 		rec.Error = "upstream " + strconv.Itoa(resp.StatusCode)
+		ev.outcome = outcomeUpstreamError
+	default:
+		ev.outcome = outcomeSuccess
 	}
+	ev.status = resp.StatusCode
 	if incomplete {
-		p.recordIncompleteBudget(ctx, rec)
-		return
+		rec = p.recordIncompleteBudget(ctx, rec)
+	} else {
+		rec = p.recordBudget(ctx, rec)
 	}
-	p.recordBudget(ctx, rec)
+	ev.latencyMS = rec.LatencyMS
+	p.emitAttempt(ev)
 }
 
 // newRecord starts a ledger row for one upstream try.
@@ -597,7 +647,7 @@ func (p *Proxy) newRecord(req *request, account core.Account, failoverOf string)
 
 // record finalizes timing, logs a summary, and writes the ledger row. Ledger
 // failures are logged and never affect the response.
-func (p *Proxy) record(ctx context.Context, rec core.RequestRecord) {
+func (p *Proxy) record(ctx context.Context, rec core.RequestRecord) core.RequestRecord {
 	// Errors can carry upstream/transport text: bound and sanitize them.
 	rec.Error = core.TruncateError(rec.Error)
 	rec.FinishedAt = p.clock.Now()
@@ -610,13 +660,14 @@ func (p *Proxy) record(ctx context.Context, rec core.RequestRecord) {
 		"reasoning_tokens", rec.Usage.ReasoningTokens, "bytes_out", rec.BytesOut,
 		"failover_of", rec.FailoverOf, "error", rec.Error)
 	if p.deps.Ledger == nil {
-		return
+		return rec
 	}
 	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerTimeout)
 	defer cancel()
 	if err := p.deps.Ledger.Record(lctx, rec); err != nil {
 		p.log.Error("ledger record failed", "id", rec.ID, "err", err)
 	}
+	return rec
 }
 
 // recordBudget settles the attempt's budget reservation — when one was taken —
@@ -639,11 +690,14 @@ func (p *Proxy) record(ctx context.Context, rec core.RequestRecord) {
 // failover, a transport error, an upstream error response — is charged at its
 // full hold under the unknown basis. That is deliberate conservative policy:
 // the proxy cannot prove an attempt that reached the upstream was not billed.
-func (p *Proxy) recordBudget(ctx context.Context, rec core.RequestRecord) {
+//
+// It returns the finalized row record wrote, so the caller's completion event
+// carries the same latency the ledger does.
+func (p *Proxy) recordBudget(ctx context.Context, rec core.RequestRecord) core.RequestRecord {
 	if p.deps.Budget != nil {
 		p.settleBudget(ctx, rec, p.deps.Budget.Settle)
 	}
-	p.record(ctx, rec)
+	return p.record(ctx, rec)
 }
 
 // recordIncompleteBudget is recordBudget for a response relay that ended early
@@ -651,11 +705,11 @@ func (p *Proxy) recordBudget(ctx context.Context, rec core.RequestRecord) {
 // any provider-reported cost seen so far, but that cost may come from an
 // intermediate usage record, so the budget settles it with SettleIncomplete:
 // as unknown, charged at max(hold, observed), never as a final cost.
-func (p *Proxy) recordIncompleteBudget(ctx context.Context, rec core.RequestRecord) {
+func (p *Proxy) recordIncompleteBudget(ctx context.Context, rec core.RequestRecord) core.RequestRecord {
 	if p.deps.Budget != nil {
 		p.settleBudget(ctx, rec, p.deps.Budget.SettleIncomplete)
 	}
-	p.record(ctx, rec)
+	return p.record(ctx, rec)
 }
 
 func (p *Proxy) settleBudget(ctx context.Context, rec core.RequestRecord, settle func(context.Context, core.RequestRecord) error) {
