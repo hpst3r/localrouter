@@ -191,10 +191,23 @@ var supportedAlgs = []string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512
 // reservedClaims may not drive the access policy: they are identity,
 // protocol or mutable profile claims.
 var reservedClaims = []string{
-	"iss", "sub", "aud", "exp", "nbf", "iat", "auth_time", "nonce", "azp", "tid", "oid",
-	"email", "email_verified", "preferred_username", "upn", "name", "unique_name",
-	"_claim_names", "_claim_sources", "hasgroups",
+	// JWT registered and OIDC protocol claims.
+	"iss", "sub", "aud", "exp", "nbf", "iat", "jti", "auth_time", "nonce", "azp",
+	"at_hash", "c_hash", "s_hash", "acr", "amr", "sid", "cnf", "sub_jwk",
+	// OIDC Core §5.1 standard claims.
+	"name", "given_name", "family_name", "middle_name", "nickname", "preferred_username",
+	"profile", "picture", "website", "email", "email_verified", "gender", "birthdate",
+	"zoneinfo", "locale", "phone_number", "phone_number_verified", "address", "updated_at",
+	// Provider identity/profile and claim-overage claims.
+	"tid", "oid", "upn", "unique_name", "ipaddr", "idp", "_claim_names", "_claim_sources", "hasgroups",
 }
+
+// ReservedClaims returns a copy of the claim names that may not drive the
+// access policy. Matching is case-sensitive and exact.
+func ReservedClaims() []string { return slices.Clone(reservedClaims) }
+
+// IsReservedClaim reports whether name may not drive the access policy.
+func IsReservedClaim(name string) bool { return slices.Contains(reservedClaims, name) }
 
 var claimNameRE = regexp.MustCompile(`^[A-Za-z0-9_.:/-]{1,128}$`)
 
@@ -335,7 +348,7 @@ func (p *Policy) validate() error {
 		}
 	}
 	if len(p.UserValues)+len(p.AdminValues) > 0 {
-		if !claimNameRE.MatchString(p.Claim) || slices.Contains(reservedClaims, p.Claim) {
+		if !claimNameRE.MatchString(p.Claim) || IsReservedClaim(p.Claim) {
 			return errors.New("weblogin: policy: claim must be a non-reserved claim name")
 		}
 	}

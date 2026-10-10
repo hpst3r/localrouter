@@ -266,14 +266,6 @@ func (i *IdentityConfig) validate(c *Config) []error {
 // Policy bounds shared with the login service.
 const maxClaimValueBytes = 256
 
-// reservedClaims may not drive the access policy: they are identity,
-// protocol or mutable profile claims.
-var reservedClaims = []string{
-	"iss", "sub", "aud", "exp", "nbf", "iat", "auth_time", "nonce", "azp", "tid", "oid",
-	"email", "email_verified", "preferred_username", "upn", "name", "unique_name",
-	"_claim_names", "_claim_sources", "hasgroups",
-}
-
 var claimNameRE = regexp.MustCompile(`^[A-Za-z0-9_.:/-]{1,128}$`)
 
 // validate checks the login access policy. Every login, including one by an
@@ -285,7 +277,7 @@ func (a IdentityAccessConfig) validate() []error {
 	switch {
 	case a.Claim == "":
 		errs = append(errs, errors.New("identity.access.claim is required: every login must carry an allowed claim value"))
-	case !claimNameRE.MatchString(a.Claim) || slices.Contains(reservedClaims, a.Claim):
+	case !claimNameRE.MatchString(a.Claim) || weblogin.IsReservedClaim(a.Claim):
 		errs = append(errs, errors.New("identity.access.claim must be a non-reserved claim name ([A-Za-z0-9_.:/-], at most 128 characters)"))
 	}
 	if len(a.UserValues)+len(a.AdminValues) == 0 {
