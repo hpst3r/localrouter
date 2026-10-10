@@ -93,9 +93,11 @@ must not change without a schema-version bump.
   status that then fails over, the 401/403 auth-refresh attempt, and an error
   status whose body stalled for `StreamIdleTimeout` before it could be read).
 - `transport_error` — no usable upstream response: dial/TLS failure, response
-  header timeout, mid-stream read failure, idle stream timeout, or credential
-  unavailable. The stream failures keep the status already relayed (e.g.
-  `200`); the others report `status=0`.
+  header timeout, mid-stream read failure, idle stream timeout, a successful
+  event stream that ended without its protocol terminal (ledger error
+  `upstream stream ended without completion`), or credential unavailable. The
+  stream failures keep the status already relayed (e.g. `200`); the others
+  report `status=0`.
 - `client_cancelled` — the downstream client went away (before or during the
   response).
 - `budget_exceeded` — spend controls denied the attempt before it was sent: a

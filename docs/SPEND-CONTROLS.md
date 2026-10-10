@@ -257,15 +257,31 @@ How each basis is charged (`store.go` `normalizeCharge`, `Settle`;
   unknown path the requested charge is `0`, so the hold is charged in full at
   the reserved amount.
 - **An incomplete response is a lower bound, never a final cost.** When the
-  relay ends early — client disconnect, stream idle timeout, or upstream read
-  error — any OpenRouter `usage.cost` already seen may come from an
+  relay ends early — client disconnect, stream idle timeout, upstream read
+  error, or a successful (`< 400`) event stream that reaches a clean EOF
+  without its protocol terminal — any OpenRouter `usage.cost` already seen may
+  come from an
   intermediate usage record (a stale `0` or a partial amount). The ledger row
   still keeps that observed cost, but the proxy settles the budget with
   `Gate.SettleIncomplete`, which books it as `unknown` with the observed cost as
   the requested charge. The charge is therefore `max(hold, observed)`: a stale
   zero or partial cost never releases the hold, and an observed cost above the
-  hold is booked in full. A response that completes normally with a reported
-  `0` is still a real, free outcome and releases the hold.
+  hold is booked in full. Token usage from an incomplete response is recorded
+  as unknown, so a table estimate is never booked from it either. A response
+  that completes normally with a reported `0` is still a real, free outcome
+  and releases the hold.
+- **A clean EOF is not completion.** Finality is tracked from the protocol,
+  never inferred from usage or cost: a chat completions stream is complete
+  only after `data: [DONE]` (a chunk with `finish_reason` is not enough), and a
+  Responses stream only after a `response.completed`, `response.incomplete` or
+  `response.failed` event carrying its `response` object (Responses never
+  sends `[DONE]`, and neither protocol accepts the other's terminal). A
+  terminal without usage is still complete. A stream without its terminal is
+  relayed unchanged, recorded with `usage_known = false` and the error
+  `upstream stream ended without completion`, keeps any observed OpenRouter
+  cost in the ledger, and settles through `SettleIncomplete`. Non-stream JSON
+  bodies are framed by HTTP and need no marker, and error statuses (`>= 400`)
+  are settled exactly as before.
 - **Failed attempts are charged the full hold (deliberate policy).** Every
   attempt that settles with no usable cost — the 401/403 attempt before a
   credential-refresh retry, each 429/5xx (or OpenRouter 402) failover attempt,

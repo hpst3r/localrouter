@@ -325,6 +325,11 @@ const invalidateGap = 60 * time.Second
 // stalled for StreamIdleTimeout before the response was relayed.
 const errIdleErrorBody = "upstream idle timeout reading error body"
 
+// errUnterminatedStream is the ledger error for a successful event stream
+// that reached a clean EOF without its protocol's terminal (see
+// usageCapture.Completed).
+const errUnterminatedStream = "upstream stream ended without completion"
+
 // classify decides how an upstream status counts against the account.
 // scoped means the failure was caused by this request, not the account, so
 // policy must not cool the account down; final additionally means no other
@@ -571,7 +576,13 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	}
 
 	usage, known := capture.Result()
-	incomplete := aborted || idledOut || readErr != nil
+	// A clean EOF is not proof the response finished: a successful event
+	// stream must also have delivered its protocol's terminal. Finality is
+	// never inferred from usage or cost, which an intermediate record can
+	// carry. Error statuses keep their existing handling.
+	unterminated := !aborted && !idledOut && readErr == nil &&
+		resp.StatusCode < 400 && !capture.Completed(req.endpoint)
+	incomplete := aborted || idledOut || readErr != nil || unterminated
 	if incomplete {
 		known = false
 	}
@@ -590,8 +601,9 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	// Provider-reported cost is an independent observation and is only trusted
 	// from OpenRouter; cost fields from other providers are ignored. Read it
 	// after Result above has flushed any final buffered event. On an incomplete
-	// stream the ledger still keeps it, but it may come from an intermediate
-	// usage record, so the budget settles it only as a lower bound (below).
+	// stream (including one that ended without its terminal) the ledger still
+	// keeps it, but it may come from an intermediate usage record, so the
+	// budget settles it only as a lower bound (below).
 	if rec.Provider == core.ProviderOpenRouter {
 		rec.ReportedCostUSD = capture.ReportedCost()
 	}
@@ -605,6 +617,10 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 		ev.outcome = outcomeTransportError
 	case readErr != nil:
 		rec.Error = "upstream stream error: " + sanitizeErr(readErr)
+		ev.outcome = outcomeTransportError
+	case unterminated:
+		p.log.Warn("upstream stream ended without completion", "account", rec.AccountID, "model", req.model)
+		rec.Error = errUnterminatedStream
 		ev.outcome = outcomeTransportError
 	case resp.StatusCode >= 400:
 		rec.Error = "upstream " + strconv.Itoa(resp.StatusCode)
@@ -712,7 +728,8 @@ func (p *Proxy) recordBudget(ctx context.Context, rec core.RequestRecord) core.R
 }
 
 // recordIncompleteBudget is recordBudget for a response relay that ended early
-// (client disconnect, idle timeout, upstream read error). The ledger row keeps
+// (client disconnect, idle timeout, upstream read error, or a successful event
+// stream that reached EOF without its protocol terminal). The ledger row keeps
 // any provider-reported cost seen so far, but that cost may come from an
 // intermediate usage record, so the budget settles it with SettleIncomplete:
 // as unknown, charged at max(hold, observed), never as a final cost.

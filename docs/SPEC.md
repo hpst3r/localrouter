@@ -369,6 +369,13 @@ responses stay JSON-encodable.
   any usage record makes the response's usage unknown (`usage_known = false`)
   rather than storing it. Cached input is clamped to at most input, and
   reasoning to at most output (usage stays known).
+- Stream completion is tracked separately from usage: a successful (`< 400`)
+  chat stream is complete only after `data: [DONE]`, a Responses stream only
+  after `response.completed`/`response.incomplete`/`response.failed` with its
+  `response` object (usage optional). A clean EOF without that terminal is
+  incomplete: `usage_known = false`, error
+  `upstream stream ended without completion`, outcome `transport_error`.
+  Non-stream JSON bodies need no marker.
 - Client disconnect or missing usage ⇒ `usage_known = false`; lease still
   released. An already observed provider cost is retained alongside the
   transport/request error, independently of token knowledge; for an interrupted

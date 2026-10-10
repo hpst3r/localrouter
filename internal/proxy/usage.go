@@ -163,6 +163,35 @@ type usageCapture struct {
 	// knowledge so a cost-only usage object still yields a value; nil means
 	// that latest record did not carry a usable cost.
 	reportedCost *float64
+
+	// Protocol completion, tracked independently of usage and cost: whether
+	// the stream's own terminal arrived whole. sawDone is a chat
+	// "data: [DONE]"; sawResponseEnd is a Responses response.completed,
+	// response.incomplete or response.failed event carrying its response
+	// object. See Completed.
+	sawDone        bool
+	sawResponseEnd bool
+}
+
+// doneSentinel is the chat completions stream terminal's data payload.
+var doneSentinel = []byte("[DONE]")
+
+// isResponseEnd reports whether typ is a Responses terminal event type.
+func isResponseEnd(typ string) bool {
+	switch typ {
+	case "response.completed", "response.incomplete", "response.failed":
+		return true
+	}
+	return false
+}
+
+// mayEndResponse is a cheap pre-filter for events that could be a Responses
+// terminal, so usage-less events are only decoded when they might be one.
+func mayEndResponse(event string, data []byte) bool {
+	return isResponseEnd(event) ||
+		bytes.Contains(data, []byte("response.completed")) ||
+		bytes.Contains(data, []byte("response.incomplete")) ||
+		bytes.Contains(data, []byte("response.failed"))
 }
 
 func newUsageCapture(contentType string) *usageCapture {
@@ -248,7 +277,14 @@ func (c *usageCapture) handleLine(line []byte) {
 func (c *usageCapture) dispatch() {
 	data, event, over := c.data, c.event, c.dataOver
 	c.data, c.event, c.dataOver = c.data[:0], "", false
-	if over || len(data) == 0 || !bytes.Contains(data, []byte(`"usage"`)) {
+	if over || len(data) == 0 {
+		return
+	}
+	if bytes.Equal(bytes.TrimSpace(data), doneSentinel) {
+		c.sawDone = true
+		return
+	}
+	if !bytes.Contains(data, []byte(`"usage"`)) && !mayEndResponse(event, data) {
 		return
 	}
 	var ev struct {
@@ -265,9 +301,10 @@ func (c *usageCapture) dispatch() {
 	if typ == "" {
 		typ = event
 	}
-	switch typ {
-	case "response.completed", "response.incomplete", "response.failed":
+	if isResponseEnd(typ) {
 		if ev.Response != nil {
+			// A terminal is complete without usage: some providers omit it.
+			c.sawResponseEnd = true
 			if u := ev.Response.Usage; u != nil {
 				// The most recent usage-bearing record is authoritative for
 				// cost: re-read it unconditionally so a stale intermediate
@@ -296,18 +333,24 @@ func (c *usageCapture) dispatch() {
 	}
 }
 
+// flush dispatches a final SSE event not terminated by a blank line. It is
+// idempotent.
+func (c *usageCapture) flush() {
+	if len(c.line) > 0 && !c.skipLine {
+		c.handleLine(bytes.TrimSuffix(c.line, []byte{'\r'}))
+		c.line = c.line[:0]
+	}
+	if len(c.data) > 0 {
+		c.dispatch()
+	}
+}
+
 // Result returns the captured usage. For SSE it is the last usage-bearing
-// event; for JSON bodies it is the top-level usage object.
+// event; for JSON bodies it is the top-level usage object. Usage says nothing
+// about whether the stream finished; see Completed.
 func (c *usageCapture) Result() (core.Usage, bool) {
 	if c.sse {
-		// Flush a final event not terminated by a blank line.
-		if len(c.line) > 0 && !c.skipLine {
-			c.handleLine(bytes.TrimSuffix(c.line, []byte{'\r'}))
-			c.line = c.line[:0]
-		}
-		if len(c.data) > 0 {
-			c.dispatch()
-		}
+		c.flush()
 		if c.bad {
 			return core.Usage{}, false
 		}
@@ -335,3 +378,27 @@ func (c *usageCapture) Result() (core.Usage, bool) {
 // a cost-only usage object still yields a value. Call it after Result so any
 // final event buffered without a trailing blank line has been flushed.
 func (c *usageCapture) ReportedCost() *float64 { return c.reportedCost }
+
+// Completed reports whether the response reached its protocol's own terminal,
+// independently of any usage or cost it carried. Call it after the body was
+// read to a clean EOF. A non-stream body is framed by HTTP and needs no
+// marker, so it is always complete. An event stream is complete only if its
+// terminal arrived whole: "data: [DONE]" for chat completions, or a
+// response.completed, response.incomplete or response.failed event with its
+// response object for Responses (which never sends [DONE]). A chat chunk with
+// finish_reason is not a terminal, and neither protocol accepts the other's.
+// endpoint is the upstream path, "/chat/completions" or "/responses"; a
+// stream on any other endpoint is never complete.
+func (c *usageCapture) Completed(endpoint string) bool {
+	if !c.sse {
+		return true
+	}
+	c.flush()
+	switch endpoint {
+	case "/chat/completions":
+		return c.sawDone
+	case "/responses":
+		return c.sawResponseEnd
+	}
+	return false
+}

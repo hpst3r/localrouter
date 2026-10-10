@@ -101,8 +101,9 @@ func (g *Gate) Settle(ctx context.Context, rec core.RequestRecord) error {
 }
 
 // SettleIncomplete closes the reservation for an attempt whose response was
-// cut short — a client disconnect, an idle timeout or an upstream read error
-// mid-stream — and so never delivered its final usage record. Any cost the
+// cut short — a client disconnect, an idle timeout, an upstream read error
+// mid-stream, or a stream that reached EOF without its protocol terminal — and
+// so never delivered its final usage record. Any cost the
 // ledger resolves for such an attempt (typically an OpenRouter usage.cost from
 // an intermediate record, which can be a stale zero or a partial amount) is
 // only a lower bound on what the provider will bill. It therefore books under
