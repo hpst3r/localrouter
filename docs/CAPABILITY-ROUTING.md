@@ -284,6 +284,12 @@ ledger-write time.
 - An **unpriced backend stays honestly unpriced**. There is no fallback from an
   unpriced backend to a possibly unrelated alias — the row is simply unpriced
   (`cost_usd` NULL).
+- **Spend controls settle at the same key.** When a `budgets` block is
+  configured, an attempt's `estimated` settlement is priced by the same
+  generation price table at the same key as its ledger row, so each attempt —
+  including each failover candidate — is charged to its client and account
+  budgets at its own backend's price. An unpriced backend settles as `unknown`
+  at the fixed hold (see `SPEND-CONTROLS.md` §7).
 
 The resolved backend name is recorded in `upstream_model` for every attempt; on
 constrained routes `pricing_model` is what selects the price. History is only ever

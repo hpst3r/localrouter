@@ -18,6 +18,11 @@ channels, in-memory queues or persisted tables are introduced.
 - logger message: `attempt completed`
 - stable machine key: `event = routing_attempt_completed`
 
+An attempt the budget denies (see `SPEND-CONTROLS.md`) also writes a ledger
+row before any upstream contact, so it emits one event with `status=0`,
+`failover_eligible=false` and a budget outcome (below); a client that
+disconnects while the reservation is being taken reports `client_cancelled`.
+
 A denied request (policy rejection) performs no upstream attempt and therefore
 emits **no** completion event; the pre-existing `policy denied` diagnostic is
 unchanged. A policy that returns an unknown account also writes no ledger row
@@ -93,6 +98,13 @@ must not change without a schema-version bump.
   `200`); the others report `status=0`.
 - `client_cancelled` — the downstream client went away (before or during the
   response).
+- `budget_exceeded` — spend controls denied the attempt before it was sent: a
+  client or account ceiling had no room for the fixed hold. The client receives
+  429 `budget_exceeded`; the attempt is terminal and is never failed over.
+- `budget_store_error` — spend controls could not take the reservation (store
+  unavailable). The client receives 503 `budget_store_error`; terminal.
+
+The two budget outcomes are additive values; no existing outcome changed.
 
 **Credential unavailable is a local attempt.** When the account's credential
 cannot be obtained, the proxy never contacts upstream, but it still writes a
@@ -168,6 +180,14 @@ can be echoed through the new log path before that work is reviewed:
 Until then, `class`, `client`, `account` and `provider` carry the configured
 routing identity, and the ledger (`core.RequestRecord`) remains the only place
 where route/model attribution is persisted.
+
+**Status in the integrated tree.** Capability routing has landed alongside this
+event, and these fields remain **excluded**: adding any of them is a separate,
+reviewed contract change. The backend attribution an attempt resolved
+(`upstream_model`, `pricing_model`) is persisted only on the ledger row, which
+`attempt_id` joins. The integrated suite
+(`internal/proxy/stack_integration_test.go`) checks that no event carries the
+client alias, a backend alias or the route name.
 
 Latency is **no longer deferred**: `latency_ms` is emitted today on every record
 path, sourced from the ledger row's own `LatencyMS` (one clock read in

@@ -235,8 +235,11 @@ under one of three bases. The **resolution order is fixed**:
    `CostBasisReported` and wins over the price table. A larger value is
    unusable and falls through to the next basis.
 2. **Estimated** — otherwise, if the attempt has **known usage** and the
-   generation's price table prices the model, the table's computed cost resolves
-   as `CostBasisEstimated`. Reasoning tokens are part of output; cached and
+   generation's price table prices the attempt's pricing key, the table's
+   computed cost resolves as `CostBasisEstimated`. The pricing key is the
+   ledger's: `pricing_model` when set (the backend a capability-constrained
+   route resolved for this attempt, see `CAPABILITY-ROUTING.md` §7), else the
+   client-facing `model`. Reasoning tokens are part of output; cached and
    cache-creation tokens are subsets of input and clamped so the uncached
    remainder is never negative (`ledger.go` `resolveCost`, `pricing.go` `Cost`).
 3. **Unknown** — otherwise the cost is nil and the basis is `CostBasisUnknown`,
@@ -414,8 +417,12 @@ loaded by `ledger.LoadPricing(cfg.PricingFile)`:
 **Caveat — not route/backend aware.** The budget gate is a fixed per-attempt
 hold against the attempt's client and account keys. It is **not integrated with
 routing**: it does not select, rank, or influence which route/account/backend
-serves a request, and it does not consult backend identity or model routing.
-Do not describe spend controls here as route-aware or backend-aware. Routing
+serves a request, and its admission does not consult backend identity or model
+routing. The only point of contact is settlement: an `estimated` charge is
+priced at the same key the ledger row uses, so an attempt on a
+capability-constrained route is charged at its resolved backend's price, never
+at the client alias's. Do not describe spend controls here as route-aware or
+backend-aware. Routing
 admission (quota reserves, policy) is a separate mechanism with its own
 rejection type and its own `Retry-After` behaviour.
 
