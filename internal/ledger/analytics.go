@@ -1,12 +1,14 @@
 package ledger
 
 import (
+	"container/heap"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/core"
@@ -73,15 +75,12 @@ func (l *Ledger) analytics(ctx context.Context, q core.AnalyticsQuery, loc *time
 		filterSQL += " AND " + dimensionColumns[k] + " = ?"
 		filterArgs = append(filterArgs, q.Filters[k])
 	}
-	query := `SELECT (started_at - ?) / ? AS s, ` + groupCol + `, ` + aggCols + `
-		FROM requests WHERE started_at >= ? AND started_at < ?` + filterSQL + ` GROUP BY s, ` + groupCol
 
 	// The range is split at bucket boundaries into chunks queried
 	// concurrently (WAL readers don't block each other); SQLite's GROUP BY
 	// is the dominant cost on large ranges.
 	nChunks := min(analyticsChunks, len(starts))
-	chunks := make([][]slotRow, nChunks)
-	eg, egctx := errgroup.WithContext(ctx)
+	bounds := make([][2]int64, nChunks)
 	for c := range nChunks {
 		lo, hi := q.From.UnixMilli(), q.To.UnixMilli()
 		if c > 0 {
@@ -90,7 +89,36 @@ func (l *Ledger) analytics(ctx context.Context, q core.AnalyticsQuery, loc *time
 		if c < nChunks-1 {
 			hi = starts[(c+1)*len(starts)/nChunks].UnixMilli()
 		}
-		args := append([]any{base, slot, lo, hi}, filterArgs...)
+		bounds[c] = [2]int64{lo, hi}
+	}
+
+	// Rank every key in range first and keep only the best
+	// core.AnalyticsMaxBreakdown, so memory does not grow with the number
+	// of distinct keys times buckets.
+	breakdown, nKeys, err := l.rankKeys(ctx, groupCol, filterSQL, filterArgs, bounds)
+	if err != nil {
+		return core.AnalyticsResult{}, err
+	}
+	top := breakdown[:min(topN, len(breakdown))]
+
+	// Per-slot aggregates name only the top keys; every other key is folded
+	// into a NULL key (__other__) by SQL.
+	keyExpr := groupCol
+	var keyArgs []any
+	if nKeys > len(top) {
+		keyExpr = `CASE WHEN ` + groupCol + ` IN (?` + strings.Repeat(`,?`, len(top)-1) + `) THEN ` + groupCol + ` END`
+		for _, b := range top {
+			keyArgs = append(keyArgs, b.Key)
+		}
+	}
+	query := `SELECT (started_at - ?) / ? AS s, ` + keyExpr + ` AS k, ` + aggCols + `
+		FROM requests WHERE started_at >= ? AND started_at < ?` + filterSQL + ` GROUP BY s, k`
+
+	chunks := make([][]slotRow, nChunks)
+	eg, egctx := errgroup.WithContext(ctx)
+	for c, b := range bounds {
+		args := append(append([]any{base, slot}, keyArgs...), b[0], b[1])
+		args = append(args, filterArgs...)
 		eg.Go(func() (err error) {
 			chunks[c], err = l.querySlots(egctx, query, args)
 			return err
@@ -100,55 +128,37 @@ func (l *Ledger) analytics(ctx context.Context, q core.AnalyticsQuery, loc *time
 		return core.AnalyticsResult{}, err
 	}
 
-	type acc struct {
-		total  core.UsageRow
-		points []core.UsageRow
+	series := make([]core.AnalyticsSeries, len(top), len(top)+1)
+	index := make(map[string]int, len(top))
+	for i, b := range top {
+		index[b.Key] = i
+		series[i] = core.AnalyticsSeries{Key: b.Key, Total: core.UsageRow{Key: b.Key}, Points: make([]core.UsageRow, len(starts))}
 	}
-	groups := map[string]*acc{}
+	var other *core.AnalyticsSeries
 	var totals core.UsageRow
 	for _, chunk := range chunks {
 		for _, r := range chunk {
 			at := base + r.slot*slot
 			i := sort.Search(len(starts), func(i int) bool { return starts[i].UnixMilli() > at }) - 1
-			g := groups[r.key]
-			if g == nil {
-				g = &acc{total: core.UsageRow{Key: r.key}, points: make([]core.UsageRow, len(starts))}
-				groups[r.key] = g
+			var dst *core.AnalyticsSeries
+			if j, ok := index[r.key.String]; ok && r.key.Valid {
+				dst = &series[j]
+			} else {
+				// NULL key, or a key that appeared after ranking.
+				if other == nil {
+					other = &core.AnalyticsSeries{Key: core.AnalyticsOtherKey,
+						Total: core.UsageRow{Key: core.AnalyticsOtherKey}, Points: make([]core.UsageRow, len(starts))}
+				}
+				dst = other
 			}
-			addRow(&g.points[i], r.u)
-			addRow(&g.total, r.u)
+			addRow(&dst.Points[i], r.u)
+			addRow(&dst.Total, r.u)
 			addRow(&totals, r.u)
 		}
 	}
-
-	breakdown := make([]core.UsageRow, 0, len(groups))
-	for _, g := range groups {
-		breakdown = append(breakdown, g.total)
-	}
-	sort.Slice(breakdown, func(i, j int) bool {
-		ti, tj := rankTokens(breakdown[i]), rankTokens(breakdown[j])
-		if ti != tj {
-			return ti > tj
-		}
-		return breakdown[i].Key < breakdown[j].Key
-	})
-
-	series := []core.AnalyticsSeries{}
-	var other *core.AnalyticsSeries
-	for i, b := range breakdown {
-		g := groups[b.Key]
-		if i < topN {
-			series = append(series, core.AnalyticsSeries{Key: b.Key, Total: g.total, Points: g.points})
-			continue
-		}
-		if other == nil {
-			other = &core.AnalyticsSeries{Key: core.AnalyticsOtherKey,
-				Total: core.UsageRow{Key: core.AnalyticsOtherKey}, Points: make([]core.UsageRow, len(starts))}
-		}
-		addRow(&other.Total, g.total)
-		for j := range g.points {
-			addRow(&other.Points[j], g.points[j])
-		}
+	// Top breakdown rows mirror their series totals (same scan as Points).
+	for i := range top {
+		breakdown[i] = series[i].Total
 	}
 	if other != nil {
 		series = append(series, *other)
@@ -159,23 +169,130 @@ func (l *Ledger) analytics(ctx context.Context, q core.AnalyticsQuery, loc *time
 		filters[k] = v
 	}
 	return core.AnalyticsResult{
-		SchemaVersion: analyticsSchema,
-		From:          q.From,
-		To:            q.To,
-		Bucket:        q.Bucket,
-		BucketStarts:  starts,
-		Group:         q.Group,
-		Filters:       filters,
-		Totals:        totals,
-		Breakdown:     breakdown,
-		Series:        series,
+		SchemaVersion:    analyticsSchema,
+		From:             q.From,
+		To:               q.To,
+		Bucket:           q.Bucket,
+		BucketStarts:     starts,
+		Group:            q.Group,
+		Filters:          filters,
+		Totals:           totals,
+		Breakdown:        breakdown,
+		BreakdownOmitted: nKeys - len(breakdown),
+		Series:           series,
 	}, nil
+}
+
+// rankKeys aggregates every group key matching the filters within bounds and
+// returns the best core.AnalyticsMaxBreakdown rows in rank order (rankTokens
+// desc, key asc) plus the number of distinct keys. Each chunk is grouped and
+// ordered by key in SQL; the streams are merged by key and pass through a
+// bounded heap, so memory does not depend on the number of keys.
+func (l *Ledger) rankKeys(ctx context.Context, groupCol, filterSQL string, filterArgs []any, bounds [][2]int64) ([]core.UsageRow, int, error) {
+	query := `SELECT ` + groupCol + `, ` + aggCols + `
+		FROM requests WHERE started_at >= ? AND started_at < ?` + filterSQL + `
+		GROUP BY ` + groupCol + ` ORDER BY ` + groupCol
+	eg, egctx := errgroup.WithContext(ctx)
+	streams := make([]chan core.UsageRow, len(bounds))
+	for c, b := range bounds {
+		ch := make(chan core.UsageRow, 64)
+		streams[c] = ch
+		args := append([]any{b[0], b[1]}, filterArgs...)
+		eg.Go(func() error {
+			defer close(ch)
+			rows, err := l.db.QueryContext(egctx, query, args...)
+			if err != nil {
+				return fmt.Errorf("ledger: analytics: %w", err)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var u core.UsageRow
+				if err := scanAgg(rows, &u, &u.Key); err != nil {
+					return fmt.Errorf("ledger: analytics: %w", err)
+				}
+				select {
+				case ch <- u:
+				case <-egctx.Done():
+					return egctx.Err()
+				}
+			}
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("ledger: analytics: %w", err)
+			}
+			return nil
+		})
+	}
+
+	// SQLite's default BINARY collation orders like Go string comparison.
+	heads := make([]core.UsageRow, len(streams))
+	live := make([]bool, len(streams))
+	for c, ch := range streams {
+		heads[c], live[c] = <-ch
+	}
+	h := &rankHeap{}
+	n := 0
+	for {
+		first := -1
+		for c := range streams {
+			if live[c] && (first < 0 || heads[c].Key < heads[first].Key) {
+				first = c
+			}
+		}
+		if first < 0 {
+			break
+		}
+		u := core.UsageRow{Key: heads[first].Key}
+		for c, ch := range streams {
+			if live[c] && heads[c].Key == u.Key {
+				addRow(&u, heads[c])
+				heads[c], live[c] = <-ch
+			}
+		}
+		n++
+		switch {
+		case h.Len() < core.AnalyticsMaxBreakdown:
+			heap.Push(h, u)
+		case rankBefore(u, (*h)[0]):
+			(*h)[0] = u
+			heap.Fix(h, 0)
+		}
+	}
+	// A failed stream closes early; its error is reported here.
+	if err := eg.Wait(); err != nil {
+		return nil, 0, err
+	}
+	out := []core.UsageRow(*h)
+	sort.Slice(out, func(i, j int) bool { return rankBefore(out[i], out[j]) })
+	return out, n, nil
+}
+
+// rankBefore reports whether a ranks above b.
+func rankBefore(a, b core.UsageRow) bool {
+	ta, tb := rankTokens(a), rankTokens(b)
+	if ta != tb {
+		return ta > tb
+	}
+	return a.Key < b.Key
+}
+
+// rankHeap is a min-heap by rank: the lowest-ranked kept row is at [0].
+type rankHeap []core.UsageRow
+
+func (h rankHeap) Len() int           { return len(h) }
+func (h rankHeap) Less(i, j int) bool { return rankBefore(h[j], h[i]) }
+func (h rankHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *rankHeap) Push(x any)        { *h = append(*h, x.(core.UsageRow)) }
+func (h *rankHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
 }
 
 // slotRow is one (slot, group key) aggregate from querySlots.
 type slotRow struct {
 	slot int64
-	key  string
+	key  sql.NullString // NULL: folded into __other__
 	u    core.UsageRow
 }
 
@@ -189,17 +306,8 @@ func (l *Ledger) querySlots(ctx context.Context, query string, args []any) ([]sl
 	var out []slotRow
 	for rows.Next() {
 		var r slotRow
-		var cost sql.NullFloat64
-		var in, cached, creation, outTok, reasoning float64
-		if err := rows.Scan(&r.slot, &r.key, &r.u.Requests, &in, &cached, &creation, &outTok, &reasoning,
-			&cost, &r.u.UnknownUsageRequests, &r.u.UnpricedRequests); err != nil {
+		if err := scanAgg(rows, &r.u, &r.slot, &r.key); err != nil {
 			return nil, fmt.Errorf("ledger: analytics: %w", err)
-		}
-		r.u.InputTokens, r.u.CachedInputTokens = satInt(in), satInt(cached)
-		r.u.CacheCreationInputTokens, r.u.OutputTokens, r.u.ReasoningTokens = satInt(creation), satInt(outTok), satInt(reasoning)
-		if cost.Valid {
-			c := cost.Float64
-			r.u.CostUSD = &c
 		}
 		out = append(out, r)
 	}
@@ -207,6 +315,25 @@ func (l *Ledger) querySlots(ctx context.Context, query string, args []any) ([]sl
 		return nil, fmt.Errorf("ledger: analytics: %w", err)
 	}
 	return out, nil
+}
+
+// scanAgg scans the leading columns into lead and the aggCols that follow
+// into u (token totals and cost saturated, NULL cost = nil).
+func scanAgg(rows *sql.Rows, u *core.UsageRow, lead ...any) error {
+	var cost sql.NullFloat64
+	var in, cached, creation, outTok, reasoning float64
+	dest := append(lead, &u.Requests, &in, &cached, &creation, &outTok, &reasoning,
+		&cost, &u.UnknownUsageRequests, &u.UnpricedRequests)
+	if err := rows.Scan(dest...); err != nil {
+		return err
+	}
+	u.InputTokens, u.CachedInputTokens = satInt(in), satInt(cached)
+	u.CacheCreationInputTokens, u.OutputTokens, u.ReasoningTokens = satInt(creation), satInt(outTok), satInt(reasoning)
+	if cost.Valid {
+		c := satCost(cost.Float64)
+		u.CostUSD = &c
+	}
+	return nil
 }
 
 // validateAnalytics checks q and returns the group column and effective TopN.
@@ -279,7 +406,7 @@ func addRow(dst *core.UsageRow, u core.UsageRow) {
 	if u.CostUSD != nil {
 		c := *u.CostUSD
 		if dst.CostUSD != nil {
-			c += *dst.CostUSD
+			c = satCost(c + *dst.CostUSD)
 		}
 		dst.CostUSD = &c
 	}

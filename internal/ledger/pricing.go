@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,12 +110,22 @@ func readPricingFile(path string) (pricingFile, error) {
 		return f, fmt.Errorf("pricing: parse %s: %w", path, err)
 	}
 	for name, mp := range f.Models {
-		if mp.Input < 0 || mp.Output < 0 || (mp.CachedInput != nil && *mp.CachedInput < 0) ||
-			(mp.CacheCreationInput != nil && *mp.CacheCreationInput < 0) {
-			return f, fmt.Errorf("pricing: model %q: negative price", name)
+		if err := checkPrice(name, mp); err != nil {
+			return f, fmt.Errorf("%w (in %s)", err, path)
 		}
 	}
 	return f, nil
+}
+
+// checkPrice rejects a price that is NaN, negative, infinite or above
+// core.MaxPricePerMTokUSD, so a tampered table cannot make Cost return +Inf.
+func checkPrice(name string, mp ModelPrice) error {
+	ok := func(p float64) bool { return p >= 0 && p <= core.MaxPricePerMTokUSD } // false for NaN
+	if !ok(mp.Input) || !ok(mp.Output) || (mp.CachedInput != nil && !ok(*mp.CachedInput)) ||
+		(mp.CacheCreationInput != nil && !ok(*mp.CacheCreationInput)) {
+		return fmt.Errorf("pricing: model %q: price must be between 0 and %g USD per 1M tokens", name, core.MaxPricePerMTokUSD)
+	}
+	return nil
 }
 
 // Lookup returns the price for model by exact name, then case-insensitively.
@@ -132,7 +143,9 @@ func (p *Pricing) Lookup(model string) (ModelPrice, bool) {
 // Cost returns the USD cost of u for model, or ok=false if the model is not
 // priced. Reasoning tokens are part of output and not billed separately.
 // Cached and cache-creation tokens are subsets of InputTokens; they are
-// clamped so the uncached remainder is never negative.
+// clamped so the uncached remainder is never negative. A non-finite result
+// (only possible with a table that bypassed checkPrice) is reported as
+// unpriced, so resolveCost and Reprice store NULL.
 func (p *Pricing) Cost(model string, u core.Usage) (float64, bool) {
 	mp, ok := p.Lookup(model)
 	if !ok {
@@ -150,8 +163,12 @@ func (p *Pricing) Cost(model string, u core.Usage) (float64, bool) {
 	cached := min(max(u.CachedInputTokens, 0), input)
 	creation := min(max(u.CacheCreationInputTokens, 0), input-cached)
 	uncached := input - cached - creation
-	return (float64(uncached)*mp.Input + float64(cached)*cachedRate +
-		float64(creation)*creationRate + float64(max(u.OutputTokens, 0))*mp.Output) / 1e6, true
+	c := (float64(uncached)*mp.Input + float64(cached)*cachedRate +
+		float64(creation)*creationRate + float64(max(u.OutputTokens, 0))*mp.Output) / 1e6
+	if math.IsNaN(c) || math.IsInf(c, 0) {
+		return 0, false
+	}
+	return c, true
 }
 
 type litellmEntry struct {
@@ -163,7 +180,8 @@ type litellmEntry struct {
 
 // ImportLiteLLM parses LiteLLM's model_prices_and_context_window.json and
 // converts per-token prices to per-1M. Entries lacking input or output cost
-// are skipped. Keys of the form "provider/model" are kept and additionally
+// are skipped; an entry with a price outside checkPrice's range fails the
+// whole import. Keys of the form "provider/model" are kept and additionally
 // aliased as "model" unless that name is an original key or the alias is
 // ambiguous (several providers with different prices).
 func ImportLiteLLM(r io.Reader) (map[string]ModelPrice, error) {
@@ -190,6 +208,9 @@ func ImportLiteLLM(r io.Reader) (map[string]ModelPrice, error) {
 		if e.CacheWrite != nil {
 			c := *e.CacheWrite * 1e6
 			mp.CacheCreationInput = &c
+		}
+		if err := checkPrice(key, mp); err != nil {
+			return nil, err
 		}
 		out[key] = mp
 		if i := strings.Index(key, "/"); i > 0 && i < len(key)-1 {

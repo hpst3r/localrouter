@@ -55,6 +55,16 @@ Inference requires the client key in the `Authorization` header, using the
   400 `{"error":{"message":"codex accounts only serve /v1/responses"}}`.
 - `GET /v1/models` — synthesized from config `routes[].models` (exact names).
 
+The body is parsed once, with the upstream's exact-key, case-sensitive
+semantics, and rejected with 400 `invalid_request_error` (never forwarded)
+unless it is a single UTF-8 JSON object (no trailing data) with no duplicate
+top-level keys and no top-level key equal to `model`/`stream` only
+case-insensitively (e.g. `MODEL`, `Stream`). `model` must be a non-empty
+string; `stream`, if present, a boolean or `null` (an omitted optional, read
+as false). Nested values are not inspected
+beyond syntax. The route is chosen from that `model`, so the upstream reads
+the same model and stream mode that was routed.
+
 Body is forwarded verbatim except:
 - `chat/completions` with `"stream": true`: set
   `stream_options.include_usage = true` (preserve other stream_options).
@@ -70,6 +80,8 @@ stripped.
 
 Optional attribution headers from clients (stored, never forwarded):
 `X-LocalRouter-Session`, `X-LocalRouter-Task`, `X-LocalRouter-Agent`.
+Each is truncated to 128 bytes on a UTF-8 boundary, with invalid UTF-8 and
+control characters replaced by U+FFFD.
 `X-LocalRouter-Class: background` lets an interactive-class key downgrade
 itself; a background key can never upgrade.
 
@@ -98,7 +110,12 @@ Codex passive observation: responses from `chatgpt.com` carry headers
 (any may be absent). The proxy hands headers to `QuotaSource.ObserveHeaders`.
 
 Ollama Cloud: `GET https://ollama.com/api/usage` with
-the API key in `Authorization` using the `Bearer` scheme.
+the API key in `Authorization` using the `Bearer` scheme, only when the
+account's `base_url` host equals the usage URL host (case-insensitive, port
+ignored); otherwise no request is made and the snapshot `Err` is
+`usage api: usage polling unavailable for non-ollama.com base_url`. All usage
+API requests (Codex, Ollama, Claude, OpenRouter) never follow redirects; a
+3xx is an `http 3xx` fetch error.
 `limits.session.usage` → `5h`,
 `limits.weekly.usage` → `weekly`; values are ALREADY 0–1 fractions. No
 reset time: `ResetAt` zero, `WindowSeconds` 18000 / 604800.
@@ -130,7 +147,17 @@ Staleness: snapshot older than `policy.stale_after` (default 10m) or absent:
 
 Cooldown: after upstream 429 (or 401/403 after one refresh retry), the
 account is excluded until `max(reset_at of exhausted window, now+60s)`;
-cleared early if a fresh snapshot shows headroom.
+cleared early if a fresh snapshot shows headroom. A 401/403 triggers a
+credential refresh (`Invalidate` + retry on the same account) at most once
+per account per 60s; inside that window it is handled as an account-level
+failure without a refresh.
+
+Request-scoped failures never cool an account down: the proxy releases the
+lease with `Outcome.RequestScoped`, and policy then only decrements
+in-flight and requests a non-urgent refresh. Otherwise one client could lock
+every other class out of an account with a request that only fails for
+itself. Only OpenRouter answers are classified as request-scoped (see
+OpenRouter); codex/ollama/openai_compat 401/403/429 stay account-level.
 
 Selection: routes give an ordered account list per class. First admissible
 account wins. Admission is atomic with lease creation (mutex) to prevent the
@@ -139,8 +166,14 @@ not all pass. `inflight(A)` counts open leases.
 
 Lease release reports outcome {HTTP status, usage known?, bytes streamed}.
 Failover: proxy may retry on the next admissible account ONLY if no response
-bytes were sent to the client and status was 429/401/403/5xx-before-body.
-Max 2 failovers. Each attempt is a separate ledger row.
+bytes were sent to the client and status was 429/401/403/5xx-before-body
+(OpenRouter: also 402; never a 403). Max 2 failovers. Each attempt is a
+separate ledger row. Every upstream body read before relaying (buffering a
+retryable error body, classifying an OpenRouter 402, draining before an
+auth retry) uses the stream idle timeout (300s): if no bytes arrive for that
+long the upstream request is aborted, the ledger row records `upstream idle
+timeout reading error body`, and the bytes read so far are failed over or
+relayed as the answer.
 
 ## Concurrency limits and inbound timeouts
 
@@ -181,7 +214,8 @@ unpriced. Unknown price ⇒ `cost_usd` NULL, never 0. `metered` and
 `api_equivalent` amounts from local pricing are estimates; `provider_reported`
 is a distinct request-level provenance.
 
-A usable provider-reported cost (finite, ≥ 0, present only for OpenRouter) is
+A usable provider-reported cost (0 ≤ cost ≤ `core.MaxReportedCostUSD` = 1e6
+USD, so NaN/±Inf are unusable; present only for OpenRouter) is
 recorded verbatim as `cost_usd` with `cost_basis: provider_reported`. It takes
 precedence over the local price table — including an explicit 0 — and is kept
 even when token usage was not parseable (`usage_known = 0`), since the cost is
@@ -197,6 +231,13 @@ Pricing file `pricing.yaml`: per model, USD per 1M `input`, `cached_input`,
 `output` (reasoning billed as output). Shipped EMPTY of numbers; user or
 `localrouter pricing import <litellm json>` populates it. Never invent prices.
 Cost = (input−cached)·in + cached·cached_in + output·out, all /1e6.
+Every price must be 0 ≤ price ≤ `core.MaxPricePerMTokUSD` (1e6 USD per 1M
+tokens); loading `pricing.yaml` or `pricing.local.yaml` fails on any other
+value (including YAML `.nan`/`.inf`), naming the model, and `pricing import`
+fails the same way instead of writing such a table. A computed cost that is
+not finite counts as unpriced (`cost_usd` NULL) in Record and Reprice. Cost
+sums in Summary and Analytics saturate at the largest finite float64 so
+responses stay JSON-encodable.
 
 ## Usage capture
 
@@ -211,10 +252,14 @@ Cost = (input−cached)·in + cached·cached_in + output·out, all /1e6.
   final chat chunk's top-level `usage`, the non-stream body's top-level `usage`,
   or a Responses terminal event's `response.usage`. The last meaningful final
   usage wins; costs are never summed per chunk. Captured only for OpenRouter.
-  An explicit 0 is valid; missing, `null`, non-numeric, negative, or non-finite
-  cost in the latest meaningful usage record clears any earlier intermediate
+  An explicit 0 is valid; missing, `null`, non-numeric, negative, non-finite,
+  or above-1e6 (`core.MaxReportedCostUSD`) cost in the latest meaningful usage record clears any earlier intermediate
   cost, without discarding that record's valid token counts. Usage-less chunks
   do not clear the observation.
+- A token count that is negative or above 1e12 (`core.MaxRecordTokens`) in
+  any usage record makes the response's usage unknown (`usage_known = false`)
+  rather than storing it. Cached input is clamped to at most input, and
+  reasoning to at most output (usage stays known).
 - Client disconnect or missing usage ⇒ `usage_known = false`; lease still
   released. An already observed provider cost is retained alongside the
   transport/request error, independently of token knowledge; for an interrupted
@@ -244,7 +289,11 @@ contention). `localrouter login <account-id>` runs the device flow:
   `grant_type=refresh_token, refresh_token, client_id` when access expires
   within 5 min (JWT `exp`) or after a 401. Single-flight per account;
   persist rotated refresh token atomically (write temp + fsync + rename,
-  mode 0600) BEFORE returning the new access token.
+  mode 0600) BEFORE returning the new access token. If that Save fails the
+  call returns an error but the new token set stays in memory (the old
+  refresh token is already consumed); the Save is retried on the next
+  `Credential` call, which returns the token once it is durable. No refresh
+  backoff applies to a persist failure.
 - Credential headers: `Authorization` (access token with the `Bearer` scheme),
   `ChatGPT-Account-Id: <id>`, `originator: codex_cli_rs`.
 - Store: `<data_dir>/tokens/<account-id>.json`, dir 0700, file 0600.
@@ -254,6 +303,15 @@ Ollama / openai_compat: static key from `api_key_file` (preferred) or
 
 Client keys: `clients[].key_file` containing the raw key; compared in
 constant time. Keys never logged or returned.
+
+Secret files (`core.CheckPrivateFile`: regular file, `mode & 0o077 == 0`):
+client key files, `api_key_file`, `management_key_file`, `tls_key_file`, and
+the agent `key_file`. The config file and `data_dir` must not be group/world
+writable (`core.CheckNotWritableByOthers`; a missing `data_dir` is allowed).
+`config.Config.CheckFiles` applies all of these; `localrouter check` fails and
+`localrouter serve` refuses to start on any violation. Upstream key files are
+also re-checked on every read (including cache hits). Windows: existence and
+regularity only.
 
 ## Control API (`internal/control`)
 
@@ -299,6 +357,9 @@ key.
   no keys, secret paths, prompt content or per-account quota windows. `reload`
   is present only when a reload seam is wired; it is the sanitized last reload
   attempt (see "Configuration reload" below) and never carries key material.
+- JSON responses are encoded before the status line is written; a body that
+  cannot be encoded yields 500 `{"error":{"message":"encoding response
+  failed"}}` instead of a 200 with an empty body.
 
 ## Logging
 
@@ -336,9 +397,11 @@ time. One accepted generation publishes its handler, auth, routes, limits,
 reserves, price table and generation number together under a single pointer, so
 an inference or HTTP-ingest request is costed from the generation it was
 admitted on even if a reload swaps the price table while it is in flight. The
-in-process `claude_logs` collector selects the current generation once per
-`Record`/`RecordBatch` call, so each batch is costed by the generation live when
-that batch is written.
+in-process `claude_logs` and `hermes_logs` collectors select the current
+generation once per `Record`/`RecordBatch` call, so each batch is costed by the
+generation live when that batch is written. That write path also bounds labels
+(`core.TruncateLabel`/`core.TruncateError`) and rejects records with a token
+count outside [0, 1e12] with a permanent error, which the collectors drop.
 
 A reload replaces the live generation only: it never re-prices rows already
 written and never rewrites the startup table. History is reconciled only by the
@@ -490,6 +553,28 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
   treat a key as final when a later line in the same file has a different key,
   or the file has not been modified for ≥ 30s. (Keep pending keys in memory.)
 - Runs every `claude_logs.scan_interval` (default 1m) plus once at startup.
+- Plausibility (same bounds as ingest): lines with any usage field < 0 or
+  > 1e12, or a timestamp missing or outside [now-400d, now+5m], are skipped
+  (`Stats.Skipped`; old timestamps log at debug). Model, session, project and
+  client labels are bounded with `core.TruncateLabel` (128 bytes, valid UTF-8,
+  no control characters).
+
+### Hermes usage import (internal/hermeslog)
+
+- Reads `session_model_usage` from `<home>/state.db` and
+  `<home>/profiles/*/state.db` read-only, and records the increase of each
+  row's cumulative counters since the last scan (state in
+  `<data_dir>/hermeslog-state.json`). Rows whose `billing_base_url` is this
+  router are skipped. Counters that go backwards are rebased, not recorded.
+- Plausibility: a row is skipped (`Stats.SkippedInvalid`, logged without
+  content) and rebased if any cumulative counter or token total is outside
+  [0, 1e12] (so delta arithmetic cannot overflow), or the raw `last_seen` is
+  non-finite, negative or outside [now-400d, now+5m]. Only a missing (NULL or
+  0) `last_seen` uses now.
+  Increases from an implausible baseline are rebased, not recorded. Labels
+  are bounded with `core.TruncateLabel`.
+- A ledger error with `Permanent() == true` drops the row (`Stats.Dropped`)
+  and rebases it; other errors leave state unchanged for retry.
 
 ### Ledger changes
 
@@ -511,6 +596,10 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
   `--key-file` supplies the client key when `control.require_auth` is on.
   Exit 0 = allow, 1 = deny (prints reason), 2 = error/unreachable. Clients
   use it as a gate, e.g. before launching background Claude workers.
+  With `--key-file` and a plain `http://` URL to a non-loopback host, a
+  warning is printed to stderr (not refused). Redirects are not followed (a
+  3xx exits 2). On a shared host a stopped router's loopback port can be
+  bound by another local user, who would then receive the key.
 
 ## Multi-host (central server + per-host agents)
 
@@ -570,13 +659,28 @@ server's `/v1` with their own client keys.
   whatever the agent claimed), and FORCES `Route="claude"`, `Provider="claude"`;
   records whose `AccountID` is not a configured claude account -> whole
   request 400 (no partial writes).
-  Records must have non-empty ID, `UsageKnown=true`, non-negative usage;
-  otherwise 400.
+  Records must have an ID matching `[A-Za-z0-9:._-]{1,128}`,
+  `UsageKnown=true`, usage token counts in [0, `core.MaxRecordTokens`] (1e12)
+  and `started_at` within -400 days..+5 minutes of server time. `class` must
+  be "", `interactive` or `background`; `model`, `session`, `task`, `agent`,
+  `upstream_identity` and `failover_of` at most `core.MaxLabelBytes` (128)
+  bytes and `error` at most `core.MaxErrorBytes` (256) bytes, each valid
+  UTF-8 without control characters (the proxy truncates its own values to
+  the same bounds); `status`, `latency_ms` and `bytes_out` non-negative.
+  Otherwise 400 with `error.code` `invalid_record` (whole request rejected).
 - Snapshots: each must name a configured claude account with
   `quota_source: agent`, else 400. Passed to `SnapshotIngester`; a snapshot
   with `FetchedAt` <= the stored one is ignored (counted in
   `snapshots_ignored`). Snapshots with `FetchedAt` more than 5 minutes in the
-  future -> 400.
+  future -> 400. Bounds (else 400 `invalid_request`, nothing written): at
+  most 16 snapshots per request; per snapshot at most 16 windows with
+  distinct kinds matching `[a-z0-9_]{1,32}`, `used_frac` in [0,1],
+  `window_seconds` >= 0; `plan` and `source` at most `core.MaxLabelBytes`
+  and `error` at most `core.MaxErrorBytes`, valid UTF-8 without control
+  characters; `model_requests` at most 16 kinds (same kind pattern), each
+  with at most 256 entries whose `model` follows the label rule and
+  `requests` is in [0, 1e12]. `credits`, `key` and `allowed` (openrouter /
+  codex members) must be absent.
 - Response 200 `core.IngestResponse`. Ingest is idempotent: re-sending the
   same batch yields 200 with records_accepted counting submitted records (the
   ledger dedupes silently).
@@ -636,6 +740,10 @@ state_dir: ~/.local/state/localrouter-agent   # default (darwin: ~/Library/Appli
   tokens, prompts, or file paths beyond the project dir name.
 - `localrouter agent -config PATH [--once]`: `--once` = one scan + one quota
   push then exit (for testing/cron).
+- `key_file` must be a private regular file (0600); the error names neither
+  the key nor the path. The ingest client never follows redirects (a 3xx is a
+  transient `*HTTPError`, records are kept). A plain `http://` server URL to
+  a non-loopback host logs a startup warning (not refused).
 
 ### Acceptance tests (multi-host)
 
@@ -697,7 +805,7 @@ to LocalRouter only through the documented control API.
   (time.Local, DST-correct: bucket boundaries are local midnights; a 23h or
   25h day is one bucket). BucketStarts covers [From, To) from the bucket
   containing From to the bucket containing To-1ns.
-- One SQL query aggregates by (bucket key, group key) over
+- SQL aggregates by (bucket key, group key) over
   `started_at >= From AND started_at < To` + filters; bucketing of local days
   happens in Go (do NOT trust SQLite localtime). Must handle 1M rows in < 1s
   on a laptop: aggregate in SQL by hour (`started_at/3600000`), then fold
@@ -708,9 +816,13 @@ to LocalRouter only through the documented control API.
   the point has requests but none priced, else sum of priced; same rule as
   Summary.
 - Rank keys by total tokens (input+output) desc, then key asc. Breakdown =
-  all keys ranked (UsageRow.Key = group value, "" allowed). Series = top N in
-  rank order, then `__other__` summing the rest (omitted if none). Every
-  series has exactly len(BucketStarts) points (zeros where empty).
+  the highest-ranked `core.AnalyticsMaxBreakdown` (200) keys in rank order
+  (UsageRow.Key = group value, "" allowed); `breakdown_omitted` counts the
+  remaining keys, which appear only in Totals and `__other__`. Series = top N
+  in rank order, then `__other__` summing the rest (omitted if none). Every
+  series has exactly len(BucketStarts) points (zeros where empty). Keys are
+  ranked first and per-bucket points are kept only for the top N plus
+  `__other__`, so memory does not grow with the number of distinct keys.
 - Totals = sum over everything matched.
 
 ### HTTP
@@ -755,10 +867,11 @@ and wide (browser). Sections:
    zooms the time range to that bucket (day -> hourly view of that day).
    State is kept in the URL hash (`#range=7d&group=model&f.host=pf3llssv`) so
    reload/back works.
-5. **Breakdown table** under the chart: the full Breakdown with columns key,
+5. **Breakdown table** under the chart: the Breakdown with columns key,
    requests, input, cached (and % cache hit), cache write, output, cost,
    share bar (inline CSS bar). Sortable by clicking headers. Rows clickable
-   = drill down.
+   = drill down. When `breakdown_omitted` > 0 a note under the table reads
+   "N more not shown".
 6. **Machines strip**: one compact card per host (from a host-grouped query
    for the current range, unfiltered): tokens, cost, requests, last seen
    (max started_at is NOT available from the API — show a 24h sparkline of
@@ -835,11 +948,27 @@ periodic response recomputes `LimitResetAt` for display only). A key reset
 never overrides account exhaustion. An unknown or malformed key part never
 denies on its own (no invented exhaustion), so unknown parts follow the normal
 stale rule (no reserve → allow; upstream 402 is the backstop). Upstream 402 on
-an openrouter account: proxy fails over (no bytes sent yet; streamed/completed
-responses are never repeated), outcome carries the `Retry-After` hint, policy
-cools down for `max(60s, hint)` and requests an urgent refresh. A 402 cooldown
+an openrouter account whose body is OpenRouter's affordability preflight
+(the message contains "requires more credits, or fewer max_tokens" or "can
+only afford N", any N including 0: a large prompt or expensive model can
+make it 0) is request-scoped: no cooldown and no urgent refresh, but it
+still fails over (another key may have more credit), bounded by the failover
+limit; if every candidate answers so, the client gets the last 402. Any other
+402 ("Insufficient credits", an unknown or empty body, or a body that
+stalls past the idle timeout), and any 402 while the snapshot shows a known
+non-positive balance or exhausted key cap, is account-level: proxy fails
+over (no bytes sent yet; streamed/completed responses are never repeated),
+outcome carries the `Retry-After` hint, policy cools down for `max(60s,
+hint)` and requests an urgent refresh. A recent positive balance never makes
+a 402 request-scoped: it does not prove current funds. A 402 cooldown
 clears early only when a balance fetched after it is positive and above the
 balance known at the 402. Other providers' 402 handling is unchanged.
+OpenRouter 403 (moderation-flagged input) is final and request-scoped: relayed
+without credential refresh, failover or cooldown; 401 keeps the refresh-once,
+then account-level handling. OpenRouter 429 (per-model or upstream-provider
+rate limit) is request-scoped unless the snapshot shows a known non-positive
+balance or an exhausted key cap; it may still fail over to the next account
+(another key may not be limited), bounded by the failover limit.
 
 Control status adds, for openrouter accounts only, `credits:{available,
 balance_usd, total_credits_usd, total_usage_usd, exhausted, age_s, stale,

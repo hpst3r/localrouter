@@ -96,8 +96,10 @@ func codexAcct() []core.Account {
 	return []core.Account{{ID: "cx", Provider: core.ProviderCodex, BaseURL: "https://chatgpt.com/backend-api/codex"}}
 }
 
+// ollamaAcct's base_url host matches the harness usage server (127.0.0.1);
+// usage is only polled when the hosts match.
 func ollamaAcct() []core.Account {
-	return []core.Account{{ID: "ol", Provider: core.ProviderOllama, BaseURL: "https://ollama.com/v1"}}
+	return []core.Account{{ID: "ol", Provider: core.ProviderOllama, BaseURL: "http://127.0.0.1/v1"}}
 }
 
 func approx(a, b float64) bool { return math.Abs(a-b) < 1e-9 }

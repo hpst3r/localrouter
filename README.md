@@ -82,7 +82,10 @@ unknown balance or key part does not deny on its own (upstream `402` is the
 backstop). An
 OpenRouter `402` fails over to the next account before any byte is sent, cools
 the account down (60s or `Retry-After`), and refreshes its balance urgently; a
-top-up clears the cooldown early. `reserve` is rejected for these accounts.
+top-up clears the cooldown early. The affordability preflight 402 ("requires
+more credits, or fewer max_tokens") depends on the request, so it fails over
+without cooling the account down; a moderation `403` is returned to the client
+as is. `reserve` is rejected for these accounts.
 
 Optional `limits.max_concurrent` / `limits.max_concurrent_per_client` cap
 active inference requests (0 = unlimited, negatives rejected); a saturated
@@ -101,9 +104,28 @@ journalctl --user -u localrouter -f
 ```
 
 The unit validates config before start, restarts on failure, and is sandboxed:
-the home directory is read-only except `~/.config/localrouter`. To upgrade,
+the home directory is replaced by an empty tmpfs that exposes only
+`~/.config/localrouter` (writable; `keys/` and `tls/` read-only), `~/.claude` and
+`~/.hermes` (read-only) and the binary. Paths configured elsewhere, and hosts
+without unprivileged user namespaces, need a drop-in; see
+[systemd sandbox](docs/NETWORK.md#systemd-sandbox). To upgrade,
 rebuild, re-run `install`, then `systemctl --user restart localrouter`. With
 lingering enabled (`loginctl enable-linger`), it runs without a login session.
+
+### Verifying release downloads
+
+Tagged releases publish four native archives, `SHA256SUMS` and a multi-arch
+image at `ghcr.io/hpst3r/localrouter`, each with a Sigstore-signed GitHub build
+provenance attestation. `SHA256SUMS` lives in the same release as the archives,
+so it detects corruption, not tampering; verify the attestation (GitHub CLI 2.49
+or newer):
+
+```bash
+gh attestation verify localrouter_<version>_linux_amd64.tar.gz --repo hpst3r/localrouter
+gh attestation verify oci://ghcr.io/hpst3r/localrouter@sha256:<digest> --repo hpst3r/localrouter
+```
+
+Deploy the image by digest, not tag; see [Container deployment](docs/CONTAINERS.md#verifying-releases).
 
 ## Reload configuration (SIGHUP)
 
@@ -198,8 +220,10 @@ again. Inspect the sanitized last attempt:
 
 ```bash
 # reload:{generation, ok, at, reason?, restart_only?}
+# The header is read from a process substitution, so the key never appears
+# in curl's argv (printf is a shell builtin).
 curl --silent --show-error \
-  -H "Authorization: Bearer $(cat ~/.config/localrouter/keys/me.key)" \
+  -H @<(printf 'Authorization: Bearer %s\n' "$(cat ~/.config/localrouter/keys/me.key)") \
   http://127.0.0.1:8787/control/v1/diagnostics | python3 -m json.tool | sed -n '/"reload"/,/}/p'
 journalctl --user -u localrouter -n 20 --no-pager | grep -i 'config reload'
 ```

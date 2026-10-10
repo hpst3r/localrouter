@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bytes"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -547,11 +548,20 @@ func (s *Server) findRoute(model string) (core.Route, bool) {
 	return core.Route{}, false
 }
 
+// writeJSON encodes v before writing the header, so a value json cannot
+// encode (e.g. a +Inf float) yields a 500 error instead of an empty body.
 func writeJSON(w http.ResponseWriter, code int, v any) {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(v); err != nil {
+		slog.Warn("control: encoding response failed", "err", err)
+		code = http.StatusInternalServerError
+		buf.Reset()
+		_ = json.NewEncoder(&buf).Encode(map[string]any{"error": map[string]string{"message": "encoding response failed"}})
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(buf.Bytes())
 }
 
 func writeError(w http.ResponseWriter, code int, msg string) {

@@ -1,71 +1,78 @@
 #!/usr/bin/env python3
 """Drive the dashboard in headless Chrome via CDP (stdlib only): collect JS
 errors, exercise hover/drill-down/zoom/legend, screenshot each state.
-Usage: cdp_check.py URL OUTDIR [width height] [dark]"""
-import base64, json, os, socket, subprocess, sys, time, urllib.request, struct, random
+Usage: cdp_check.py URL OUTDIR [width height] [dark]
+
+DevTools runs over --remote-debugging-pipe (Chrome reads NUL-terminated JSON
+on fd 3 and writes on fd 4), so no TCP debugging endpoint is opened that
+another local user could attach to. The Chrome profile is a private mkdtemp()
+directory (removed on exit). Chrome's sandbox stays on; set CDP_NO_SANDBOX=1
+only where it cannot start (e.g. some containers)."""
+import base64, fcntl, json, os, select, shutil, subprocess, sys, tempfile, time
 
 url, out = sys.argv[1], sys.argv[2]
 w, h = (int(sys.argv[3]), int(sys.argv[4])) if len(sys.argv) > 4 else (1280, 1700)
 dark = len(sys.argv) > 5 and sys.argv[5] == "dark"
 os.makedirs(out, exist_ok=True)
-port = 9333 + random.randint(0, 500)
-prof = f"/tmp/cdp-prof-{port}"
-args = ["google-chrome", "--headless=new", "--disable-gpu", "--no-sandbox", f"--remote-debugging-port={port}",
+prof = tempfile.mkdtemp(prefix="cdp-prof-")
+args = ["google-chrome", "--headless=new", "--disable-gpu", "--remote-debugging-pipe",
         f"--user-data-dir={prof}", "--hide-scrollbars", f"--window-size={w},{h}", "about:blank"]
-chrome = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+if os.environ.get("CDP_NO_SANDBOX") == "1":
+    args.insert(1, "--no-sandbox")
+def above_4(fd):
+    # Keep the child ends clear of 3/4 so the redirections below cannot clash.
+    n = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 10); os.close(fd); return n
+to_chrome_r, to_chrome_w = os.pipe()
+from_chrome_r, from_chrome_w = os.pipe()
+to_chrome_r, from_chrome_w = above_4(to_chrome_r), above_4(from_chrome_w)
+# pass_fds keeps the fd numbers, so a shell moves them to the 3/4 Chrome expects.
+wrapper = f'exec "$@" 3<&{to_chrome_r} 4>&{from_chrome_w} {to_chrome_r}<&- {from_chrome_w}>&-'
+chrome = subprocess.Popen(["/bin/sh", "-c", wrapper, "sh"] + args, pass_fds=(to_chrome_r, from_chrome_w),
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+os.close(to_chrome_r); os.close(from_chrome_w)
 try:
-    for _ in range(50):
-        try:
-            tabs = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json"))
-            ws_url = [t for t in tabs if t["type"] == "page"][0]["webSocketDebuggerUrl"]
-            break
-        except Exception:
-            time.sleep(0.2)
-    # minimal websocket client
-    host, rest = ws_url[len("ws://"):].split("/", 1)
-    hh, pp = host.split(":")
-    s = socket.create_connection((hh, int(pp)))
-    key = base64.b64encode(os.urandom(16)).decode()
-    s.send(f"GET /{rest} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
-    buf = b""
-    while b"\r\n\r\n" not in buf:
-        buf += s.recv(4096)
-    buf = buf.split(b"\r\n\r\n", 1)[1]
+    inbuf = b""
 
     def send(obj):
-        data = json.dumps(obj).encode()
-        hdr = bytearray([0x81])
-        n = len(data)
-        if n < 126: hdr.append(0x80 | n)
-        elif n < 65536: hdr += bytes([0x80 | 126]) + struct.pack(">H", n)
-        else: hdr += bytes([0x80 | 127]) + struct.pack(">Q", n)
-        mask = os.urandom(4); hdr += mask
-        s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+        data = json.dumps(obj).encode() + b"\0"
+        while data:
+            data = data[os.write(to_chrome_w, data):]
 
-    def recv_frame():
-        nonlocal_buf = recv_frame.buf
-        def need(k):
-            while len(recv_frame.buf) < k:
-                recv_frame.buf += s.recv(1 << 16)
-        need(2)
-        b0, b1 = recv_frame.buf[0], recv_frame.buf[1]
-        n = b1 & 0x7f; off = 2
-        if n == 126: need(4); n = struct.unpack(">H", recv_frame.buf[2:4])[0]; off = 4
-        elif n == 127: need(10); n = struct.unpack(">Q", recv_frame.buf[2:10])[0]; off = 10
-        need(off + n)
-        payload = recv_frame.buf[off:off + n]; recv_frame.buf = recv_frame.buf[off + n:]
-        return payload
-    recv_frame.buf = buf
+    def recv_msg(timeout=30):
+        global inbuf
+        while b"\0" not in inbuf:
+            if not select.select([from_chrome_r], [], [], timeout)[0]:
+                sys.exit("chrome DevTools pipe timed out")
+            chunk = os.read(from_chrome_r, 1 << 16)
+            if not chunk:
+                sys.exit("chrome DevTools pipe closed")
+            inbuf += chunk
+        msg, inbuf = inbuf.split(b"\0", 1)
+        return json.loads(msg)
 
-    mid = [0]; events = []
+    mid = [0]; events = []; session = [None]
     def call(method, **params):
-        mid[0] += 1; send({"id": mid[0], "method": method, "params": params})
+        mid[0] += 1
+        req = {"id": mid[0], "method": method, "params": params}
+        if session[0]: req["sessionId"] = session[0]
+        send(req)
         while True:
-            msg = json.loads(recv_frame())
+            msg = recv_msg()
             if msg.get("id") == mid[0]:
                 if "error" in msg: raise RuntimeError(msg["error"])
                 return msg.get("result", {})
-            events.append(msg)
+            if msg.get("sessionId") == session[0]:
+                events.append(msg)
+
+    # The pipe speaks to the browser target; attach to the page (flat mode).
+    page = None
+    for _ in range(50):
+        page = next((t for t in call("Target.getTargets")["targetInfos"] if t["type"] == "page"), None)
+        if page: break
+        time.sleep(0.2)
+    if page is None:
+        sys.exit("chrome page target did not come up")
+    session[0] = call("Target.attachToTarget", targetId=page["targetId"], flatten=True)["sessionId"]
 
     def ev(expr):
         r = call("Runtime.evaluate", expression=expr, returnByValue=True, awaitPromise=True)
@@ -126,7 +133,8 @@ try:
     time.sleep(0.5)
     print("ERRORS", json.dumps(errors()))
 finally:
+    os.close(to_chrome_w); os.close(from_chrome_r)
     chrome.terminate()
     try: chrome.wait(5)
     except Exception: chrome.kill()
-    subprocess.run(["rm", "-rf", prof])
+    shutil.rmtree(prof, ignore_errors=True)

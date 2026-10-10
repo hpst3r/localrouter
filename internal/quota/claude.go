@@ -137,7 +137,8 @@ func (m *Manager) fetchClaude(ctx context.Context, id string) (core.Snapshot, er
 // accountID with FetchedAt=now and Source=SourceUsageAPI. An expired cred
 // returns ErrClaudeTokenExpired without any request; a 401 returns
 // ErrClaudeTokenRejected. Errors are sanitized: never the token or the body.
-// A nil client uses a 30s-timeout client. The Manager polls through this same
+// A nil client uses a 30s-timeout client. Redirects are never followed (a
+// 3xx is an "http 3xx" error); client itself is not modified. The Manager polls through this same
 // function; it is exported for the per-host agent.
 func FetchClaudeSnapshot(ctx context.Context, client *http.Client, url, userAgent string, cred ClaudeCredential, accountID string, now time.Time) (core.Snapshot, error) {
 	if cred.ExpiresAt > 0 && !now.Before(time.UnixMilli(cred.ExpiresAt)) {
@@ -146,6 +147,7 @@ func FetchClaudeSnapshot(ctx context.Context, client *http.Client, url, userAgen
 	if client == nil {
 		client = &http.Client{Timeout: defaultHTTPTimeout}
 	}
+	client = noRedirect(client)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return core.Snapshot{}, errTransport

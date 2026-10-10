@@ -8,7 +8,8 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
-ExecStartPre=/usr/bin/mkdir -p %h/.local/state/localrouter-agent
+# '+': runs outside the sandbox, so the state dir exists before it is bound.
+ExecStartPre=+/usr/bin/mkdir -p -m 0700 %h/.local/state/localrouter-agent
 ExecStart=%h/.local/bin/localrouter agent -config %h/.config/localrouter/agent.yaml
 Restart=on-failure
 RestartSec=10
@@ -16,12 +17,37 @@ Nice=10
 StandardOutput=journal
 StandardError=journal
 
-# Reads Claude transcripts/credentials read-only; writes only its state dir.
+# Hardening. The home directory is an empty tmpfs; only these paths exist:
+#   %h/.local/state/localrouter-agent  rw  agent state (default state_dir)
+#   %h/.config/localrouter             ro  agent.yaml, agent.key
+#   %h/.claude                         ro  transcripts and credentials
+#   %h/.local/bin/localrouter          ro  the binary
+# A custom state_dir, key_file or claude_projects_dir outside these needs a
+# drop-in, see docs/NETWORK.md.
+#
+# Several options below imply PrivateUsers=yes in a user unit and need
+# unprivileged user namespaces; see docs/NETWORK.md ("systemd sandbox") for
+# the relaxing drop-in if the unit fails with 226/NAMESPACE or 218/CAPABILITIES.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=-%h/.local/state/localrouter-agent
+ProtectHome=tmpfs
+BindPaths=%h/.local/state/localrouter-agent
+ReadWritePaths=%h/.local/state/localrouter-agent
+BindReadOnlyPaths=%h/.local/bin/localrouter %h/.config/localrouter -%h/.claude
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 LockPersonality=yes
 RestrictRealtime=yes

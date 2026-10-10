@@ -10,7 +10,9 @@ See [README](../README.md) for the build and basic setup, [server example](../co
 - Any valid client key can read shared status and usage data. There are no per-client visibility or per-account inference permissions beyond workload class and configured routes.
 - `ingest: true` is a trusted reporting permission, not host/account isolation. That client can report usage for any configured Claude account and snapshots for any Claude account with `quota_source: agent`. The request's `host` is a client-supplied label; the server attributes records to the authenticated client name.
 - `allowed_hosts` checks the HTTP Host header to protect browsers against DNS rebinding. **It is not a source-IP ACL.** Enforce access with network access controls and the host firewall.
-- **Use HTTPS for all networked deployments.** HTTP is possible, but should only ever be considered when an encrypted network overlay (such as Tailscale or NetBird) protects the entire client-to-router connection. Do not publish this listener to the Internet.
+- **Use HTTPS for all networked deployments.** HTTP is possible, but should only ever be considered when an encrypted network overlay (such as Tailscale or NetBird) protects the entire client-to-router connection. Do not publish this listener to the Internet. `localrouter agent` logs a startup warning and `localrouter admit --key-file` prints one when the URL is plain `http://` to a non-loopback host. Neither the agent, `admit`, nor the usage pollers follow HTTP redirects, because a redirect would re-send the bearer key.
+- Secret files must be mode 0600 (no group/other access) regular files: client key files, `api_key_file`, `management_key_file`, `tls_key_file`, and the agent's `key_file`. The config file and `data_dir` must not be group/world writable (0644/0755 are fine). `localrouter check` reports every violation and `localrouter serve` refuses to start; upstream key files are also re-checked on every read, and the agent refuses a loose `key_file`. Environment-variable keys are not affected.
+- A `provider: ollama` account polls `https://ollama.com/api/usage` only when its `base_url` host is `ollama.com`; for any other host its key is never sent to ollama.com and the snapshot reports that usage polling is unavailable.
 - The widget stores its bearer key in browser localStorage. Use a trusted browser profile; clear the saved key/site storage on shared machines. The key retains its normal inference/ingestion permissions.
 - Body-size limits, optional per-client/global inference concurrency limits (`limits`), and inbound read/idle timeouts (`timeouts`) exist, but there is no rate limiter. Trusted clients and restricted reachability remain important.
 - Claude inference remains on the official Claude CLI. Agents read Claude credentials locally for quota polling; they send usage metadata and snapshots, not Claude tokens or transcript content, to the router.
@@ -60,7 +62,7 @@ Set up the upstream credentials and routes you actually use. The example include
 ~/.local/bin/localrouter check -config ~/.config/localrouter/config.yaml
 ```
 
-`check` validates the configuration and client key files. It does **not** prove upstream connectivity, quota availability, TLS certificate validity, or remote reachability.
+`check` validates the configuration, client key files, and secret-file permissions (see [Security boundary](#security-boundary)). It does **not** prove upstream connectivity, quota availability, TLS certificate validity, or remote reachability.
 
 Install the Linux user service:
 
@@ -162,6 +164,21 @@ The key-to-curl helper assumes an unmodified `localrouter keygen` key. `admit` e
 
 These checks have distinct meanings: `/healthz` is **liveness** (the process answers), while `/readyz` is **local readiness** (willing to serve and local storage healthy). An upstream outage does not make the router locally unready; inspect account health, freshness, and reasons in status or diagnostics instead. Only a successful real model request verifies **upstream inference**. That test consumes quota; `/healthz`, `/readyz`, `/v1/models`, and `admit` do not substitute for it.
 
+## systemd sandbox
+
+Both Linux user units hide the home directory (`ProtectHome=tmpfs`) and bind back only what they need. The server gets `~/.config/localrouter` read-write (`keys/` and `tls/` read-only), plus `~/.claude`, `~/.hermes` and its binary read-only. The agent gets `~/.local/state/localrouter-agent` read-write, plus `~/.config/localrouter`, `~/.claude` and its binary read-only. Because the default `data_dir` is the config directory, the server can still rewrite `config.yaml`.
+
+Paths outside these (custom `data_dir`, TLS or pricing files, collector dirs, agent `state_dir`/`key_file`) need a drop-in (`systemctl --user edit localrouter`):
+
+```ini
+[Service]
+BindPaths=%h/.local/state/localrouter
+ReadWritePaths=%h/.local/state/localrouter
+BindReadOnlyPaths=%h/certs/router
+```
+
+If the unit fails with `226/NAMESPACE` or `218/CAPABILITIES`, the host lacks unprivileged user namespaces. Enable them, or as a last resort drop the filesystem isolation with a drop-in (`ProtectHome=no`, `ProtectSystem=no`, `PrivateTmp=no`, `PrivateDevices=no`, `ProtectKernelTunables=no`, `ProtectKernelModules=no`, `ProtectKernelLogs=no`, `ProtectControlGroups=no`, `ProtectClock=no`, `ProtectHostname=no`, `CapabilityBoundingSet=~`, and empty `BindPaths=`, `BindReadOnlyPaths=`, `ReadWritePaths=`, `ReadOnlyPaths=`, `InaccessiblePaths=`). The seccomp options stay in effect.
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -177,7 +194,8 @@ These checks have distinct meanings: `/healthz` is **liveness** (the process ans
 | Background denied | Reserve/cooldown/exhausted window or stale reserved account; inspect status reason. Interactive may still be admissible. |
 | `429` `concurrency_limit_exceeded` | Inference concurrency `limits` reached (global or per-client). Retry after the `Retry-After` hint; raise the limit only if intended. Not a quota/admission denial. |
 | `/readyz` returns 503 while `/healthz` is ok | Local readiness failed (shutting down or storage ping error). Inspect diagnostics `storage`; upstream health is unrelated. |
-| Writes fail only under systemd | Custom data/state paths are outside the supplied sandbox's `ReadWritePaths`. |
+| Writes or reads fail only under systemd | Custom data/state/key/TLS paths are outside the paths the unit binds into its tmpfs home; add a drop-in ([systemd sandbox](#systemd-sandbox)). |
+| Unit fails with `226/NAMESPACE` or `218/CAPABILITIES` | No unprivileged user namespaces for the user unit sandbox; see [systemd sandbox](#systemd-sandbox). |
 
 A fresh quota snapshot and recent host usage are separate signals: usage can push while quota polling fails, and quota can refresh on a host with no new transcript usage.
 

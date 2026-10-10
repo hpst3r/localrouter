@@ -26,6 +26,23 @@ type fixedClock struct{ t time.Time }
 
 func (c fixedClock) Now() time.Time { return c.t }
 
+// stepClock is a settable clock.
+type stepClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *stepClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+func (c *stepClock) Add(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
 var testNow = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 
 // fakeLease records its outcome.
@@ -117,12 +134,23 @@ type fakeQuota struct {
 	mu       sync.Mutex
 	observed map[string]int
 	refresh  map[string]int
+	snaps    map[string]core.Snapshot
 }
 
 func newFakeQuota() *fakeQuota {
-	return &fakeQuota{observed: map[string]int{}, refresh: map[string]int{}}
+	return &fakeQuota{observed: map[string]int{}, refresh: map[string]int{}, snaps: map[string]core.Snapshot{}}
 }
-func (q *fakeQuota) Latest(string) (core.Snapshot, bool) { return core.Snapshot{}, false }
+func (q *fakeQuota) Latest(id string) (core.Snapshot, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	s, ok := q.snaps[id]
+	return s, ok
+}
+func (q *fakeQuota) setSnapshot(id string, s core.Snapshot) {
+	q.mu.Lock()
+	q.snaps[id] = s
+	q.mu.Unlock()
+}
 func (q *fakeQuota) ObserveHeaders(id string, _ http.Header) {
 	q.mu.Lock()
 	q.observed[id]++
@@ -192,6 +220,8 @@ type harness struct {
 	accounts map[string]core.Account
 	routes   []core.Route
 	opts     Options
+	clock    core.Clock  // nil means fixedClock{testNow}
+	pol      core.Policy // nil means the fake policy
 	srv      *httptest.Server
 }
 
@@ -246,9 +276,17 @@ func (h *harness) start() {
 			h.srv.Close()
 		}
 	})
+	var clock core.Clock = fixedClock{testNow}
+	if h.clock != nil {
+		clock = h.clock
+	}
+	var pol core.Policy = h.policy
+	if h.pol != nil {
+		pol = h.pol
+	}
 	p := New(Deps{
 		Accounts: h.accounts, Routes: h.routes, Creds: h.creds, Quota: h.quota,
-		Policy: h.policy, Ledger: h.ledger, Clock: fixedClock{testNow}, Limiter: h.limiter,
+		Policy: pol, Ledger: h.ledger, Clock: clock, Limiter: h.limiter,
 		Logger: slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Authenticate: func(bearer string) (core.Client, bool) {
 			switch bearer {

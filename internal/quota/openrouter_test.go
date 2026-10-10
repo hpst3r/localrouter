@@ -614,9 +614,8 @@ func TestOpenRouterKeyInconsistentCapPairs(t *testing.T) {
 
 func orPtr(v float64) *float64 { return &v }
 
-// The no-redirect policy must be scoped to OpenRouter: the shared
-// Options.HTTPClient keeps its configured redirect policy (nil = default)
-// so every other provider's get() behaves exactly as before.
+// Usage requests use a no-redirect copy of the client; the shared
+// Options.HTTPClient keeps its configured redirect policy (nil = default).
 func TestOpenRouterDoesNotMutateSharedClient(t *testing.T) {
 	h := &orHarness{clock: &fakeClock{t: t0}, creds: &fakeCreds{}, mgmt: &staticCreds{token: mgmtToken},
 		logs: &bytes.Buffer{}, auths: map[string][]string{}}
@@ -624,7 +623,7 @@ func TestOpenRouterDoesNotMutateSharedClient(t *testing.T) {
 	opts := Options{Clock: h.clock, HTTPClient: shared, Logger: slog.New(slog.NewTextHandler(h.logs, nil))}
 	h.m = New([]core.Account{{ID: "or", Provider: core.ProviderOpenRouter, BaseURL: "http://127.0.0.1:1/api/v1"}}, h.creds, opts)
 
-	or := h.m.orClient()
+	or := h.m.noRedirectClient()
 	if or == shared {
 		t.Error("OpenRouter client must be a copy, not the shared client")
 	}
@@ -640,7 +639,7 @@ func TestOpenRouterDoesNotMutateSharedClient(t *testing.T) {
 	if or.Transport != shared.Transport || or.Timeout != shared.Timeout || or.Jar != shared.Jar {
 		t.Error("copy must share Transport/Timeout/Jar")
 	}
-	if m := h.m.orClient(); m == or {
+	if m := h.m.noRedirectClient(); m == or {
 		t.Error("each call must return its own copy")
 	}
 }

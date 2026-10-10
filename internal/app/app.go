@@ -257,6 +257,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 			SelfHosts:    selfHosts(cfg.Listen),
 			StatePath:    filepath.Join(cfg.DataDir, "hermeslog-state.json"),
 			ScanInterval: cfg.HermesLogs.ScanInterval.D(),
+			Clock:        clock,
 			Logger:       logger,
 		})
 	}
@@ -277,17 +278,6 @@ func selfHosts(listen string) []string {
 		}
 	}
 	return out
-}
-
-// inflightReporter adapts the concurrency controller to the control server's
-// diagnostics seam without the control package depending on connlim.
-type inflightReporter struct{ c *connlim.Controller }
-
-func (r inflightReporter) InflightStats() core.InflightStats {
-	if r.c == nil {
-		return core.InflightStats{}
-	}
-	return r.c.Stats()
 }
 
 // Start begins background quota polling until ctx is cancelled.

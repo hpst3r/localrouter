@@ -46,9 +46,10 @@ type usageJSON struct {
 }
 
 // reportedCostUSD decodes the provider-reported cost strictly. A usable cost
-// is a JSON number that is finite and non-negative; an explicit zero is valid.
-// Missing, null, non-numeric, negative, non-finite, or out-of-range values
-// yield nil.
+// is a JSON number that is finite, non-negative and at most
+// core.MaxReportedCostUSD (so ledger sums cannot overflow); an explicit zero
+// is valid. Missing, null, non-numeric, negative, non-finite, or out-of-range
+// values yield nil.
 func (u *usageJSON) reportedCostUSD() *float64 {
 	if u == nil {
 		return nil
@@ -61,15 +62,16 @@ func (u *usageJSON) reportedCostUSD() *float64 {
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return nil
 	}
-	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 {
+	if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > core.MaxReportedCostUSD {
 		return nil
 	}
 	return &f
 }
 
-// toUsage converts a decoded usage object; ok is false if it has no token counts.
+// toUsage converts a decoded usage object; ok is false if it has no token
+// counts or any count is out of range (see outOfRange).
 func (u *usageJSON) toUsage() (core.Usage, bool) {
-	if u == nil {
+	if u == nil || u.outOfRange() {
 		return core.Usage{}, false
 	}
 	var out core.Usage
@@ -95,7 +97,36 @@ func (u *usageJSON) toUsage() (core.Usage, bool) {
 	default:
 		return core.Usage{}, false
 	}
+	// Cached input is a subset of input and reasoning a subset of output.
+	out.CachedInputTokens = min(out.CachedInputTokens, out.InputTokens)
+	out.ReasoningTokens = min(out.ReasoningTokens, out.OutputTokens)
 	return out, true
+}
+
+// outOfRange reports whether any reported token count is negative or above
+// core.MaxRecordTokens. Such usage is garbage (buggy or hostile upstream) and
+// is recorded as unknown rather than stored.
+func (u *usageJSON) outOfRange() bool {
+	bad := func(p *int64) bool { return p != nil && (*p < 0 || *p > core.MaxRecordTokens) }
+	ptrs := []*int64{u.InputTokens, u.OutputTokens, u.PromptTokens, u.CompletionTokens}
+	if u.InputDetails != nil {
+		ptrs = append(ptrs, &u.InputDetails.CachedTokens)
+	}
+	if u.OutputDetails != nil {
+		ptrs = append(ptrs, &u.OutputDetails.ReasoningTokens)
+	}
+	if u.PromptDetails != nil {
+		ptrs = append(ptrs, &u.PromptDetails.CachedTokens)
+	}
+	if u.CompletionDetails != nil {
+		ptrs = append(ptrs, &u.CompletionDetails.ReasoningTokens)
+	}
+	for _, p := range ptrs {
+		if bad(p) {
+			return true
+		}
+	}
+	return false
 }
 
 func deref(p *int64) int64 {
@@ -123,6 +154,9 @@ type usageCapture struct {
 
 	usage core.Usage
 	known bool
+	// bad is set once any usage record had an out-of-range count; the
+	// response's usage is then unknown whatever other records say.
+	bad bool
 
 	// reportedCost is the usable provider-reported cost in the latest
 	// meaningful usage record. It is tracked independently of token
@@ -242,6 +276,7 @@ func (c *usageCapture) dispatch() {
 				// independent of token knowledge, so a cost-only usage object
 				// still yields a value.
 				c.reportedCost = u.reportedCostUSD()
+				c.bad = c.bad || u.outOfRange()
 				if tok, ok := u.toUsage(); ok {
 					c.usage, c.known = tok, true
 				}
@@ -254,6 +289,7 @@ func (c *usageCapture) dispatch() {
 		// Same authority rule as above: the latest usage-bearing record decides
 		// the cost, and an unusable cost clears any earlier one.
 		c.reportedCost = u.reportedCostUSD()
+		c.bad = c.bad || u.outOfRange()
 		if tok, ok := u.toUsage(); ok {
 			c.usage, c.known = tok, true
 		}
@@ -271,6 +307,9 @@ func (c *usageCapture) Result() (core.Usage, bool) {
 		}
 		if len(c.data) > 0 {
 			c.dispatch()
+		}
+		if c.bad {
+			return core.Usage{}, false
 		}
 		return c.usage, c.known
 	}

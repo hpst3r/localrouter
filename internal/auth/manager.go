@@ -83,6 +83,11 @@ type codexState struct {
 	invalidated bool
 	refreshedAt time.Time // last successful refresh or login (in-process)
 
+	// unsaved: tok came from a successful refresh whose Save failed. The
+	// issuer has already rotated (consumed) the refresh token on disk, so tok
+	// is kept and Save is retried before tok is handed out or refreshed.
+	unsaved bool
+
 	// Cached refresh failure. A login-required failure (failLogin) holds
 	// until the token file changes (failStamp) or Login succeeds; any other
 	// failure holds until failUntil.
@@ -266,6 +271,10 @@ func (m *Manager) codexCredential(ctx context.Context, id string) (core.Credenti
 		st.mu.Unlock()
 		return core.Credential{}, err
 	}
+	if err := m.persistLocked(id, st); err != nil {
+		st.mu.Unlock()
+		return core.Credential{}, err
+	}
 	if !m.needsRefreshLocked(st) {
 		c := codexCred(st.tok)
 		st.mu.Unlock()
@@ -297,6 +306,9 @@ func (m *Manager) refresh(id string, st *codexState) (core.Credential, error) {
 	if err := m.loadLocked(id, st); err != nil {
 		return core.Credential{}, err
 	}
+	if err := m.persistLocked(id, st); err != nil {
+		return core.Credential{}, err
+	}
 	// A refresh that completed just before this flight started may have
 	// already satisfied us.
 	if !m.needsRefreshLocked(st) {
@@ -304,10 +316,31 @@ func (m *Manager) refresh(id string, st *codexState) (core.Credential, error) {
 	}
 	c, err := m.refreshLocked(id, st)
 	if err != nil {
-		m.recordFailureLocked(id, st, err)
+		// A persist failure is not a refresh failure: the next call retries
+		// the Save instead of backing off.
+		if !st.unsaved {
+			m.recordFailureLocked(id, st, err)
+		}
 		return core.Credential{}, err
 	}
 	return c, nil
+}
+
+// persistLocked retries saving a refreshed token whose Save failed (see
+// codexState.unsaved). While it keeps failing the token is not handed out,
+// but it stays in memory so the rotated refresh token is not lost. st.mu
+// must be held.
+func (m *Manager) persistLocked(id string, st *codexState) error {
+	if !st.unsaved {
+		return nil
+	}
+	if err := m.store.Save(id, *st.tok); err != nil {
+		m.opts.Logger.Error("codex token persist retry failed", "account", id, "err", err)
+		return fmt.Errorf("auth: codex account %s: persist refreshed token: %w", id, err)
+	}
+	st.unsaved = false
+	m.opts.Logger.Info("codex refreshed token persisted", "account", id)
+	return nil
 }
 
 // cachedFailureLocked returns the cached refresh failure for id if it still
@@ -391,14 +424,18 @@ func (m *Manager) refreshLocked(id string, st *codexState) (core.Credential, err
 	now := m.opts.Clock.Now()
 	next.ExpiresAt = tokenExpiry(tr, now)
 	next.LastRefresh = now.UTC()
-	if err := m.store.Save(id, next); err != nil {
-		// Do not hand out a token whose rotated refresh token is not durable.
-		m.opts.Logger.Error("codex token persist failed", "account", id, "err", err)
-		return core.Credential{}, fmt.Errorf("auth: codex account %s: persist refreshed token: %w", id, err)
-	}
+	saveErr := m.store.Save(id, next)
 	st.tok = &next
 	st.invalidated = false
 	st.refreshedAt = now
+	if saveErr != nil {
+		// Do not hand out a token whose rotated refresh token is not durable,
+		// but keep it: the previous refresh token is already consumed.
+		// persistLocked retries the Save on the next call.
+		st.unsaved = true
+		m.opts.Logger.Error("codex token persist failed; will retry", "account", id, "err", saveErr)
+		return core.Credential{}, fmt.Errorf("auth: codex account %s: persist refreshed token: %w", id, saveErr)
+	}
 	m.opts.Logger.Info("codex token refreshed", "account", id, "expires_at", next.ExpiresAt)
 	return codexCred(st.tok), nil
 }
@@ -528,10 +565,16 @@ func (m *Manager) staticCredential(id string) (core.Credential, error) {
 	return core.Credential{Headers: h, Identity: id}, nil
 }
 
+// readKeyFile reads an upstream key file (api_key_file, management_key_file).
+// The mode is checked on every call, including cache hits, so a file loosened
+// after it was first read is refused.
 func (m *Manager) readKeyFile(id, path string) (string, error) {
 	st := m.staticState(id)
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	if err := core.CheckPrivateFile("auth: account "+id+": api key file", path); err != nil {
+		return "", err
+	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		return "", fmt.Errorf("auth: account %s: api key file: %w", id, err)

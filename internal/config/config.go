@@ -558,3 +558,41 @@ func (c *Config) CoreRoutes() []core.Route {
 	}
 	return out
 }
+
+// CheckFiles verifies file permissions that Validate (no I/O) does not:
+// every client key file, api_key_file, management_key_file and tls_key_file
+// must be a regular file that is not group/world accessible
+// (core.CheckPrivateFile); the config file at configPath and data_dir must
+// not be group/world writable, since they decide which files are read as
+// secrets and where tokens are stored. A data_dir that does not exist yet is
+// accepted (serve creates it 0700). `localrouter check` and `localrouter
+// serve` fail when this returns an error.
+func (c *Config) CheckFiles(configPath string) error {
+	var errs []error
+	add := func(err error) {
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	add(core.CheckNotWritableByOthers("config file", configPath))
+	if _, err := os.Stat(c.DataDir); !errors.Is(err, os.ErrNotExist) {
+		add(core.CheckNotWritableByOthers("data_dir", c.DataDir))
+	}
+	for _, cl := range c.Clients {
+		for _, p := range cl.KeyPaths() {
+			add(core.CheckPrivateFile("client "+cl.Name+" key file", p))
+		}
+	}
+	for _, a := range c.Accounts {
+		if a.APIKeyFile != "" {
+			add(core.CheckPrivateFile("account "+a.ID+" api_key_file", a.APIKeyFile))
+		}
+		if a.ManagementKeyFile != "" {
+			add(core.CheckPrivateFile("account "+a.ID+" management_key_file", a.ManagementKeyFile))
+		}
+	}
+	if c.TLSKeyFile != "" {
+		add(core.CheckPrivateFile("tls_key_file", c.TLSKeyFile))
+	}
+	return errors.Join(errs...)
+}

@@ -1,0 +1,25 @@
+# Keeps the SHA-pinned actions, Go modules and digest-pinned base images
+# current. Dependabot updates the commit SHA and its "# vX.Y.Z" comment
+# together. Not covered (update by hand, see docs/CONTAINERS.md): the binfmt
+# and buildkit digests in release.yml and the NGINX Image= digest in
+# packaging/quadlet/localrouter-nginx.container.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Containerfile FROM lines (tag@sha256 digest).
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly

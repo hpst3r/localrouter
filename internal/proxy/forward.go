@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -126,11 +127,12 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		lease.Release(core.Outcome{})
 		return p.noResponse(w, canFailover, "account misconfigured")
 	}
-	// upCtx lets stream abort an idle upstream without touching the client.
-	upCtx, cancelUp := context.WithCancel(ctx)
-	defer cancelUp()
 	authRetried := false
 	for {
+		// upCtx lets an idle read abort this upstream try without touching
+		// the client or a later auth retry.
+		upCtx, cancelUp := context.WithCancel(ctx)
+		defer cancelUp()
 		rec := p.newRecord(req, account, *prevID)
 		*prevID = rec.ID
 
@@ -162,8 +164,38 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		p.deps.Quota.ObserveHeaders(acctID, resp.Header)
 		status := resp.StatusCode
 
-		if (status == http.StatusUnauthorized || status == http.StatusForbidden) && !authRetried {
-			drain(resp)
+		scoped, final, idledOut := p.classify(account, status, resp, cancelUp)
+		if idledOut {
+			// The error body stalled: keep what was read, and fail over or
+			// relay it.
+			body, _ := p.readFailureBody(resp, cancelUp)
+			f := &failure{status: status, header: resp.Header.Clone(), body: body}
+			out := core.Outcome{Status: status, RequestScoped: scoped}
+			if wantsResetHint(account.Provider, status) {
+				out.ResetAt = resetHint(resp.Header, p.clock.Now())
+			}
+			lease.Release(out)
+			rec.Status = status
+			rec.Error = errIdleErrorBody
+			p.log.Warn("upstream idle timeout reading error body", "account", acctID, "model", req.model, "status", status)
+			p.record(ctx, rec)
+			if canFailover && retryableFor(account.Provider, status) {
+				return attemptResult{failure: f}
+			}
+			relayFailure(w, f)
+			return attemptResult{done: true}
+		}
+		if final {
+			// The same request would fail the same way on any account, so a
+			// replay elsewhere is only amplification: relay it as the answer.
+			p.log.Info("upstream rejected request", "account", acctID, "class", req.class, "model", req.model, "status", status)
+			p.stream(w, r, req, resp, lease, rec, cancelUp, true)
+			return attemptResult{done: true}
+		}
+
+		if (status == http.StatusUnauthorized || status == http.StatusForbidden) && !authRetried && p.allowInvalidate(acctID) {
+			_, _ = p.readFailureBody(resp, cancelUp)
+			cancelUp()
 			authRetried = true
 			p.deps.Creds.Invalidate(acctID)
 			rec.Status = status
@@ -174,24 +206,163 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		}
 
 		if retryableFor(account.Provider, status) && canFailover {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxFailureBody))
-			drain(resp)
+			body, timedOut := p.readFailureBody(resp, cancelUp)
 			f := &failure{status: status, header: resp.Header.Clone(), body: body}
-			out := core.Outcome{Status: status}
+			out := core.Outcome{Status: status, RequestScoped: scoped}
 			if wantsResetHint(account.Provider, status) {
 				out.ResetAt = resetHint(resp.Header, p.clock.Now())
 			}
 			lease.Release(out)
 			rec.Status = status
 			rec.Error = "upstream " + strconv.Itoa(status) + "; failing over"
+			if timedOut {
+				rec.Error = errIdleErrorBody
+			}
 			p.log.Info("upstream failure; failing over", "account", acctID, "class", req.class, "model", req.model, "status", status)
 			p.record(ctx, rec)
 			return attemptResult{failure: f}
 		}
 
-		p.stream(w, r, req, resp, lease, rec, cancelUp)
+		p.stream(w, r, req, resp, lease, rec, cancelUp, scoped)
 		return attemptResult{done: true}
 	}
+}
+
+// invalidateGap is the minimum interval between credential refreshes forced
+// by upstream 401/403 answers on one account.
+const invalidateGap = 60 * time.Second
+
+// errIdleErrorBody is the ledger error for an upstream error body that
+// stalled for StreamIdleTimeout before the response was relayed.
+const errIdleErrorBody = "upstream idle timeout reading error body"
+
+// classify decides how an upstream status counts against the account.
+// scoped means the failure was caused by this request, not the account, so
+// policy must not cool the account down; final additionally means no other
+// account would answer differently, so the response is relayed without
+// credential refresh or failover. idledOut reports that the body read
+// needed for classification stalled and the upstream was canceled. Only
+// OpenRouter distinguishes these; other providers' 401/403/429 stay
+// account-level.
+func (p *Proxy) classify(account core.Account, status int, resp *http.Response, cancelUp context.CancelFunc) (scoped, final, idledOut bool) {
+	if account.Provider != core.ProviderOpenRouter {
+		return false, false, false
+	}
+	switch status {
+	case http.StatusForbidden:
+		// Moderation-flagged input; auth failures are 401.
+		return true, true, false
+	case http.StatusPaymentRequired:
+		// The affordability preflight depends on this request (max_tokens,
+		// prompt size, model price), so it does not cool the account down;
+		// another account may have more credit, so it is not final either.
+		// Any other 402 ("Insufficient credits", unknown or unreadable body)
+		// is the account being out of credit. A positive balance snapshot
+		// proves nothing about current funds; a known exhausted one wins.
+		if snap, ok := p.deps.Quota.Latest(account.ID); ok && orExhausted(snap) {
+			return false, false, false
+		}
+		body, timedOut := p.peekBody(resp, cancelUp)
+		if timedOut {
+			return false, false, true
+		}
+		return isAffordability(body), false, false
+	case http.StatusTooManyRequests:
+		// A per-model or upstream-provider rate limit, unless the account
+		// itself is known exhausted. Another key may not be limited.
+		snap, ok := p.deps.Quota.Latest(account.ID)
+		return !(ok && orExhausted(snap)), false, false
+	}
+	return false, false, false
+}
+
+// affordRE matches OpenRouter's affordability preflight 402 ("This request
+// requires more credits, or fewer max_tokens. You requested up to N tokens,
+// but can only afford M."). M may be 0 for a large enough prompt.
+var affordRE = regexp.MustCompile(`requires more credits, or fewer max_tokens|can only afford [0-9]+`)
+
+func isAffordability(body []byte) bool { return affordRE.Match(body) }
+
+// copyIdle copies up to limit bytes from src to dst. If no bytes arrive for
+// idle (0 disables), it calls cancelUp to abort the upstream and reports
+// timedOut, with the same semantics as stream's idle timer.
+func copyIdle(dst io.Writer, src io.Reader, limit int64, idle time.Duration, cancelUp context.CancelFunc) (timedOut bool) {
+	var fired atomic.Bool
+	var timer *time.Timer
+	if idle > 0 {
+		timer = time.AfterFunc(idle, func() { fired.Store(true); cancelUp() })
+		defer timer.Stop()
+	}
+	buf := make([]byte, 4<<10)
+	for limit > 0 {
+		if timer != nil {
+			timer.Reset(idle)
+		}
+		n, err := src.Read(buf[:min(int64(len(buf)), limit)])
+		if timer != nil {
+			timer.Stop()
+		}
+		_, _ = dst.Write(buf[:n])
+		limit -= int64(n)
+		if err != nil {
+			return fired.Load()
+		}
+	}
+	return false
+}
+
+// peekBody reads up to maxFailureBody bytes of resp.Body, idle-bounded, and
+// puts them back in front of the remainder so the response can still be
+// streamed or buffered unchanged.
+func (p *Proxy) peekBody(resp *http.Response, cancelUp context.CancelFunc) ([]byte, bool) {
+	var b bytes.Buffer
+	timedOut := copyIdle(&b, resp.Body, maxFailureBody, p.opts.StreamIdleTimeout, cancelUp)
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(b.Bytes()), resp.Body), resp.Body}
+	return b.Bytes(), timedOut
+}
+
+// readFailureBody buffers up to maxFailureBody bytes of an upstream error
+// body, discards up to as much again so the connection can be reused, and
+// closes it. Reads are idle-bounded like stream; on timeout the upstream is
+// canceled and the bytes read so far are returned.
+func (p *Proxy) readFailureBody(resp *http.Response, cancelUp context.CancelFunc) ([]byte, bool) {
+	defer resp.Body.Close()
+	idle := p.opts.StreamIdleTimeout
+	var b bytes.Buffer
+	if copyIdle(&b, resp.Body, maxFailureBody, idle, cancelUp) {
+		return b.Bytes(), true
+	}
+	return b.Bytes(), copyIdle(io.Discard, resp.Body, maxFailureBody, idle, cancelUp)
+}
+
+// orExhausted reports a known non-positive balance or an exhausted key cap.
+func orExhausted(s core.Snapshot) bool {
+	c := s.Credits
+	return c != nil && !c.FetchedAt.IsZero() && c.BalanceUSD <= 0 || keyCapExhausted(s.Key)
+}
+
+// keyCapExhausted mirrors the policy's rule: a known cap with no spend left.
+func keyCapExhausted(k *core.KeyUsage) bool {
+	return k != nil && !k.FetchedAt.IsZero() && k.LimitUSD != nil && k.LimitRemainingUSD != nil &&
+		*k.LimitRemainingUSD <= 0
+}
+
+// allowInvalidate reports whether an upstream 401/403 on accountID may force
+// a credential refresh now, and records it if so. At most one refresh per
+// account per invalidateGap, so a client cannot drive refresh traffic; a
+// later auth failure inside the gap is handled as an account-level failure.
+func (p *Proxy) allowInvalidate(accountID string) bool {
+	now := p.clock.Now()
+	p.invMu.Lock()
+	defer p.invMu.Unlock()
+	if last, ok := p.lastInvalidate[accountID]; ok && now.Sub(last) < invalidateGap {
+		return false
+	}
+	p.lastInvalidate[accountID] = now
+	return true
 }
 
 // noResponse either signals failover or, if none is allowed, answers 502.
@@ -232,8 +403,9 @@ func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cr
 
 // stream relays the upstream response to the client, capturing usage, then
 // releases the lease and records the ledger row. If no upstream bytes arrive
-// for StreamIdleTimeout, cancelUp aborts the upstream request.
-func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, resp *http.Response, lease core.Lease, rec core.RequestRecord, cancelUp context.CancelFunc) {
+// for StreamIdleTimeout, cancelUp aborts the upstream request. scoped is
+// passed to policy as Outcome.RequestScoped.
+func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, resp *http.Response, lease core.Lease, rec core.RequestRecord, cancelUp context.CancelFunc, scoped bool) {
 	defer resp.Body.Close()
 	ctx := r.Context()
 	rc := http.NewResponseController(w)
@@ -298,7 +470,7 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	if aborted || idledOut || readErr != nil {
 		known = false
 	}
-	out := core.Outcome{Status: resp.StatusCode, UsageKnown: known, BytesToClient: written}
+	out := core.Outcome{Status: resp.StatusCode, UsageKnown: known, BytesToClient: written, RequestScoped: scoped}
 	if wantsResetHint(rec.Provider, resp.StatusCode) {
 		out.ResetAt = resetHint(resp.Header, p.clock.Now())
 	}
@@ -352,6 +524,8 @@ func (p *Proxy) newRecord(req *request, account core.Account, failoverOf string)
 // record finalizes timing, logs a summary, and writes the ledger row. Ledger
 // failures are logged and never affect the response.
 func (p *Proxy) record(ctx context.Context, rec core.RequestRecord) {
+	// Errors can carry upstream/transport text: bound and sanitize them.
+	rec.Error = core.TruncateError(rec.Error)
 	rec.FinishedAt = p.clock.Now()
 	rec.LatencyMS = rec.FinishedAt.Sub(rec.StartedAt).Milliseconds()
 	p.log.Info("request",
@@ -402,8 +576,10 @@ func retryable(status int) bool {
 }
 
 // retryableFor adds provider-specific failover statuses to retryable. An
-// OpenRouter 402 (out of credit) is account-specific, so another account may
-// still serve; for other providers 402 stays a final answer.
+// OpenRouter 402 (out of credit, or this request unaffordable on this key)
+// is account-specific, so another account may still serve; for other
+// providers 402 stays a final answer. Final answers (classify) are filtered
+// out before this check.
 func retryableFor(provider string, status int) bool {
 	return retryable(status) || provider == core.ProviderOpenRouter && status == http.StatusPaymentRequired
 }
@@ -411,11 +587,6 @@ func retryableFor(provider string, status int) bool {
 // wantsResetHint reports whether the outcome should carry resetHint.
 func wantsResetHint(provider string, status int) bool {
 	return status == http.StatusTooManyRequests || provider == core.ProviderOpenRouter && status == http.StatusPaymentRequired
-}
-
-func drain(resp *http.Response) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxFailureBody))
-	_ = resp.Body.Close()
 }
 
 // resetHint derives when an exhausted account may be retried from
