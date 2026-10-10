@@ -70,10 +70,21 @@ func (s *Server) pingStorage() bool {
 }
 
 func (s *Server) readyStatus() int {
-	if !s.readyFlag() || !s.pingStorage() {
+	if !s.readyFlag() || !s.pingStorage() || !s.identityReady() {
 		return http.StatusServiceUnavailable
 	}
 	return http.StatusOK
+}
+
+// identityReady folds the identity store into readiness in multi-user mode
+// (a nil or failing store is not ready). It probes local storage only, never
+// the OIDC provider. Legacy mode is unaffected.
+func (s *Server) identityReady() bool {
+	if !s.multiUser() {
+		return true
+	}
+	h := s.identityHealth()
+	return h.Configured && h.OK
 }
 
 // diagnosticsDoc is the authenticated GET /control/v1/diagnostics response.
@@ -88,6 +99,10 @@ type diagnosticsDoc struct {
 	// fabricating a generation.
 	Reload   *core.ReloadStatus `json:"reload,omitempty"`
 	Accounts []diagAccount      `json:"accounts"`
+	// Identity is the identity store's health in multi-user mode only
+	// (omitted in legacy mode). Like Storage it carries a generic reason at
+	// most: never the issuer, client id, a user or the raw store error.
+	Identity *storageHealth `json:"identity,omitempty"`
 }
 
 type storageHealth struct {
@@ -134,6 +149,10 @@ func (s *Server) diagnostics(w http.ResponseWriter, r *http.Request) {
 	for _, a := range s.deps.Accounts {
 		doc.Accounts = append(doc.Accounts, s.diagAccount(a, now))
 	}
+	if s.multiUser() {
+		doc.Identity = s.identityHealth()
+		doc.Ready = doc.Ready && doc.Identity.Configured && doc.Identity.OK
+	}
 	writeJSON(w, http.StatusOK, doc)
 }
 
@@ -172,6 +191,20 @@ func (s *Server) storageHealth() storageHealth {
 		return storageHealth{Configured: true, OK: false, Error: boundedError(err)}
 	}
 	return storageHealth{Configured: true, OK: true}
+}
+
+// identityHealth probes the identity store with the same bound and the same
+// sanitized reasons as storageHealth. A nil store is reported unconfigured.
+func (s *Server) identityHealth() *storageHealth {
+	if s.deps.Identity == nil {
+		return &storageHealth{}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), storagePingTimeout)
+	defer cancel()
+	if err := s.deps.Identity.Ping(ctx); err != nil {
+		return &storageHealth{Configured: true, OK: false, Error: boundedError(err)}
+	}
+	return &storageHealth{Configured: true, OK: true}
 }
 
 // storageErrorUnavailable is the only non-timeout reason reported for a

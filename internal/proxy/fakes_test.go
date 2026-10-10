@@ -233,6 +233,10 @@ type harness struct {
 	// led, when set before start(), replaces the fake ledger as Deps.Ledger.
 	led core.Ledger
 	srv *httptest.Server
+	// multiUser and authPrincipal, when set before start(), select the
+	// multi-user authentication path (Deps.MultiUser/AuthenticatePrincipal).
+	multiUser     bool
+	authPrincipal core.BearerAuthenticator
 	// handled counts proxy handler invocations that have returned.
 	handled atomic.Int64
 }
@@ -319,7 +323,7 @@ func (h *harness) newProxy() *Proxy {
 	return New(Deps{
 		Accounts: h.accounts, Routes: h.routes, Creds: h.creds, Quota: h.quota,
 		Policy: pol, Ledger: led, Clock: clock, Limiter: h.limiter, Budget: h.budget,
-		Logger: slog.New(handler),
+		Logger: slog.New(handler), MultiUser: h.multiUser, AuthenticatePrincipal: h.authPrincipal,
 		Authenticate: func(bearer string) (core.Client, bool) {
 			switch bearer {
 			case clientKey:

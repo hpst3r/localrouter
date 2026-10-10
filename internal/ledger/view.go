@@ -16,8 +16,9 @@ import (
 // This is the seam a hot reload uses: each configuration generation captures a
 // view, so records admitted in that generation are costed at that generation's
 // prices even if the price table changes while they are in flight. Because the
-// view embeds *Ledger, the read-side API (Ping, Summary, Analytics,
-// RelabelHost, …) is promoted unchanged; only the writing methods are
+// view embeds *Ledger, the read-side API (Ping, Summary, SummaryScoped,
+// Analytics, RelabelHost, …) is promoted unchanged — including the ledger's
+// RequireScope mode; only the writing methods are
 // overridden to select the frozen price table.
 //
 // Ownership: a PricingView does NOT own the database. Its Close is a no-op —
@@ -32,8 +33,9 @@ type PricingView struct {
 // PricingView must satisfy the same ledger contracts as *Ledger. The read
 // methods are promoted from the embedded ledger.
 var (
-	_ core.Ledger      = (*PricingView)(nil)
-	_ core.BatchLedger = (*PricingView)(nil)
+	_ core.Ledger       = (*PricingView)(nil)
+	_ core.BatchLedger  = (*PricingView)(nil)
+	_ core.ScopedLedger = (*PricingView)(nil)
 )
 
 // WithPricing returns a view of l that attributes cost using p for every

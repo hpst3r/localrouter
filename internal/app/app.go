@@ -5,6 +5,7 @@ package app
 
 import (
 	"context"
+	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"net"
@@ -23,9 +24,11 @@ import (
 	"github.com/hpst3r/localrouter/internal/core"
 	"github.com/hpst3r/localrouter/internal/hermeslog"
 	"github.com/hpst3r/localrouter/internal/httpguard"
+	"github.com/hpst3r/localrouter/internal/identity"
 	"github.com/hpst3r/localrouter/internal/ledger"
 	"github.com/hpst3r/localrouter/internal/policy"
 	"github.com/hpst3r/localrouter/internal/quota"
+	"github.com/hpst3r/localrouter/internal/weblogin"
 )
 
 // Overrides replaces production endpoints; zero values keep defaults.
@@ -36,6 +39,20 @@ type Overrides struct {
 	ClaudeUsageURL string
 	HTTPClient     *http.Client
 	Clock          core.Clock
+
+	// Identity test seams (multi-user mode only). They are independent of
+	// Issuer/HTTPClient, which point at upstream providers.
+	//
+	// IdentityClock drives the identity store, OIDC login validation and
+	// bearer owner checks; nil is the system clock. IdentityRootCAs replaces
+	// the system roots for the OIDC provider (nil = system roots).
+	// IdentityTestDialContext is TEST-ONLY: it replaces weblogin's IP-guarded
+	// dialer so fixtures can reach a loopback TLS issuer under a .test host
+	// name; every other outbound guard stays active. It has no configuration
+	// path and must be nil in production.
+	IdentityClock           core.Clock
+	IdentityRootCAs         *x509.CertPool
+	IdentityTestDialContext func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 // Timeouts are the resolved inbound server deadlines. They are read from
@@ -71,6 +88,12 @@ type App struct {
 	TLSCertFile, TLSKeyFile string
 	// Logger is the server logger.
 	Logger *slog.Logger
+	// Identity is the multi-user identity store (users, API keys, sessions)
+	// and WebLogin the OIDC browser-login service. Both are nil unless the
+	// identity block is configured. Build opens them once for the process;
+	// every runtime generation shares them.
+	Identity *identity.Store
+	WebLogin *weblogin.Service
 
 	serving atomic.Bool
 	// budgetStore and budgetOwnership are set by Build when cfg.Budgets is
@@ -84,11 +107,18 @@ type App struct {
 	// budgetGate read and Close's release are ordered on that one lock.
 	budgetStore     *budget.Store
 	budgetOwnership *budget.Ownership
-	current         atomic.Pointer[runtimeGeneration]
-	lastReload      atomic.Pointer[core.ReloadStatus]
-	reloadMu        sync.Mutex
-	reloadBase      *config.Config
-	reloadClock     core.Clock
+	// identityLock is the server ownership of identity.db (a second server is
+	// refused; the users CLI opens the database without it), acquired in
+	// Build before Identity is opened and released by closeIdentity after it
+	// is closed. identityClock is fixed at Build (the identity block is
+	// restart-only).
+	identityLock  *identityLock
+	identityClock core.Clock
+	current       atomic.Pointer[runtimeGeneration]
+	lastReload    atomic.Pointer[core.ReloadStatus]
+	reloadMu      sync.Mutex
+	reloadBase    *config.Config
+	reloadClock   core.Clock
 
 	// srvMu guards the one-shot Serve lifecycle fields below. Serve publishes
 	// an active server to at most one caller; Shutdown may run concurrently on
@@ -237,9 +267,30 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 	a.serving.Store(true)
 	a.reloadBase = cfg
 	a.reloadClock = clock
+	if cfg.Identity != nil {
+		// Multi-user mode: every ledger read must name a data scope from
+		// here on, before any generation can serve, so no read path can
+		// fall back to an unscoped (all-users) query by omission.
+		led.RequireScope()
+		a.identityClock = identityClock(ov)
+		lock, st, err := openIdentity(cfg, a.identityClock)
+		if err != nil {
+			_ = led.Close()
+			return nil, err
+		}
+		a.identityLock, a.Identity = lock, st
+		svc, err := newWebLogin(cfg.Identity, st, a.identityClock, logger, ov)
+		if err != nil {
+			a.closeIdentity()
+			_ = led.Close()
+			return nil, err
+		}
+		a.WebLogin = svc
+	}
 	if cfg.Budgets != nil {
 		owner, store, err := openBudgetStore(cfg)
 		if err != nil {
+			a.closeIdentity()
 			_ = led.Close()
 			return nil, err
 		}
@@ -248,6 +299,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 	generation, _, err := a.makeGeneration(cfg, 1)
 	if err != nil {
 		a.closeBudget()
+		a.closeIdentity()
 		_ = led.Close()
 		return nil, err
 	}
@@ -398,6 +450,7 @@ func (a *App) Close() error {
 	a.stopped = true
 	a.srvMu.Unlock()
 	a.closeBudget()
+	a.closeIdentity()
 	if a.Ledger == nil {
 		return nil
 	}

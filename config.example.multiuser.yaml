@@ -1,0 +1,85 @@
+# LocalRouter MULTI-USER example (OIDC browser login + user-owned API keys).
+# See docs/OIDC-MULTIUSER.md before using it. Every name, ID and URL below is a
+# placeholder; no value here is a real tenant, client, subject or secret.
+#
+# Layout follows the container deployment (docs/CONTAINERS.md): NGINX
+# terminates TLS on https://router.example.com:8443 and forwards Host verbatim
+# to this process on plain HTTP; this process does not terminate TLS.
+# Paths are absolute container paths; secrets are files (mode 0600), never
+# inline values.
+
+listen: 0.0.0.0:8787             # private container network only; no host port published
+allow_non_loopback: true
+allowed_hosts: [router.example.com, localhost]   # must include the public_base_url host
+
+data_dir: /var/lib/localrouter   # holds identity.db next to localrouter.db and budgets.db
+pricing_file: /etc/localrouter/pricing.yaml
+
+control:
+  require_auth: true             # required by the identity block
+
+identity:
+  public_base_url: https://router.example.com:8443   # exact browser origin; callback is <origin>/auth/callback
+  oidc:
+    issuer: https://idp.example.com/application/o/localrouter/   # exact iss, byte for byte
+    client_id: localrouter-example
+    client_secret_file: /run/secrets/oidc-client-secret          # file only, 0600, <= 4096 bytes
+    # client_auth: client_secret_basic   # default; or client_secret_post
+    # scopes: [openid, profile]          # default; openid required, offline_access refused
+    # signing_algs: [RS256]              # default; asymmetric only
+    # tenant_id: ""                      # Entra only: must appear in issuer, checked against tid
+    # allow_private_network: false       # true only for a LAN IdP (RFC 1918/ULA/CGNAT/loopback)
+    # extra_endpoint_hosts: []           # bare hosts, if discovery names endpoints off the issuer host
+    # http_timeout: 10s                  # default; at most 60s
+  access:
+    claim: groups                # string or string-array ID-token claim; e.g. roles for Entra app roles
+    user_values: [localrouter-users]
+    admin_values: [localrouter-admins]
+    # admin_subjects: ["example-subject-0001"]  # exact sub; still needs a claim value above
+  # Defaults shown; values may only be tightened. Go durations (no "d" unit).
+  keys:
+    max_ttl: 2160h               # 90 days, ceiling
+    require_login_within: 720h   # 30 days, ceiling
+    max_per_user: 10             # 1..100
+  session:
+    idle_ttl: 8h                 # ceiling
+    absolute_ttl: 24h            # ceiling
+
+limits:
+  max_concurrent: 64
+  max_concurrent_per_user: 4     # across all of one user's keys; 0 = unlimited
+
+budgets:
+  reserve_usd: "0.05"            # fixed per-attempt hold, exact decimal string; not a bill cap
+  users:                         # default ceiling for every identity user, across all their keys
+    daily_usd: "2.00"
+    monthly_usd: "20.00"
+
+clients:
+  # Static keys are optional in multi-user mode and each needs an explicit role.
+  # Names starting with k_ or u_ are reserved.
+  # service: may ingest and read global status/usage; never an admin.
+  - { name: agent-laptop, class: interactive, host: laptop, key_file: /run/secrets/agent-laptop.key, ingest: true, role: service }
+  # user: acts as an existing identity user. Fill owner with the user's ID from
+  # `localrouter users list` after their first browser login. The key is bound
+  # to that owner for good; after a disable or policy denial it stays revoked,
+  # so write a NEW key here after the owner's next login (see the doc, §6).
+  # - { name: build-bot, class: background, host: ci, key_file: /run/secrets/build-bot.key, role: user, owner: u_aaaaaaaaaaaaaaaaaaaaaaaaaa }
+
+accounts:
+  - id: ollama-cloud
+    provider: ollama
+    base_url: https://ollama.com/v1
+    api_key_file: /run/secrets/ollama.key
+    reserve: { 5h: 0.10, weekly: 0.10 }
+
+routes:
+  - name: ollama
+    models: [deepseek-v4.1-flash, kimi-k3]
+    interactive: [ollama-cloud]
+    background:  [ollama-cloud]
+
+claude_logs:
+  enabled: false
+hermes_logs:
+  enabled: false

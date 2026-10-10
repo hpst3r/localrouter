@@ -3,8 +3,10 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -20,7 +22,8 @@ import (
 )
 
 const (
-	maxFailureBody  = 64 << 10 // buffered upstream error body kept for relay
+	maxFailureBody  = 64 << 10           // buffered upstream error body kept for relay
+	maxErrorDrain   = 2 * maxFailureBody // multi-user: upstream error bytes read, then discarded
 	ledgerTimeout   = 5 * time.Second
 	denyRetryAfter  = "60"
 	streamChunkSize = 32 << 10
@@ -82,13 +85,19 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 			}
 			switch {
 			case pending != nil:
-				relayFailure(w, pending)
+				p.relayFailure(w, pending)
 			case lastErr != "":
 				writeError(w, http.StatusBadGateway, "localrouter: "+lastErr, "upstream_error")
 			default:
 				p.log.Info("policy denied", "client", req.client.Name, "class", req.class, "model", req.model, "reason", dec.Reason)
 				w.Header().Set("Retry-After", denyRetryAfter)
-				writeError(w, http.StatusTooManyRequests, "localrouter: no admissible account: "+dec.Reason, "quota_reserve")
+				// The reason names accounts and quota state: only the operator
+				// sees it in multi-user mode (logged above).
+				msg := "localrouter: no admissible account: " + dec.Reason
+				if p.deps.MultiUser {
+					msg = "localrouter: no admissible account"
+				}
+				writeError(w, http.StatusTooManyRequests, msg, "quota_reserve")
 			}
 			return
 		}
@@ -261,7 +270,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			if eligible {
 				return attemptResult{failure: f}
 			}
-			relayFailure(w, f)
+			p.relayFailure(w, f)
 			return attemptResult{done: true}
 		}
 		if final {
@@ -514,6 +523,11 @@ func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cr
 // releases the lease, records the ledger row and emits the completion event.
 // If no upstream bytes arrive for StreamIdleTimeout, cancelUp aborts the
 // upstream request. scoped is passed to policy as Outcome.RequestScoped.
+//
+// In multi-user mode an upstream error body (status >= 400) is account text:
+// the client gets the generic envelope instead, and the upstream body is only
+// drained, up to maxErrorDrain, so usage capture and the abort, idle and
+// read-error outcomes below are computed exactly as for a relayed body.
 func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, resp *http.Response, lease core.Lease, rec core.RequestRecord, cancelUp context.CancelFunc, scoped bool, ev attemptEvent) {
 	defer resp.Body.Close()
 	ctx := r.Context()
@@ -529,14 +543,19 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 		defer timer.Stop()
 	}
 
-	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
+	var written, drained int64
+	redact := p.deps.MultiUser && resp.StatusCode >= 400
+	if redact {
+		written = writeUpstreamError(w, resp.StatusCode, resp.Header)
+	} else {
+		p.relayHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+	}
 	_ = rc.Flush()
 
 	capture := newUsageCapture(resp.Header.Get("Content-Type"))
 	buf := make([]byte, streamChunkSize)
 	var (
-		written  int64
 		aborted  bool
 		idledOut bool
 		readErr  error
@@ -551,13 +570,15 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 		}
 		if n > 0 {
 			_, _ = capture.Write(buf[:n])
-			wn, werr := w.Write(buf[:n])
-			written += int64(wn)
-			if werr != nil {
-				aborted = true
-				break
+			if !redact {
+				wn, werr := w.Write(buf[:n])
+				written += int64(wn)
+				if werr != nil {
+					aborted = true
+					break
+				}
+				_ = rc.Flush()
 			}
-			_ = rc.Flush()
 		}
 		if err == io.EOF {
 			break
@@ -571,6 +592,9 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 			default:
 				readErr = err
 			}
+			break
+		}
+		if drained += int64(n); redact && drained >= maxErrorDrain {
 			break
 		}
 	}
@@ -659,6 +683,8 @@ func (p *Proxy) newRecord(req *request, account core.Account, failoverOf string)
 		Task:          req.task,
 		Agent:         req.agent,
 		Host:          req.client.Host,
+		UserID:        req.principal.UserID,
+		KeyID:         req.principal.KeyID,
 	}
 	// A capability-constrained route (per-candidate Upstreams) attributes cost
 	// to the backend this attempt actually resolved, so two candidates serving
@@ -775,10 +801,115 @@ func budgetErrClass(err error) string {
 	}
 }
 
-func relayFailure(w http.ResponseWriter, f *failure) {
+// relayFailure answers with a buffered upstream failure: verbatim in legacy
+// mode, as the generic envelope in multi-user mode.
+func (p *Proxy) relayFailure(w http.ResponseWriter, f *failure) {
+	if p.deps.MultiUser {
+		writeUpstreamError(w, f.status, f.header)
+		return
+	}
 	copyHeaders(w.Header(), f.header)
 	w.WriteHeader(f.status)
 	_, _ = w.Write(f.body)
+}
+
+// writeUpstreamError answers a multi-user upstream failure. The upstream
+// accounts are shared, so an error body's text (organization ids, plans,
+// remaining credit, backend model names) and the account's headers are never
+// relayed: the client gets the upstream status, a validated Retry-After, and
+// the localrouter error envelope with its own Content-Length. It returns the
+// bytes written.
+func writeUpstreamError(w http.ResponseWriter, status int, upstream http.Header) int64 {
+	var e errorBody
+	e.Error.Message = "localrouter: upstream error (HTTP " + strconv.Itoa(status) + ")"
+	e.Error.Type = "upstream_error"
+	body, _ := json.Marshal(e)
+	body = append(body, '\n')
+	h := w.Header()
+	if ra, ok := safeRetryAfter(upstream.Get("Retry-After")); ok {
+		h.Set("Retry-After", ra)
+	}
+	h.Set("Content-Type", "application/json")
+	h.Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	n, _ := w.Write(body)
+	return int64(n)
+}
+
+// relayHeaders copies upstream response headers for a relayed body. Legacy
+// mode copies all but hop-by-hop headers. Multi-user mode passes only what a
+// client needs to read the relayed bytes: the media type (charset utf-8 at
+// most) and a content coding the transport left in place. Organization,
+// rate-limit, cookie, request-id, redirect and debug headers describe the
+// shared account and are dropped for every principal.
+func (p *Proxy) relayHeaders(dst, src http.Header) {
+	if !p.deps.MultiUser {
+		copyHeaders(dst, src)
+		return
+	}
+	if ct, ok := safeContentType(src.Get("Content-Type")); ok {
+		dst.Set("Content-Type", ct)
+	}
+	if ce, ok := safeContentEncoding(src.Values("Content-Encoding")); ok {
+		dst.Set("Content-Encoding", ce)
+	}
+}
+
+// safeContentType reduces v to its media type plus charset=utf-8 when that was
+// declared; other parameters are dropped. It reports false for an unparsable v.
+func safeContentType(v string) (string, bool) {
+	mt, params, err := mime.ParseMediaType(v)
+	if err != nil {
+		return "", false
+	}
+	var keep map[string]string
+	if strings.EqualFold(params["charset"], "utf-8") {
+		keep = map[string]string{"charset": "utf-8"}
+	}
+	out := mime.FormatMediaType(mt, keep)
+	return out, out != ""
+}
+
+// contentCodings are the registered content codings relayed in multi-user mode.
+var contentCodings = map[string]bool{
+	"gzip": true, "x-gzip": true, "deflate": true, "br": true, "zstd": true,
+	"compress": true, "x-compress": true, "identity": true,
+}
+
+// safeContentEncoding returns the Content-Encoding codings when every one is
+// registered. The transport removes the header when it decodes the body
+// itself, so a header still present describes the relayed bytes.
+func safeContentEncoding(vs []string) (string, bool) {
+	var codings []string
+	for _, v := range vs {
+		for _, c := range strings.Split(v, ",") {
+			c = strings.ToLower(strings.TrimSpace(c))
+			if c == "" {
+				continue
+			}
+			if !contentCodings[c] {
+				return "", false
+			}
+			codings = append(codings, c)
+		}
+	}
+	return strings.Join(codings, ", "), len(codings) > 0
+}
+
+// safeRetryAfter returns v when it is delta-seconds, or v re-formatted when it
+// is an HTTP date, so no free text is relayed.
+func safeRetryAfter(v string) (string, bool) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", false
+	}
+	if len(v) <= 10 && strings.Trim(v, "0123456789") == "" {
+		return v, true
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return t.UTC().Format(http.TimeFormat), true
+	}
+	return "", false
 }
 
 func copyHeaders(dst, src http.Header) {

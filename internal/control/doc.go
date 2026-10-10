@@ -39,4 +39,32 @@
 // When Options.RequireAuth is set, /control/v1/* require a client bearer key;
 // /healthz and / stay open and the widget prompts for a key kept in
 // localStorage. No secret material is ever returned.
+//
+// Multi-user mode (Options.MultiUser or Deps.MultiUser) changes the route
+// table; legacy mode is unchanged:
+//
+//   - Every /control/v1 route authenticates the bearer with
+//     Deps.AuthenticatePrincipal only (nil seam or backend failure -> 503,
+//     bad credential -> 401; cookies and the legacy Authenticate are never
+//     used) and authorizes it with internal/authz (403). Usage, analytics and
+//     dimensions are owner-scoped: a user key or user-owned static client sees
+//     only its owner's rows, a service client sees all rows; the scope is
+//     applied in SQL before aggregation and never taken from the URL. The
+//     owner dimensions "key" (everyone) and "user" (global readers) are added.
+//     Status, diagnostics and budgets are service-only on the bearer API;
+//     ingest needs a service client with Ingest and forces record ownership
+//     from the principal. Admit keeps its full answer for service clients; a
+//     user bearer gets the decision with an empty account_id, the generic
+//     reason "admitted" or "no_admissible_account", and a budget estimate over
+//     its own client and user buckets only. The {class, account} form is 403
+//     for a user bearer, before the account is looked up.
+//   - /ui/v1/* is the browser-session API (session cookie only, an
+//     Authorization header is refused; unsafe methods need the exact
+//     PublicBaseURL Origin, Sec-Fetch-Site absent or same-origin and the
+//     X-LocalRouter-CSRF token): /me, /me/keys, /me/usage, /me/analytics,
+//     /me/analytics/dimensions (alias /me/dimensions), /me/budget, and for
+//     admin sessions /admin/users[/{id}/disable|enable|delete|keys[/{kid}]],
+//     /admin/audit and the global /admin/status, usage, analytics,
+//     analytics/dimensions (alias /admin/dimensions), diagnostics, budgets.
+//   - GET / redirects to /ui/; /readyz also requires the identity store.
 package control
