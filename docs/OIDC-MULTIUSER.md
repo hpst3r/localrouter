@@ -272,8 +272,9 @@ in the config, and every admin also needs an allowed claim value.
   admin subject was removed, or a user value is no longer in `user_values` or
   `admin_values`. On a narrowing, every session ends, every admin becomes a
   user, and every user's keys and owned static keys stop working until that
-  person's next allowed login. The keys are suspended, not revoked. The
-  audit log records `access_policy.narrowed` and the server log warns. Adding
+  person's next allowed login. The keys are suspended, not revoked. Ordering
+  uses a stored generation counter, not the clock, so clock changes cannot
+  bypass it or lock users out. The audit log records `access_policy.narrowed` and the server log warns. Adding
   values, or restarting with the same policy, changes nothing.
 - **IdP-side removal is not immediate.**
   - If the person attempts a new login after being removed from the allowed
@@ -351,10 +352,14 @@ providers, change billing, or refer to state stored on the account are
 refused with 400 `field "<name>" is not allowed on this gateway`. Key names
 are matched case-insensitively:
 - always refused: `models`, `route`, `provider`, `plugins`, `transforms`,
-  `preset`;
+  `preset`, `web_search_options`;
 - `service_tier` unless `null`, `"auto"` or `"default"`; `background` unless
   `null` or `false`;
-- `previous_response_id`, `conversation` and `prompt` unless `null`.
+- `previous_response_id`, `conversation` and `prompt` unless `null`;
+- inside `input`, `messages` and `tools`, at any depth: `item_reference`
+  items and any `file_id`, `vector_store_ids` or `container` key. Function
+  tool parameter schemas are not inspected. Send file content inline
+  instead. These values may be nested at most 64 levels deep.
 
 A non-OpenRouter 429/403 that reports a request-size error (context length,
 "Request too large") is returned as final and does not cool the account down
@@ -399,7 +404,8 @@ intended.
   audit), `localrouter.db` (ledger), `budgets.db` and their lock files.
 - **Upgrading is one-way.** The first start of this version migrates
   `localrouter.db` to schema 5 and `budgets.db` to schema 2, in either mode.
-  Multi-user mode also creates `identity.db` at schema 2. Older binaries
+  Multi-user mode also creates `identity.db` at schema 3 (an earlier build
+  of this branch at schema 2 is migrated forward). Older binaries
   refuse to start on these files ("database schema version … is newer than
   supported"). To roll back, restore the pre-upgrade backup.
 - **First start of this version with existing users** records the access
@@ -459,7 +465,8 @@ scratch paths and generated secrets:
   - `/auth/login` returns 503 while the IdP is unreachable.
   - A service key reads global status, and a bogus `lrk_` key gets 401.
   - The data directory ends up with identity schema 2, ledger 5 and budgets 2.
-    The `89693a0` binary then refuses to start on it.
+    The `89693a0` binary then refuses to start on it. (Checked on `829ddb4`;
+    the security-review fixes move identity to schema 3.)
 - [x] **Cross-builds** for `windows/amd64`, `darwin/amd64` and `darwin/arm64`
   compile. None of them was run.
 - [x] **Fake signed IdP tests in `internal/weblogin` and `internal/app`**
