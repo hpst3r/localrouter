@@ -227,6 +227,9 @@ const (
 	AuditKeyRevoked      = "key.revoked"
 	AuditSessionsRevoked = "session.revoked_all"
 	AuditPolicyRevoked   = "credentials.revoked_policy"
+	// AuditAccessPolicyNarrowed: a configured access policy narrowed the
+	// recorded one (ApplyAccessPolicy).
+	AuditAccessPolicyNarrowed = "access_policy.narrowed"
 
 	OutcomeOK     = "ok"
 	OutcomeDenied = "denied"

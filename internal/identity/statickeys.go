@@ -146,7 +146,8 @@ func (s *Store) RegisterStaticKey(ctx context.Context, owner, token string) (Sta
 // already matched to a configured client owned by owner, with a fresh read on
 // every call (no cache). It succeeds only if the token's digest is
 // registered to owner, not revoked, and the owner exists, is active and has
-// an allowed login within Options.LoginMaxAge. Owned static keys have no
+// an allowed login within Options.LoginMaxAge and not before the policy
+// epoch (ApplyAccessPolicy). Owned static keys have no
 // expiry of their own.
 //
 // The principal is Kind PrincipalStaticClient, Role RoleUser and UserID; the
@@ -163,12 +164,13 @@ func (s *Store) AuthenticateStaticKey(ctx context.Context, owner, token string) 
 		revoked   sql.NullInt64
 		status    sql.NullString
 		lastLogin sql.NullInt64
+		epoch     int64
 	)
 	err := s.read(ctx, func(ctx context.Context) error {
 		err := s.db.QueryRowContext(ctx,
-			`SELECT k.user_id, k.revoked_at, u.status, u.last_login_at
+			`SELECT k.user_id, k.revoked_at, u.status, u.last_login_at, `+policyEpochSQL+`
 			 FROM static_keys k LEFT JOIN users u ON u.id = k.user_id WHERE k.digest = ?`, digest).
-			Scan(&bound, &revoked, &status, &lastLogin)
+			Scan(&bound, &revoked, &status, &lastLogin, &epoch)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -179,7 +181,7 @@ func (s *Store) AuthenticateStaticKey(ctx context.Context, owner, token string) 
 		return core.Principal{}, unavailable(err)
 	}
 	if !found || bound != owner || revoked.Valid || UserStatus(status.String) != StatusActive ||
-		!s.loginFresh(lastLogin, s.now()) {
+		!s.loginFresh(lastLogin, epoch, s.now()) {
 		return core.Principal{}, core.ErrUnauthenticated
 	}
 	return core.Principal{Kind: core.PrincipalStaticClient, Role: core.RoleUser, UserID: owner}, nil

@@ -89,9 +89,10 @@ func readOwnedKey(client, path string) (string, error) {
 
 // openIdentity takes server ownership of identity.db and opens it with
 // the block's store options (the store rejects anything above its ceilings,
-// so configuration can only tighten). Ownership is acquired BEFORE the store
-// is opened; any failure releases exactly what was acquired, store first, so
-// a failed Build leaves the lock free for the next attempt.
+// so configuration can only tighten), then applies the configured access
+// policy (identity.Store.ApplyAccessPolicy). Ownership is acquired BEFORE
+// the store is opened; any failure releases exactly what was acquired, store
+// first, so a failed Build leaves the lock free for the next attempt.
 func openIdentity(cfg *config.Config, clock core.Clock) (*identityLock, *identity.Store, error) {
 	lock, err := acquireIdentityLock(filepath.Join(cfg.DataDir, "identity.lock"))
 	if err != nil {
@@ -103,6 +104,20 @@ func openIdentity(cfg *config.Config, clock core.Clock) (*identityLock, *identit
 	defer cancel()
 	st, err := identity.Open(ctx, filepath.Join(cfg.DataDir, "identity.db"), opts)
 	if err != nil {
+		_ = lock.Close()
+		return nil, nil, fmt.Errorf("identity store: %w", err)
+	}
+	// The access policy is restart-only: apply it before anything is
+	// served, so a narrowing invalidates sessions, admin roles and
+	// credentials minted under the old policy (see ApplyAccessPolicy).
+	ac := cfg.Identity.Access
+	if _, err := st.ApplyAccessPolicy(ctx, identity.AccessPolicy{
+		Claim:         ac.Claim,
+		UserValues:    ac.UserValues,
+		AdminValues:   ac.AdminValues,
+		AdminSubjects: ac.AdminSubjects,
+	}); err != nil {
+		_ = st.Close()
 		_ = lock.Close()
 		return nil, nil, fmt.Errorf("identity store: %w", err)
 	}
