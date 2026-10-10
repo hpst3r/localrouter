@@ -3,7 +3,7 @@ module github.com/hpst3r/localrouter
 go 1.26.8
 
 require (
-	golang.org/x/sync v0.23.0
+	golang.org/x/sync v0.24.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.60.1
 )
