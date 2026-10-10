@@ -242,26 +242,42 @@ type Usage struct {
 // RequestRecord is one ledger row. Never contains prompt/response content.
 // JSON tags define the ingest wire format (agents -> server).
 type RequestRecord struct {
-	ID               string    `json:"id"`
-	StartedAt        time.Time `json:"started_at"`
-	FinishedAt       time.Time `json:"finished_at"`
-	Client           string    `json:"client"`
-	Class            Class     `json:"class"`
-	Route            string    `json:"route"`
-	Model            string    `json:"model"`
-	Provider         string    `json:"provider"`
-	AccountID        string    `json:"account_id"`
-	UpstreamIdentity string    `json:"upstream_identity,omitempty"`
-	Status           int       `json:"status"`
-	FailoverOf       string    `json:"failover_of,omitempty"`
-	Usage            Usage     `json:"usage"`
-	UsageKnown       bool      `json:"usage_known"`
-	LatencyMS        int64     `json:"latency_ms"`
-	BytesOut         int64     `json:"bytes_out"`
-	Session          string    `json:"session,omitempty"`
-	Task             string    `json:"task,omitempty"`
-	Agent            string    `json:"agent,omitempty"`
-	Error            string    `json:"error,omitempty"`
+	ID         string    `json:"id"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at"`
+	Client     string    `json:"client"`
+	Class      Class     `json:"class"`
+	Route      string    `json:"route"`
+	Model      string    `json:"model"`
+	// UpstreamModel is the resolved backend model actually sent upstream for
+	// this attempt (the candidate descriptor's upstream_model, else the
+	// route's upstream_model, else the client model). It is additive metadata
+	// for the ledger/pricing path; Model stays the client-facing id so pricing
+	// and analytics keep working against the route's advertised name.
+	UpstreamModel string `json:"upstream_model,omitempty"`
+	// PricingModel is the ledger's cost-attribution key for this attempt. It is
+	// populated ONLY for a capability-constrained route (one with per-candidate
+	// Upstreams), and then carries the backend model actually resolved for the
+	// attempt (the same value as UpstreamModel). Cost attribution uses
+	// PricingModel when non-empty, else Model. For a legacy/unconstrained route
+	// it stays empty and pricing keys on Model exactly as before — and it is
+	// never backfilled from the client alias for an unpriced backend: on a
+	// constrained route a backend with no price stays honestly unpriced (NULL
+	// cost) rather than being costed at the client model's price.
+	PricingModel     string `json:"pricing_model,omitempty"`
+	Provider         string `json:"provider"`
+	AccountID        string `json:"account_id"`
+	UpstreamIdentity string `json:"upstream_identity,omitempty"`
+	Status           int    `json:"status"`
+	FailoverOf       string `json:"failover_of,omitempty"`
+	Usage            Usage  `json:"usage"`
+	UsageKnown       bool   `json:"usage_known"`
+	LatencyMS        int64  `json:"latency_ms"`
+	BytesOut         int64  `json:"bytes_out"`
+	Session          string `json:"session,omitempty"`
+	Task             string `json:"task,omitempty"`
+	Agent            string `json:"agent,omitempty"`
+	Error            string `json:"error,omitempty"`
 	// Host is the machine the usage happened on ("" = the server itself for
 	// proxied requests from clients without a configured host).
 	Host string `json:"host,omitempty"`
@@ -400,14 +416,49 @@ type Client struct {
 	Ingest bool
 }
 
-// Route maps a model name to ordered candidate accounts per class, and the
-// upstream model name to send.
+// UpstreamSpec describes one candidate account's upstream binding within an
+// opted-in route (core.Route.Upstreams). Every field is optional and the zero
+// value reproduces today's behaviour: empty UpstreamModel inherits
+// Route.UpstreamModel (which, when also empty, forwards the client model
+// unchanged), nil Protocols is provider-derived, nil InputModalities is
+// text-only, and the false booleans mean the optional feature is unsupported.
+// The descriptor is a declaration, not a security boundary.
+type UpstreamSpec struct {
+	// UpstreamModel is the backend model sent upstream for this candidate;
+	// "" inherits Route.UpstreamModel.
+	UpstreamModel string
+	// Protocols is the non-empty subset of {"chat", "responses"} this candidate
+	// may serve when the route opts into capability routing.
+	Protocols []string
+	// InputModalities is the non-empty subset of {"text", "image"} this
+	// candidate accepts. Declaring only "image" (a vision-only model) does not
+	// imply "text". nil means text-only.
+	InputModalities []string
+	// Tools reports whether the candidate supports a non-empty top-level
+	// "tools" array. false = unsupported.
+	Tools bool
+	// JSONSchema reports whether the candidate supports structured output
+	// (json_schema response format). false = unsupported.
+	JSONSchema bool
+	// Stream reports whether the candidate supports streaming. false =
+	// unsupported.
+	Stream bool
+}
+
+// Route maps a model name to ordered candidate accounts per class, the
+// upstream model name to send, and (optionally) per-candidate capability
+// descriptors.
 type Route struct {
 	Name          string
 	Models        []string
 	UpstreamModel string // empty = forward client model unchanged
 	Interactive   []string
 	Background    []string
+	// Upstreams, when non-empty, opts the route into capability routing: it
+	// MUST carry one descriptor for every candidate in interactive ∪
+	// background, and unknown keys are rejected. A nil/empty map means the
+	// route is unconstrained (legacy permissive behaviour).
+	Upstreams map[string]UpstreamSpec
 }
 
 // ClientInflight is one client's concurrency usage. Limit 0 means unlimited.

@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/hpst3r/localrouter/internal/core"
+	"github.com/hpst3r/localrouter/internal/routing"
 )
 
 const (
@@ -204,13 +205,17 @@ type request struct {
 	client     core.Client
 	class      core.Class
 	model      string
+	stream     bool // client asked for a streaming response
 	route      core.Route
 	candidates []string
-	body       []byte
-	header     http.Header // original client headers
-	session    string
-	task       string
-	agent      string
+	// body is the client body exactly as read. It is never mutated: every
+	// attempt builds its own copy with its own model rewrite (and Codex
+	// normalisation) in (*Proxy).send, so no rewrite can leak between attempts.
+	body    []byte
+	header  http.Header // original client headers
+	session string
+	task    string
+	agent   string
 }
 
 func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint string) {
@@ -279,10 +284,41 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 		}
 		candidates = keep
 	}
-	body, err = rewriteBody(body, route.UpstreamModel, endpoint == "/chat/completions" && head.Stream)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "localrouter: request body must be a JSON object", "invalid_request_error")
-		return
+	// parseHead accepted only a single JSON object without duplicate top-level
+	// keys, so the per-attempt rewriteBody in (*Proxy).send cannot fail on it
+	// after a lease is taken.
+
+	// Capability-aware routing. A route with no per-candidate descriptors is
+	// unconstrained: it keeps the legacy body and byte semantics exactly. A route
+	// that declares candidate capabilities fails closed, in this order, before
+	// any lease or upstream call:
+	//
+	//   - a body that is a JSON object but whose content cannot be classified
+	//     (unknown or malformed content part, malformed structured-output
+	//     declaration) is a 400 invalid_request_error — never a silent downgrade
+	//     to text-only;
+	//   - a request no candidate can serve is a 400 capability_unsupported. The
+	//     filter only removes candidates, so the surviving order is the operator's
+	//     consent order and failover stays inside it.
+	if len(route.Upstreams) > 0 {
+		reqs, err := routing.Infer(protocolFor(endpoint), body)
+		if err != nil {
+			writeError(w, http.StatusBadRequest,
+				"localrouter: request body cannot be classified for this route",
+				"invalid_request_error")
+			return
+		}
+		filtered := routing.Filter(route, candidates, reqs)
+		if len(filtered) > 0 {
+			candidates = filtered
+		} else if len(candidates) > 0 {
+			p.log.Info("capability filter excluded every candidate",
+				"client", client.Name, "class", class, "model", head.Model, "protocol", reqs.Protocol)
+			writeError(w, http.StatusBadRequest,
+				"localrouter: no account supports the capabilities this request needs",
+				"capability_unsupported")
+			return
+		}
 	}
 
 	p.forward(w, r, &request{
@@ -290,6 +326,7 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 		client:     client,
 		class:      class,
 		model:      head.Model,
+		stream:     head.Stream,
 		route:      route,
 		candidates: candidates,
 		body:       body,
@@ -364,6 +401,14 @@ func parseHead(body []byte) (requestHead, error) {
 		return h, errBodyShape
 	}
 	return h, nil
+}
+
+// protocolFor maps an inference endpoint to the routing protocol name.
+func protocolFor(endpoint string) string {
+	if endpoint == "/chat/completions" {
+		return routing.ProtocolChat
+	}
+	return routing.ProtocolResponses
 }
 
 // rewriteBody applies the only permitted body edits: the upstream model name

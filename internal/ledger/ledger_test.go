@@ -64,7 +64,7 @@ func TestSchemaHasNoContentColumns(t *testing.T) {
 		"provider", "account_id", "upstream_identity", "status", "failover_of", "input_tokens",
 		"cached_input_tokens", "output_tokens", "reasoning_tokens", "usage_known", "cost_usd",
 		"cost_basis", "latency_ms", "bytes_out", "session", "task", "agent", "error",
-		"cache_creation_input_tokens", "host"}
+		"cache_creation_input_tokens", "host", "upstream_model", "pricing_model"}
 	if !reflect.DeepEqual(cols, want) {
 		t.Fatalf("columns = %v\nwant %v", cols, want)
 	}
@@ -159,7 +159,7 @@ func TestMigrateV1InPlace(t *testing.T) {
 	defer l.Close()
 	var v int
 	l.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v)
-	if v != 3 || len(migrations) != 3 {
+	if v != 4 || len(migrations) != 4 {
 		t.Fatalf("version = %d, migrations = %d", v, len(migrations))
 	}
 	var in, creation int64
@@ -168,6 +168,15 @@ func TestMigrateV1InPlace(t *testing.T) {
 	}
 	if in != 10 || creation != 0 {
 		t.Fatalf("old row: in=%d creation=%d", in, creation)
+	}
+	// v3 -> v4 leaves the legacy row's attribution columns NULL: no backfilled
+	// upstream_model/pricing_model guess.
+	var upstream, pricing sql.NullString
+	if err := l.db.QueryRow(`SELECT upstream_model, pricing_model FROM requests WHERE id='old'`).Scan(&upstream, &pricing); err != nil {
+		t.Fatal(err)
+	}
+	if upstream.Valid || pricing.Valid {
+		t.Fatalf("old row attribution = %v/%v; want NULL/NULL", upstream, pricing)
 	}
 	err = l.Record(context.Background(), core.RequestRecord{ID: "new", StartedAt: time.UnixMilli(2), AccountID: "b",
 		Usage: core.Usage{InputTokens: 100, CacheCreationInputTokens: 40}, UsageKnown: true})

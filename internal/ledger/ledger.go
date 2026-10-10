@@ -95,6 +95,14 @@ var migrations = []string{
 	CREATE INDEX requests_account_id ON requests(account_id);`,
 	`ALTER TABLE requests ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0;`,
 	`ALTER TABLE requests ADD COLUMN host TEXT NOT NULL DEFAULT '';`,
+	// v3 -> v4: backend attribution. Both columns are nullable so every legacy
+	// row keeps NULL (honest "unknown"), never a backfilled guess. upstream_model
+	// records what the attempt actually sent upstream; pricing_model is the
+	// cost-attribution key and is set ONLY for capability-constrained routes —
+	// legacy rows leave it NULL and the ledger keeps keying on model exactly as
+	// before.
+	`ALTER TABLE requests ADD COLUMN upstream_model TEXT;
+ALTER TABLE requests ADD COLUMN pricing_model TEXT;`,
 }
 
 // Open opens (creating if needed) the ledger database at path. pricing may be
@@ -183,8 +191,8 @@ const insertSQL = `INSERT INTO requests (
 	account_id, upstream_identity, status, failover_of, input_tokens,
 	cached_input_tokens, output_tokens, reasoning_tokens, usage_known,
 	cost_usd, cost_basis, latency_ms, bytes_out, session, task, agent, error,
-	cache_creation_input_tokens, host
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	cache_creation_input_tokens, host, upstream_model, pricing_model
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO NOTHING`
 
 // Record inserts one request row, computing cost from pricing. An empty
@@ -232,6 +240,10 @@ func insertArgs(r core.RequestRecord, pricing *Pricing, basis func(accountID str
 	if r.FailoverOf != "" {
 		failoverOf = sql.NullString{String: r.FailoverOf, Valid: true}
 	}
+	// upstream_model/pricing_model are nullable: an empty value is stored as
+	// SQL NULL (honest "unknown"), which is what every pre-v4 legacy row has.
+	upstreamModel := nullString(r.UpstreamModel)
+	pricingModel := nullString(r.PricingModel)
 	usageKnown := 0
 	if r.UsageKnown {
 		usageKnown = 1
@@ -241,8 +253,16 @@ func insertArgs(r core.RequestRecord, pricing *Pricing, basis func(accountID str
 		r.AccountID, r.UpstreamIdentity, r.Status, failoverOf, r.Usage.InputTokens,
 		r.Usage.CachedInputTokens, r.Usage.OutputTokens, r.Usage.ReasoningTokens, usageKnown,
 		cost, costBasis, r.LatencyMS, r.BytesOut, r.Session, r.Task, r.Agent, r.Error,
-		r.Usage.CacheCreationInputTokens, r.Host,
+		r.Usage.CacheCreationInputTokens, r.Host, upstreamModel, pricingModel,
 	}
+}
+
+// nullString maps "" to SQL NULL and any other value to a non-NULL string.
+func nullString(s string) sql.NullString {
+	if s == "" {
+		return sql.NullString{}
+	}
+	return sql.NullString{String: s, Valid: true}
 }
 
 // recordArgs is the shared single-row insert path: it binds args computed with
@@ -283,6 +303,20 @@ func (l *Ledger) recordBatchArgs(ctx context.Context, args [][]any) error {
 	return nil
 }
 
+// priceKey is the price-table lookup key for a row: PricingModel when set (the
+// backend a capability-constrained route actually resolved), else Model (the
+// client-facing id). It is deliberately a pure fallback to the client model
+// ONLY when no backend attribution was recorded — it never substitutes the
+// client alias for an unpriced backend, so a constrained route's unpriced
+// backend stays honestly unpriced (NULL cost) instead of being costed at the
+// route's advertised model.
+func priceKey(model, pricingModel string) string {
+	if pricingModel != "" {
+		return pricingModel
+	}
+	return model
+}
+
 // resolveCost picks the persisted cost_usd/cost_basis for r using the supplied
 // immutable price table and basis function. A usable provider-reported
 // OpenRouter cost (explicit, finite, non-negative — validated by
@@ -302,7 +336,7 @@ func resolveCost(r core.RequestRecord, pricing *Pricing, basis func(accountID st
 	var cost sql.NullFloat64
 	var costBasis sql.NullString
 	if r.UsageKnown {
-		if c, ok := pricing.Cost(r.Model, r.Usage); ok {
+		if c, ok := pricing.Cost(priceKey(r.Model, r.PricingModel), r.Usage); ok {
 			cost = sql.NullFloat64{Float64: c, Valid: true}
 			if basis != nil {
 				if b := basis(r.AccountID); b != "" {
@@ -315,18 +349,22 @@ func resolveCost(r core.RequestRecord, pricing *Pricing, basis func(accountID st
 }
 
 // Reprice recomputes cost_usd and cost_basis for every row with known usage
-// using the ledger's current pricing (e.g. after importing prices). Rows for
-// unpriced models get NULL cost. Rows whose cost was reported by the provider
+// using the ledger's current pricing (e.g. after importing prices). Each row is
+// repriced under the same key the row was originally attributed with — the
+// pricing_model it recorded (a capability-constrained route's backend), else its
+// model — so historical rows keep their backend attribution and a legacy row is
+// never retro-costed at a backend alias. Rows for unpriced keys get NULL cost.
+// Rows whose cost was reported by the provider
 // (cost_basis "provider_reported") are never recomputed, overwritten, or
 // cleared; the guard is applied both when selecting rows and in the UPDATE so
 // a row that gains provider-reported provenance between the two is still
 // protected. It returns how many rows are now priced.
 func (l *Ledger) Reprice(ctx context.Context) (int, error) {
 	type row struct {
-		id, model, account string
-		u                  core.Usage
+		id, model, pricingModel, account string
+		u                                core.Usage
 	}
-	rs, err := l.db.QueryContext(ctx, `SELECT id, model, account_id, input_tokens,
+	rs, err := l.db.QueryContext(ctx, `SELECT id, model, pricing_model, account_id, input_tokens,
 		cached_input_tokens, cache_creation_input_tokens, output_tokens, reasoning_tokens
 		FROM requests WHERE usage_known = 1
 		AND (cost_basis IS NULL OR cost_basis <> '`+costBasisProviderReported+`')`)
@@ -336,11 +374,13 @@ func (l *Ledger) Reprice(ctx context.Context) (int, error) {
 	var rows []row
 	for rs.Next() {
 		var r row
-		if err := rs.Scan(&r.id, &r.model, &r.account, &r.u.InputTokens, &r.u.CachedInputTokens,
+		var pm sql.NullString
+		if err := rs.Scan(&r.id, &r.model, &pm, &r.account, &r.u.InputTokens, &r.u.CachedInputTokens,
 			&r.u.CacheCreationInputTokens, &r.u.OutputTokens, &r.u.ReasoningTokens); err != nil {
 			rs.Close()
 			return 0, fmt.Errorf("ledger: reprice: %w", err)
 		}
+		r.pricingModel = pm.String
 		rows = append(rows, r)
 	}
 	rs.Close()
@@ -365,7 +405,7 @@ func (l *Ledger) Reprice(ctx context.Context) (int, error) {
 	for _, r := range rows {
 		var cost sql.NullFloat64
 		var basis sql.NullString
-		if c, ok := l.pricing.Cost(r.model, r.u); ok {
+		if c, ok := l.pricing.Cost(priceKey(r.model, r.pricingModel), r.u); ok {
 			cost = sql.NullFloat64{Float64: c, Valid: true}
 			priced++
 			if l.basis != nil {

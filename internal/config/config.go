@@ -171,6 +171,33 @@ type RouteConfig struct {
 	UpstreamModel string   `yaml:"upstream_model"`
 	Interactive   []string `yaml:"interactive"`
 	Background    []string `yaml:"background"`
+	// Upstreams, when non-empty, opts the route into capability routing. It
+	// maps a candidate account id (from interactive ∪ background) to its
+	// capability descriptor; a descriptor is required for every candidate and
+	// unknown keys are rejected. Absent/empty preserves the legacy
+	// unconstrained route.
+	Upstreams map[string]UpstreamSpec `yaml:"upstreams"`
+}
+
+// UpstreamSpec is one candidate account's capability descriptor inside
+// routes[].upstreams. It is a config mirror of core.UpstreamSpec.
+type UpstreamSpec struct {
+	// UpstreamModel overrides the route-wide upstream_model for this
+	// candidate; "" inherits the route's upstream_model (which, when also
+	// empty, forwards the client model unchanged).
+	UpstreamModel string `yaml:"upstream_model"`
+	// Protocols is required (non-empty) when the route opts in: an explicit
+	// subset of {"chat", "responses"}. Codex accounts cannot serve "chat".
+	Protocols []string `yaml:"protocols"`
+	// InputModalities is required (non-empty) when the route opts in: an
+	// explicit subset of {"text", "image"}. Declaring only "image" is a
+	// vision-only candidate and does not imply "text".
+	InputModalities []string `yaml:"input_modalities"`
+	// Tools / JSONSchema / Stream are tri-state by convention: absent (false)
+	// means the optional feature is unsupported for this candidate.
+	Tools      bool `yaml:"tools"`
+	JSONSchema bool `yaml:"json_schema"`
+	Stream     bool `yaml:"stream"`
 }
 
 // Duration parses Go duration strings in YAML.
@@ -521,6 +548,7 @@ func (c *Config) Validate() error {
 				errs = append(errs, fmt.Errorf("route %s: account %q is a quota-only claude account and cannot serve inference", r.Name, id))
 			}
 		}
+		errs = append(errs, validateUpstreams(r, provider)...)
 	}
 	if c.ClaudeLogs.Enabled {
 		if c.ClaudeLogs.Account == "" {
@@ -530,6 +558,93 @@ func (c *Config) Validate() error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// Capability-routing vocabulary. Kept unexported: the values are part of the
+// wire/config contract, but proxy/control match them as plain strings so the
+// frozen core package gains no new exported identifiers.
+const (
+	protocolChat      = "chat"
+	protocolResponses = "responses"
+	modalityText      = "text"
+	modalityImage     = "image"
+)
+
+// validateUpstreams enforces the capability-routing contract for one route. A
+// nil/empty Upstreams map means the route is unconstrained (legacy permissive)
+// and is skipped entirely. When the route opts in, every candidate in
+// interactive ∪ background MUST have a descriptor and no other keys may
+// appear; protocols must be an explicit non-empty subset of {chat, responses}
+// with no duplicates (and codex accounts may not advertise chat);
+// input_modalities must be an explicit non-empty subset of {text, image} with
+// no duplicates (declaring image alone is a vision-only candidate and does not
+// imply text). The boolean feature flags are tri-state by absence: false means
+// unsupported, so they need no further validation. Deliberately NOT enforced:
+// requiring an image-capable candidate on a text-only route — capability
+// declarations only narrow a candidate's applicability, they never make a new
+// demand on the route.
+func validateUpstreams(r RouteConfig, provider map[string]string) []error {
+	if len(r.Upstreams) == 0 {
+		return nil
+	}
+	var errs []error
+	cands := map[string]bool{}
+	for _, id := range r.Interactive {
+		cands[id] = true
+	}
+	for _, id := range r.Background {
+		cands[id] = true
+	}
+	for id := range r.Upstreams {
+		if !cands[id] {
+			errs = append(errs, fmt.Errorf("route %s: upstreams names unknown candidate account %q", r.Name, id))
+		}
+	}
+	for id := range cands {
+		if _, ok := r.Upstreams[id]; !ok {
+			errs = append(errs, fmt.Errorf("route %s: upstreams is missing a descriptor for candidate %q", r.Name, id))
+		}
+	}
+	for id, spec := range r.Upstreams {
+		if len(spec.Protocols) == 0 {
+			errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: protocols must be a non-empty subset of chat,responses", r.Name, id))
+		} else {
+			seen := map[string]bool{}
+			for _, p := range spec.Protocols {
+				p = strings.TrimSpace(p)
+				if p != protocolChat && p != protocolResponses {
+					errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: invalid protocol %q (want chat or responses)", r.Name, id, p))
+					continue
+				}
+				if seen[p] {
+					errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: duplicate protocol %q", r.Name, id, p))
+					continue
+				}
+				seen[p] = true
+				if p == protocolChat && provider[id] == core.ProviderCodex {
+					errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: codex accounts cannot serve chat", r.Name, id))
+				}
+			}
+		}
+		if len(spec.InputModalities) == 0 {
+			errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: input_modalities must be a non-empty subset of text,image", r.Name, id))
+			continue
+		}
+		seen := map[string]bool{}
+		for _, m := range spec.InputModalities {
+			m = strings.TrimSpace(m)
+			if m != modalityText && m != modalityImage {
+				errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: invalid input modality %q (want text or image)", r.Name, id, m))
+				continue
+			}
+			if seen[m] {
+				errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: duplicate input modality %q", r.Name, id, m))
+				continue
+			}
+			seen[m] = true
+		}
+	}
+	return errs
 }
 
 // CoreAccounts converts account config into core.Account values.
@@ -546,7 +661,10 @@ func (c *Config) CoreAccounts() []core.Account {
 }
 
 // CoreRoutes converts route config into core.Route values. A route with no
-// background list falls back to its interactive list.
+// background list falls back to its interactive list. The projection is a
+// deep copy: every map and slice is freshly allocated (and the new capability
+// descriptors have their whitespace trimmed), so a returned core.Route never
+// aliases the loaded config and callers cannot mutate shared state.
 func (c *Config) CoreRoutes() []core.Route {
 	out := make([]core.Route, 0, len(c.Routes))
 	for _, r := range c.Routes {
@@ -554,7 +672,42 @@ func (c *Config) CoreRoutes() []core.Route {
 		if len(bg) == 0 {
 			bg = r.Interactive
 		}
-		out = append(out, core.Route{Name: r.Name, Models: r.Models, UpstreamModel: r.UpstreamModel, Interactive: r.Interactive, Background: bg})
+		var ups map[string]core.UpstreamSpec
+		if len(r.Upstreams) > 0 {
+			ups = make(map[string]core.UpstreamSpec, len(r.Upstreams))
+			for id, s := range r.Upstreams {
+				ups[id] = core.UpstreamSpec{
+					UpstreamModel:   strings.TrimSpace(s.UpstreamModel),
+					Protocols:       copyTrimmed(s.Protocols),
+					InputModalities: copyTrimmed(s.InputModalities),
+					Tools:           s.Tools,
+					JSONSchema:      s.JSONSchema,
+					Stream:          s.Stream,
+				}
+			}
+		}
+		out = append(out, core.Route{
+			Name:          r.Name,
+			Models:        append([]string(nil), r.Models...),
+			UpstreamModel: r.UpstreamModel,
+			Interactive:   append([]string(nil), r.Interactive...),
+			Background:    append([]string(nil), bg...),
+			Upstreams:     ups,
+		})
+	}
+	return out
+}
+
+// copyTrimmed returns a whitespace-trimmed copy of in, or nil when in is empty
+// (an empty slice means "text only" for input_modalities). It never aliases
+// the caller's slice.
+func copyTrimmed(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, len(in))
+	for i, v := range in {
+		out[i] = strings.TrimSpace(v)
 	}
 	return out
 }

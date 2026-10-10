@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/core"
+	"github.com/hpst3r/localrouter/internal/routing"
 )
 
 const (
@@ -374,10 +375,25 @@ func (p *Proxy) noResponse(w http.ResponseWriter, canFailover bool, msg string) 
 	return attemptResult{done: true}
 }
 
-// send builds and performs the upstream request.
+// send builds and performs the upstream request for one attempt. The upstream
+// model is resolved per attempt from the leased account, so failing over to a
+// different backend sends that backend's alias; and the body is rebuilt from the
+// unmodified client body on every attempt, so no model rewrite, include_usage
+// injection or Codex normalisation can leak between attempts.
 func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cred core.Credential) (*http.Response, error) {
 	u := strings.TrimRight(account.BaseURL, "/") + req.endpoint
-	body := req.body
+	// Only an actual override rewrites the body: a resolved model equal to the
+	// client model is semantically the same request, so it is left byte-identical
+	// (the legacy no-rewrite fast path). The rewrite target is the leased
+	// candidate's alias, else the route-wide alias, else the client model.
+	override := ""
+	if model := routing.ResolveModel(req.route, account.ID, req.model); model != req.model {
+		override = model
+	}
+	body, err := rewriteBody(req.body, override, req.endpoint == "/chat/completions" && req.stream)
+	if err != nil {
+		return nil, err
+	}
 	if account.Provider == core.ProviderCodex {
 		body = codexBody(body)
 	}
@@ -504,21 +520,36 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 
 // newRecord starts a ledger row for one upstream try.
 func (p *Proxy) newRecord(req *request, account core.Account, failoverOf string) core.RequestRecord {
-	return core.RequestRecord{
-		ID:         newID(),
-		StartedAt:  p.clock.Now(),
-		Client:     req.client.Name,
-		Class:      req.class,
-		Route:      req.route.Name,
-		Model:      req.model,
-		Provider:   account.Provider,
-		AccountID:  account.ID,
-		FailoverOf: failoverOf,
-		Session:    req.session,
-		Task:       req.task,
-		Agent:      req.agent,
-		Host:       req.client.Host,
+	resolved := routing.ResolveModel(req.route, account.ID, req.model)
+	rec := core.RequestRecord{
+		ID:        newID(),
+		StartedAt: p.clock.Now(),
+		Client:    req.client.Name,
+		Class:     req.class,
+		Route:     req.route.Name,
+		Model:     req.model,
+		// UpstreamModel is what this attempt actually sent upstream: the
+		// candidate descriptor's alias, the route-level upstream model, or the
+		// client model when no rewrite applies.
+		UpstreamModel: resolved,
+		Provider:      account.Provider,
+		AccountID:     account.ID,
+		FailoverOf:    failoverOf,
+		Session:       req.session,
+		Task:          req.task,
+		Agent:         req.agent,
+		Host:          req.client.Host,
 	}
+	// A capability-constrained route (per-candidate Upstreams) attributes cost
+	// to the backend this attempt actually resolved, so two candidates serving
+	// the same client model are priced at their own backend. A legacy route
+	// keeps the exact legacy pricing path: PricingModel stays empty and the
+	// ledger keys on Model. This never falls back from an unpriced backend to
+	// the client alias — an unpriced backend stays honestly unpriced.
+	if len(req.route.Upstreams) > 0 {
+		rec.PricingModel = resolved
+	}
+	return rec
 }
 
 // record finalizes timing, logs a summary, and writes the ledger row. Ledger
