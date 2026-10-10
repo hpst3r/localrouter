@@ -273,7 +273,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		// fall back to an unscoped (all-users) query by omission.
 		led.RequireScope()
 		a.identityClock = identityClock(ov)
-		lock, st, err := openIdentity(cfg, a.identityClock)
+		lock, st, err := openIdentity(cfg, a.identityClock, logger)
 		if err != nil {
 			_ = led.Close()
 			return nil, err

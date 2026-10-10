@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/hpst3r/localrouter/internal/core"
 )
@@ -62,9 +63,12 @@ func tokenDigest(token string) []byte {
 	return d[:]
 }
 
-// validKeyName reports whether name is a bounded, printable, non-blank label.
+// validKeyName reports whether name is a bounded, printable, non-blank label
+// without Unicode format characters (bidi controls, zero-width characters),
+// which could make one key look like another in listings.
 func validKeyName(name string) bool {
-	return validText(name, MaxKeyNameBytes) && strings.TrimSpace(name) != ""
+	return validText(name, MaxKeyNameBytes) && strings.TrimSpace(name) != "" &&
+		!strings.ContainsFunc(name, func(r rune) bool { return unicode.Is(unicode.Cf, r) })
 }
 
 // CreateKey creates an API key for userID and returns its token exactly once.

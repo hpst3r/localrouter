@@ -76,11 +76,13 @@ func TestCreateKeyValidatesName(t *testing.T) {
 	u := f.user("sub-names", core.RoleUser)
 	const marker = "SECRETLABEL"
 	for name, label := range map[string]string{
-		"empty":        "",
-		"blank":        "   ",
-		"too long":     marker + strings.Repeat("x", MaxKeyNameBytes),
-		"invalid utf8": marker + "\xff",
-		"control":      marker + "\x1b[31m",
+		"empty":         "",
+		"blank":         "   ",
+		"too long":      marker + strings.Repeat("x", MaxKeyNameBytes),
+		"invalid utf8":  marker + "\xff",
+		"control":       marker + "\x1b[31m",
+		"bidi override": marker + "\u202egpj.exe",
+		"zero width":    marker + "\u200bprod",
 	} {
 		_, err := f.s.CreateKey(ctx, u.ID, label, 0)
 		if !errors.Is(err, ErrInvalid) {

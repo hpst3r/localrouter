@@ -93,7 +93,7 @@ func readOwnedKey(client, path string) (string, error) {
 // policy (identity.Store.ApplyAccessPolicy). Ownership is acquired BEFORE
 // the store is opened; any failure releases exactly what was acquired, store
 // first, so a failed Build leaves the lock free for the next attempt.
-func openIdentity(cfg *config.Config, clock core.Clock) (*identityLock, *identity.Store, error) {
+func openIdentity(cfg *config.Config, clock core.Clock, logger *slog.Logger) (*identityLock, *identity.Store, error) {
 	lock, err := acquireIdentityLock(filepath.Join(cfg.DataDir, "identity.lock"))
 	if err != nil {
 		return nil, nil, err
@@ -111,15 +111,19 @@ func openIdentity(cfg *config.Config, clock core.Clock) (*identityLock, *identit
 	// served, so a narrowing invalidates sessions, admin roles and
 	// credentials minted under the old policy (see ApplyAccessPolicy).
 	ac := cfg.Identity.Access
-	if _, err := st.ApplyAccessPolicy(ctx, identity.AccessPolicy{
+	narrowed, err := st.ApplyAccessPolicy(ctx, identity.AccessPolicy{
 		Claim:         ac.Claim,
 		UserValues:    ac.UserValues,
 		AdminValues:   ac.AdminValues,
 		AdminSubjects: ac.AdminSubjects,
-	}); err != nil {
+	})
+	if err != nil {
 		_ = st.Close()
 		_ = lock.Close()
 		return nil, nil, fmt.Errorf("identity store: %w", err)
+	}
+	if narrowed && logger != nil {
+		logger.Warn("identity: access policy narrowed or first recorded with existing users; sessions ended, admins demoted, credentials suspended until each user's next login")
 	}
 	return lock, st, nil
 }
