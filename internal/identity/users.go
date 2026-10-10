@@ -25,6 +25,9 @@ const userColumns = `id, status, role, display_name, email, created_at, updated_
 //     the future, so an arbitrarily old IdP session never renews the
 //     30-day login window.
 //   - An existing active user gets the new role, profile and last login.
+//     The last login is the auth time, raised to the policy epoch if it
+//     predates it (see ApplyAccessPolicy): the login was allowed under the
+//     policy in force now.
 //   - An unknown subject is created only if l.Provision, with a fresh random
 //     id; otherwise ErrNotProvisioned.
 //
@@ -55,6 +58,17 @@ func (s *Store) ResolveLogin(ctx context.Context, l Login) (User, error) {
 
 	var out User
 	err := s.write(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		// This login is allowed under the policy in force now, so it counts
+		// as a login at or after the policy epoch even when the verified
+		// auth_time (second precision, up to MaxAuthAge old) predates it.
+		epoch, err := policyEpoch(ctx, tx)
+		if err != nil {
+			return err
+		}
+		loginAt := authAt
+		if e := fromMS(epoch); loginAt.Before(e) && !e.After(now) {
+			loginAt = e
+		}
 		var tombstoned int
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COUNT(*) FROM subject_tombstones WHERE digest = ?`, subjectDigest(l.Issuer, l.Subject)).Scan(&tombstoned); err != nil {
@@ -67,7 +81,7 @@ func (s *Store) ResolveLogin(ctx context.Context, l Login) (User, error) {
 			return &commitErr{ErrUserDeleted}
 		}
 		var userID string
-		err := tx.QueryRowContext(ctx,
+		err = tx.QueryRowContext(ctx,
 			`SELECT user_id FROM identities WHERE issuer = ? AND subject = ?`, l.Issuer, l.Subject).Scan(&userID)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
@@ -84,7 +98,7 @@ func (s *Store) ResolveLogin(ctx context.Context, l Login) (User, error) {
 			if _, err := tx.ExecContext(ctx,
 				`INSERT INTO users (id, status, role, display_name, email, created_at, updated_at, last_login_at)
 				 VALUES (?, 'active', ?, ?, ?, ?, ?, ?)`,
-				id, string(l.Role), display, email, toMS(now), toMS(now), toMS(authAt)); err != nil {
+				id, string(l.Role), display, email, toMS(now), toMS(now), toMS(loginAt)); err != nil {
 				return fmt.Errorf("identity: provision: %w", err)
 			}
 			if _, err := tx.ExecContext(ctx,
@@ -115,7 +129,7 @@ func (s *Store) ResolveLogin(ctx context.Context, l Login) (User, error) {
 			}
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE users SET role = ?, display_name = ?, email = ?, updated_at = ?, last_login_at = ? WHERE id = ?`,
-				string(l.Role), display, email, toMS(now), toMS(authAt), userID); err != nil {
+				string(l.Role), display, email, toMS(now), toMS(loginAt), userID); err != nil {
 				return fmt.Errorf("identity: resolve login: %w", err)
 			}
 			if oldRole != string(l.Role) {
