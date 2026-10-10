@@ -449,11 +449,20 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 		writeError(w, http.StatusBadRequest, "localrouter: "+err.Error(), "invalid_request_error")
 		return
 	}
-	if p.deps.MultiUser && head.Refused != "" {
-		writeError(w, http.StatusBadRequest,
-			fmt.Sprintf("localrouter: field %q is not allowed on this gateway", core.TruncateLabel(head.Refused)),
-			"invalid_request_error")
-		return
+	if p.deps.MultiUser {
+		refused := head.Refused
+		if refused == "" {
+			if refused, err = nestedRefused(head.Scoped); err != nil {
+				writeError(w, http.StatusBadRequest, "localrouter: "+err.Error(), "invalid_request_error")
+				return
+			}
+		}
+		if refused != "" {
+			writeError(w, http.StatusBadRequest,
+				fmt.Sprintf("localrouter: field %q is not allowed on this gateway", core.TruncateLabel(refused)),
+				"invalid_request_error")
+			return
+		}
 	}
 	route, ok := p.routes[head.Model]
 	if !ok {
@@ -539,6 +548,15 @@ type requestHead struct {
 	// Refused is the first top-level key the multi-user field policy
 	// (refusedField) rejects, as sent; empty if none.
 	Refused string
+	// Scoped holds the values of the top-level "input", "messages" and
+	// "tools" keys (matched case-insensitively), which nestedRefused walks.
+	Scoped []scopedValue
+}
+
+// scopedValue is a top-level value the nested field policy inspects.
+type scopedValue struct {
+	raw   json.RawMessage
+	tools bool
 }
 
 // refusedField reports whether a top-level key with value raw is refused in
@@ -550,7 +568,8 @@ func refusedField(key string, raw json.RawMessage) bool {
 	switch {
 	case strings.EqualFold(key, "models"), strings.EqualFold(key, "route"),
 		strings.EqualFold(key, "provider"), strings.EqualFold(key, "plugins"),
-		strings.EqualFold(key, "transforms"), strings.EqualFold(key, "preset"):
+		strings.EqualFold(key, "transforms"), strings.EqualFold(key, "preset"),
+		strings.EqualFold(key, "web_search_options"):
 		return true
 	case strings.EqualFold(key, "background"):
 		return string(raw) != "null" && string(raw) != "false"
@@ -565,6 +584,108 @@ func refusedField(key string, raw json.RawMessage) bool {
 		return string(raw) != "null"
 	}
 	return false
+}
+
+// maxBodyDepth bounds the JSON nesting nestedRefused walks, counting the
+// top-level object as level 1.
+const maxBodyDepth = 64
+
+var errBodyTooDeep = fmt.Errorf("request body is nested too deeply (limit %d)", maxBodyDepth)
+
+// nestedRefused applies the multi-user field policy inside the top-level
+// input, messages and tools values (each a raw JSON value parseHead already
+// accepted). It returns the first refused name: "item_reference" for an
+// object whose "type" is item_reference (a stored Responses item), or a
+// "file_id", "vector_store_ids" or "container" key (files, vector stores and
+// containers on the upstream account). Keys and values match
+// case-insensitively. The parameters schema of a function tool
+// (tools[i].parameters, tools[i].function.parameters) is walked for depth only,
+// so schema property names are not mistaken for references.
+func nestedRefused(values []scopedValue) (string, error) {
+	for _, v := range values {
+		path := pathOther
+		if v.tools {
+			path = pathTools
+		}
+		_, refused, err := walkRefused(json.NewDecoder(bytes.NewReader(v.raw)), 2, path)
+		if err != nil || refused != "" {
+			return refused, err
+		}
+	}
+	return "", nil
+}
+
+// walkPath tracks where walkRefused is relative to a tools entry, to find
+// function parameter schemas.
+type walkPath int
+
+const (
+	pathTools    walkPath = iota // the top-level tools value
+	pathTool                     // tools[i]
+	pathFunction                 // tools[i].function
+	pathOther                    // anywhere else
+	pathSchema                   // inside a function parameters schema
+)
+
+// walkRefused consumes one JSON value from dec at nesting level depth and
+// returns it if it is a scalar, along with the first refused name in it.
+func walkRefused(dec *json.Decoder, depth int, path walkPath) (json.Token, string, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, "", errBodyShape
+	}
+	d, ok := tok.(json.Delim)
+	if !ok {
+		return tok, "", nil
+	}
+	if depth > maxBodyDepth {
+		return nil, "", errBodyTooDeep
+	}
+	if d == '[' {
+		elem := pathOther
+		if path == pathTools {
+			elem = pathTool
+		} else if path == pathSchema {
+			elem = pathSchema
+		}
+		for dec.More() {
+			if _, refused, err := walkRefused(dec, depth+1, elem); err != nil || refused != "" {
+				return nil, refused, err
+			}
+		}
+	} else {
+		for dec.More() {
+			ktok, err := dec.Token()
+			if err != nil {
+				return nil, "", errBodyShape
+			}
+			key, _ := ktok.(string)
+			next := pathOther
+			switch {
+			case path == pathSchema:
+				next = pathSchema
+			case strings.EqualFold(key, "file_id"), strings.EqualFold(key, "vector_store_ids"),
+				strings.EqualFold(key, "container"):
+				return nil, key, nil
+			case (path == pathTool || path == pathFunction) && strings.EqualFold(key, "parameters"):
+				next = pathSchema
+			case path == pathTool && strings.EqualFold(key, "function"):
+				next = pathFunction
+			}
+			v, refused, err := walkRefused(dec, depth+1, next)
+			if err != nil || refused != "" {
+				return nil, refused, err
+			}
+			if s, ok := v.(string); ok && path != pathSchema &&
+				strings.EqualFold(key, "type") && strings.EqualFold(s, "item_reference") {
+				return nil, "item_reference", nil
+			}
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, "", errBodyShape
+	}
+	return nil, "", nil
 }
 
 var errBodyShape = errors.New("request body must be a single JSON object with a model")
@@ -615,6 +736,9 @@ func parseHead(body []byte) (requestHead, error) {
 			return h, fmt.Errorf("ambiguous key %q in request body", core.TruncateLabel(key))
 		case h.Refused == "" && refusedField(key, raw):
 			h.Refused = key
+		case strings.EqualFold(key, "input"), strings.EqualFold(key, "messages"),
+			strings.EqualFold(key, "tools"):
+			h.Scoped = append(h.Scoped, scopedValue{raw: raw, tools: strings.EqualFold(key, "tools")})
 		}
 	}
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
