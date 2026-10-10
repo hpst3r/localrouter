@@ -3,3 +3,5 @@
 /keys/
 /tokens/
 .runs/
+__pycache__/
+*.pyc
