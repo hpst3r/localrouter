@@ -48,8 +48,8 @@ func ValidCSRF(sessionToken, presented string) bool {
 
 // CreateSession creates a browser session for userID right after a
 // successful ResolveLogin: the user must be active and their last allowed
-// login no older than Options.MaxAuthAge and not before the policy epoch
-// (ErrStaleLogin), so a session is never minted from an old login. It always returns a fresh random token
+// login no older than Options.MaxAuthAge and under the current policy
+// generation (ErrStaleLogin), so a session is never minted from an old login. It always returns a fresh random token
 // (no fixation) and its CSRF token; only the token's SHA-256 is stored. The
 // session expires SessionAbsoluteTTL after creation and SessionIdleTTL after
 // its last (throttled) use, whichever is first.
@@ -71,10 +71,10 @@ func (s *Store) CreateSession(ctx context.Context, userID string) (NewSession, e
 		var (
 			status    string
 			lastLogin sql.NullInt64
-			epoch     int64
+			current   bool
 		)
-		err := tx.QueryRowContext(ctx, `SELECT status, last_login_at, `+policyEpochSQL+` FROM users WHERE id = ?`, userID).
-			Scan(&status, &lastLogin, &epoch)
+		err := tx.QueryRowContext(ctx, `SELECT status, last_login_at, `+loginCurrentSQL+` FROM users WHERE id = ?`, userID).
+			Scan(&status, &lastLogin, &current)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -88,7 +88,7 @@ func (s *Store) CreateSession(ctx context.Context, userID string) (NewSession, e
 		default:
 			return ErrUserDeleted
 		}
-		if !lastLogin.Valid || lastLogin.Int64 < epoch || now.Sub(fromMS(lastLogin.Int64)) > s.opts.MaxAuthAge {
+		if !lastLogin.Valid || !current || now.Sub(fromMS(lastLogin.Int64)) > s.opts.MaxAuthAge {
 			return ErrStaleLogin
 		}
 		if _, err := tx.ExecContext(ctx,
@@ -108,8 +108,8 @@ func (s *Store) CreateSession(ctx context.Context, userID string) (NewSession, e
 // AuthenticateSession authenticates a session token with a fresh read on
 // every call (no cache). It succeeds only while the session exists, is
 // before both its idle and absolute deadlines, and its user is active with
-// an allowed login within Options.LoginMaxAge and not before the policy
-// epoch (ApplyAccessPolicy). The principal's Role is the
+// an allowed login within Options.LoginMaxAge under the current policy
+// generation (ApplyAccessPolicy). The principal's Role is the
 // user's role read now, so a demotion or disable applies to existing
 // sessions. At most once per SessionTouchInterval the idle deadline slides
 // to min(now + SessionIdleTTL, absolute).
@@ -126,13 +126,13 @@ func (s *Store) AuthenticateSession(ctx context.Context, token string) (Session,
 		userID, status, role         string
 		expires, idleExpires, seenAt int64
 		lastLogin                    sql.NullInt64
-		epoch                        int64
+		current                      bool
 	)
 	err := s.read(ctx, func(ctx context.Context) error {
 		err := s.db.QueryRowContext(ctx,
-			`SELECT s.user_id, s.expires_at, s.idle_expires_at, s.last_seen_at, u.status, u.role, u.last_login_at, `+policyEpochSQL+`
+			`SELECT s.user_id, s.expires_at, s.idle_expires_at, s.last_seen_at, u.status, u.role, u.last_login_at, `+loginCurrentSQL+`
 			 FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`, digest).
-			Scan(&userID, &expires, &idleExpires, &seenAt, &status, &role, &lastLogin, &epoch)
+			Scan(&userID, &expires, &idleExpires, &seenAt, &status, &role, &lastLogin, &current)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -145,7 +145,7 @@ func (s *Store) AuthenticateSession(ctx context.Context, token string) (Session,
 	now := s.now()
 	nowMS := toMS(now)
 	if !found || nowMS >= expires || nowMS >= idleExpires ||
-		UserStatus(status) != StatusActive || !s.loginFresh(lastLogin, epoch, now) {
+		UserStatus(status) != StatusActive || !s.loginFresh(lastLogin, current, now) {
 		return Session{}, core.ErrUnauthenticated
 	}
 	if now.Sub(fromMS(seenAt)) >= SessionTouchInterval {

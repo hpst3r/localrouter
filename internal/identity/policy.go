@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"strconv"
 )
 
 // AccessPolicy is the login access policy the server enforces, as recorded
@@ -23,15 +22,21 @@ type AccessPolicy struct {
 // Access policy meta keys.
 const (
 	metaAccessPolicy = "access_policy"
-	// metaPolicyEpoch is the unix ms of the last narrowing: a user's
-	// credentials authenticate only after an allowed login at or after it.
-	metaPolicyEpoch = "policy_epoch"
+	// metaPolicyGeneration counts narrowings (0 if none). A user's
+	// credentials authenticate only after an allowed login under the current
+	// generation (users.login_generation, set by ResolveLogin). A counter,
+	// not a time, so clock steps neither bypass nor lock out.
+	metaPolicyGeneration = "policy_generation"
 )
 
-// policyEpochSQL reads the policy epoch (0 if none) inside an
-// authentication query, so every *Store on the file, in any process, sees
-// a narrowing on its next read.
-const policyEpochSQL = `COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = '` + metaPolicyEpoch + `'), 0)`
+// policyGenerationSQL reads the policy generation (0 if none) inside a
+// query, so every *Store on the file, in any process, sees a narrowing on
+// its next read.
+const policyGenerationSQL = `COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = '` + metaPolicyGeneration + `'), 0)`
+
+// loginCurrentSQL selects whether the users row's last allowed login was
+// under the current policy generation (0 when there is no users row).
+const loginCurrentSQL = `COALESCE(login_generation >= ` + policyGenerationSQL + `, 0)`
 
 // canonical returns p with every list sorted, deduplicated and non-nil.
 func (p AccessPolicy) canonical() AccessPolicy {
@@ -76,7 +81,8 @@ func (p AccessPolicy) narrows(old AccessPolicy) bool {
 // changes. Otherwise — the claim changed, an admin value or subject was
 // removed, a user value is no longer allowed, or users exist but no policy
 // was recorded — every session is deleted, every admin is demoted to user
-// until a fresh login re-grants the role, and the policy epoch is set to now:
+// until a fresh login re-grants the role, and the policy generation is
+// incremented:
 // no key, owned static key or session of a user authenticates, and none can
 // be created, until that user's next allowed login. Keys are not revoked;
 // they resume after the owner's next allowed login. The narrowing is
@@ -125,8 +131,9 @@ func (s *Store) ApplyAccessPolicy(ctx context.Context, p AccessPolicy) (bool, er
 			return fmt.Errorf("identity: access policy: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
-			metaPolicyEpoch, strconv.FormatInt(toMS(now), 10)); err != nil {
+			`INSERT INTO meta (key, value) VALUES (?, '1')
+			 ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)`,
+			metaPolicyGeneration); err != nil {
 			return fmt.Errorf("identity: access policy: %w", err)
 		}
 		return audit(ctx, tx, now, AuditAccessPolicyNarrowed, Actor{Kind: ActorSystem}, "", "", OutcomeOK, "")
@@ -137,11 +144,11 @@ func (s *Store) ApplyAccessPolicy(ctx context.Context, p AccessPolicy) (bool, er
 	return narrowed, nil
 }
 
-// policyEpoch reads the policy epoch (unix ms, 0 if none) inside tx.
-func policyEpoch(ctx context.Context, tx *sql.Tx) (int64, error) {
-	var epoch int64
-	if err := tx.QueryRowContext(ctx, `SELECT `+policyEpochSQL).Scan(&epoch); err != nil {
-		return 0, fmt.Errorf("identity: policy epoch: %w", err)
+// policyGeneration reads the policy generation (0 if none) inside tx.
+func policyGeneration(ctx context.Context, tx *sql.Tx) (int64, error) {
+	var gen int64
+	if err := tx.QueryRowContext(ctx, `SELECT `+policyGenerationSQL).Scan(&gen); err != nil {
+		return 0, fmt.Errorf("identity: policy generation: %w", err)
 	}
-	return epoch, nil
+	return gen, nil
 }

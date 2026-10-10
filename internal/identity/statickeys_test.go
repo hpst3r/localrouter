@@ -247,8 +247,9 @@ func TestStaticKeyPlaintextNeverStored(t *testing.T) {
 	}
 }
 
-// An identity.db created by the v1 binary (no registry) migrates to v2 in
-// place: users, keys and the pinned binding survive and the registry works.
+// An identity.db created by the v1 binary (no registry) migrates to the
+// current version in place: users, keys and the pinned binding survive and
+// the registry works.
 func TestStaticKeyMigratesV1Database(t *testing.T) {
 	ctx := context.Background()
 	f := newFixture(t)
@@ -258,7 +259,7 @@ func TestStaticKeyMigratesV1Database(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Roll the file back to exactly the v1 shape.
-	for _, q := range []string{`DROP TABLE static_keys`, `UPDATE schema_version SET version = 1`} {
+	for _, q := range []string{`DROP TABLE static_keys`, `ALTER TABLE users DROP COLUMN login_generation`, `UPDATE schema_version SET version = 1`} {
 		if _, err := f.s.db.Exec(q); err != nil {
 			t.Fatal(err)
 		}
@@ -271,8 +272,8 @@ func TestStaticKeyMigratesV1Database(t *testing.T) {
 	}
 	defer s.Close()
 	var v int
-	if err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil || v != len(migrations) || v != 2 {
-		t.Fatalf("schema version = %d, %v; want 2", v, err)
+	if err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v); err != nil || v != len(migrations) || v != 3 {
+		t.Fatalf("schema version = %d, %v; want 3", v, err)
 	}
 	if _, err := s.AuthenticateKey(ctx, k.Token); err != nil {
 		t.Fatalf("v1 API key after migration = %v", err)
