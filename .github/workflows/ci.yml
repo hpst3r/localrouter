@@ -46,6 +46,11 @@ jobs:
         timeout-minutes: 10
         run: go vet ./...
 
+      - name: Provider smoke tool tests (offline)
+        # Never enable live provider requests in CI.
+        timeout-minutes: 3
+        run: python3 -m unittest discover -s scripts -p 'test_provider_smoke.py' -v
+
       - name: go build
         timeout-minutes: 10
         env:

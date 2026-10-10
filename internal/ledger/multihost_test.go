@@ -50,16 +50,21 @@ func TestMigrateV2ToV3Host(t *testing.T) {
 	defer l.Close()
 	var v int
 	l.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v)
-	if v != 3 {
+	if v != 4 {
 		t.Fatalf("version = %d", v)
 	}
 	var host string
 	var creation int64
-	if err := l.db.QueryRow(`SELECT host, cache_creation_input_tokens FROM requests WHERE id='old'`).Scan(&host, &creation); err != nil {
+	var upstream, pricing sql.NullString
+	if err := l.db.QueryRow(`SELECT host, cache_creation_input_tokens, upstream_model, pricing_model FROM requests WHERE id='old'`).
+		Scan(&host, &creation, &upstream, &pricing); err != nil {
 		t.Fatal(err)
 	}
 	if host != "" || creation != 7 {
 		t.Fatalf("old row: host=%q creation=%d", host, creation)
+	}
+	if upstream.Valid || pricing.Valid {
+		t.Fatalf("old row attribution = %v/%v; want NULL/NULL", upstream, pricing)
 	}
 	ctx := context.Background()
 	if err := l.Record(ctx, core.RequestRecord{ID: "new", StartedAt: time.UnixMilli(2), Host: "vm1", UsageKnown: true}); err != nil {

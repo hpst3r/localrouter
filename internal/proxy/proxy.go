@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/hpst3r/localrouter/internal/core"
+	"github.com/hpst3r/localrouter/internal/routing"
 )
 
 const (
@@ -51,6 +53,37 @@ type Deps struct {
 	// until the response (including any stream and every failover attempt) has
 	// fully ended. Nil means unlimited.
 	Limiter Limiter
+	// Budget gates every upstream attempt against the client's and account's
+	// configured spend ceilings. It is optional: nil admits every attempt and
+	// settles nothing, exactly as before this seam existed.
+	//
+	// Reserve is called once per upstream attempt, after the credential is
+	// resolved and immediately before the send (so a credential failure never
+	// holds budget), and the matching Settle is called once on every path that
+	// follows a successful Reserve. A Reserve error is terminal: the attempt is
+	// not sent, does not fail over, and is not settled.
+	Budget Budget
+}
+
+// Budget gates one upstream attempt against the budget store. It is satisfied by
+// internal/budget.Gate; the proxy depends on the behaviour rather than the
+// concrete type so it never constructs the store or knows the money arithmetic.
+//
+// Implementations must be safe for concurrent use and must not retain rec.
+type Budget interface {
+	// Reserve claims this attempt's fixed reservation. An error wrapping
+	// budget.ErrExceeded denies the attempt because the client is out of
+	// budget; any other error means the budget store is unavailable. Either
+	// way the attempt must not be sent and must not be settled.
+	Reserve(ctx context.Context, rec core.RequestRecord) error
+	// Settle books the attempt's resolved cost once its outcome is known. It
+	// must be called only for an attempt Reserve admitted.
+	Settle(ctx context.Context, rec core.RequestRecord) error
+	// SettleIncomplete settles an admitted attempt whose response was cut
+	// short mid-relay (client disconnect, idle timeout, upstream read error).
+	// Any cost observed so far is only a lower bound, so it must be booked as
+	// unknown and charged at no less than the hold — never as a final cost.
+	SettleIncomplete(ctx context.Context, rec core.RequestRecord) error
 }
 
 // Limiter bounds how many inference requests may be active at once. It is
@@ -204,13 +237,17 @@ type request struct {
 	client     core.Client
 	class      core.Class
 	model      string
+	stream     bool // client asked for a streaming response
 	route      core.Route
 	candidates []string
-	body       []byte
-	header     http.Header // original client headers
-	session    string
-	task       string
-	agent      string
+	// body is the client body exactly as read. It is never mutated: every
+	// attempt builds its own copy with its own model rewrite (and Codex
+	// normalisation) in (*Proxy).send, so no rewrite can leak between attempts.
+	body    []byte
+	header  http.Header // original client headers
+	session string
+	task    string
+	agent   string
 }
 
 func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint string) {
@@ -279,10 +316,41 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 		}
 		candidates = keep
 	}
-	body, err = rewriteBody(body, route.UpstreamModel, endpoint == "/chat/completions" && head.Stream)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "localrouter: request body must be a JSON object", "invalid_request_error")
-		return
+	// parseHead accepted only a single JSON object without duplicate top-level
+	// keys, so the per-attempt rewriteBody in (*Proxy).send cannot fail on it
+	// after a lease is taken.
+
+	// Capability-aware routing. A route with no per-candidate descriptors is
+	// unconstrained: it keeps the legacy body and byte semantics exactly. A route
+	// that declares candidate capabilities fails closed, in this order, before
+	// any lease or upstream call:
+	//
+	//   - a body that is a JSON object but whose content cannot be classified
+	//     (unknown or malformed content part, malformed structured-output
+	//     declaration) is a 400 invalid_request_error — never a silent downgrade
+	//     to text-only;
+	//   - a request no candidate can serve is a 400 capability_unsupported. The
+	//     filter only removes candidates, so the surviving order is the operator's
+	//     consent order and failover stays inside it.
+	if len(route.Upstreams) > 0 {
+		reqs, err := routing.Infer(protocolFor(endpoint), body)
+		if err != nil {
+			writeError(w, http.StatusBadRequest,
+				"localrouter: request body cannot be classified for this route",
+				"invalid_request_error")
+			return
+		}
+		filtered := routing.Filter(route, candidates, reqs)
+		if len(filtered) > 0 {
+			candidates = filtered
+		} else if len(candidates) > 0 {
+			p.log.Info("capability filter excluded every candidate",
+				"client", client.Name, "class", class, "model", head.Model, "protocol", reqs.Protocol)
+			writeError(w, http.StatusBadRequest,
+				"localrouter: no account supports the capabilities this request needs",
+				"capability_unsupported")
+			return
+		}
 	}
 
 	p.forward(w, r, &request{
@@ -290,6 +358,7 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 		client:     client,
 		class:      class,
 		model:      head.Model,
+		stream:     head.Stream,
 		route:      route,
 		candidates: candidates,
 		body:       body,
@@ -364,6 +433,14 @@ func parseHead(body []byte) (requestHead, error) {
 		return h, errBodyShape
 	}
 	return h, nil
+}
+
+// protocolFor maps an inference endpoint to the routing protocol name.
+func protocolFor(endpoint string) string {
+	if endpoint == "/chat/completions" {
+		return routing.ProtocolChat
+	}
+	return routing.ProtocolResponses
 }
 
 // rewriteBody applies the only permitted body edits: the upstream model name

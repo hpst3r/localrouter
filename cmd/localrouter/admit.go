@@ -14,10 +14,12 @@ import (
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/agent"
+	"github.com/hpst3r/localrouter/internal/routing"
 )
 
-// exitError carries a process exit code: 1 = admission denied, 2 = usage
-// error or control API unreachable/failed.
+// exitError carries a process exit code: 1 = admission denied (including a
+// capability_unsupported refusal), 2 = usage error or control API
+// unreachable/failed.
 type exitError struct {
 	code int
 	msg  string
@@ -35,10 +37,60 @@ type admitResult struct {
 	Reason    string `json:"reason"`
 }
 
+// admitRequirementWire is the optional "requirements" object of an admit
+// request: the client-side mirror of the server's capability profile. Its field
+// names are the lowercase-underscore spellings the server accepts, notably
+// json_schema.
+type admitRequirementWire struct {
+	Protocol   string   `json:"protocol,omitempty"`
+	Modalities []string `json:"modalities,omitempty"`
+	Tools      bool     `json:"tools,omitempty"`
+	JSONSchema bool     `json:"json_schema,omitempty"`
+	Stream     bool     `json:"stream,omitempty"`
+}
+
+// admitRequirements builds the capability profile from the flags, returning nil
+// when none was given so a legacy admit request is unchanged. It checks only the
+// vocabulary the flags draw from — the same values routing models — and never
+// fills in a default protocol or modality: on a capability-constrained route the
+// server refuses an incomplete profile with 400
+// capability_requirements_required, and the CLI must not paper over that by
+// guessing what the caller meant.
+func admitRequirements(protocol, modalities string, tools, jsonSchema, stream bool) (*admitRequirementWire, error) {
+	protocol = strings.TrimSpace(protocol)
+	if protocol != "" && protocol != routing.ProtocolChat && protocol != routing.ProtocolResponses {
+		return nil, exitError{2, fmt.Sprintf("admit: --protocol must be chat or responses, got %q", protocol)}
+	}
+	var mods []string
+	for _, m := range strings.Split(modalities, ",") {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			continue
+		}
+		switch m {
+		case routing.ModalityText, routing.ModalityImage, routing.ModalityAudio:
+			mods = append(mods, m)
+		default:
+			return nil, exitError{2, fmt.Sprintf("admit: --input-modalities must be text, image or audio, got %q", m)}
+		}
+	}
+	if protocol == "" && len(mods) == 0 && !tools && !jsonSchema && !stream {
+		return nil, nil
+	}
+	return &admitRequirementWire{
+		Protocol:   protocol,
+		Modalities: mods,
+		Tools:      tools,
+		JSONSchema: jsonSchema,
+		Stream:     stream,
+	}, nil
+}
+
 // cmdAdmit asks a running LocalRouter whether a request of --class would be
 // admitted on --account (or the route for --model), without creating a
-// lease. It returns nil on allow and exitError{1} on deny, so scripts can use
-// it as a gate; any other failure is exitError{2}.
+// lease. It returns nil on allow and exitError{1} on deny (including a
+// capability_unsupported refusal), so scripts can use it as a gate; any other
+// failure is exitError{2}.
 func cmdAdmit(args []string) error {
 	return runAdmit(args, os.Stdout, os.Stderr)
 }
@@ -53,6 +105,11 @@ func runAdmit(args []string, stdout, stderr io.Writer) error {
 	asJSON := fs.Bool("json", false, "print the decision as JSON")
 	timeout := fs.Duration("timeout", 5*time.Second, "request timeout")
 	keyFile := fs.String("key-file", "", "client key file (needed only when control.require_auth is on)")
+	protocol := fs.String("protocol", "", "capability requirement: wire protocol the request uses (chat or responses)")
+	modalities := fs.String("input-modalities", "", "capability requirement: comma-separated input modalities (text,image,audio)")
+	requiresTools := fs.Bool("requires-tools", false, "capability requirement: the request sends a non-empty top-level tools array")
+	requiresJSONSchema := fs.Bool("requires-json-schema", false, "capability requirement: the request asks for structured output (json_schema)")
+	stream := fs.Bool("stream", false, "capability requirement: the request asks for a streaming response")
 	if err := fs.Parse(args); err != nil {
 		return exitError{2, "admit: " + err.Error()}
 	}
@@ -62,12 +119,22 @@ func runAdmit(args []string, stdout, stderr io.Writer) error {
 	if (*account == "") == (*model == "") {
 		return exitError{2, "admit: exactly one of --account or --model is required"}
 	}
+	reqs, err := admitRequirements(*protocol, *modalities, *requiresTools, *requiresJSONSchema, *stream)
+	if err != nil {
+		return err
+	}
 
-	req := map[string]string{"class": *class}
+	// A map keeps the legacy request bodies byte for byte what they were (Go
+	// sorts map keys); "requirements" is appended only when a capability flag
+	// was actually given, so the old CLI invocation is unchanged.
+	req := map[string]any{"class": *class}
 	if *account != "" {
 		req["account"] = *account
 	} else {
 		req["model"] = *model
+	}
+	if reqs != nil {
+		req["requirements"] = *reqs
 	}
 	body, _ := json.Marshal(req)
 	endpoint := strings.TrimRight(*base, "/") + "/control/v1/admit"
@@ -107,6 +174,7 @@ func runAdmit(args []string, stdout, stderr io.Writer) error {
 		var e struct {
 			Error struct {
 				Message string `json:"message"`
+				Type    string `json:"type"`
 			} `json:"error"`
 		}
 		msg := resp.Status
@@ -114,7 +182,19 @@ func runAdmit(args []string, stdout, stderr io.Writer) error {
 			msg += " (redirect not followed; check --url)"
 		}
 		if json.Unmarshal(raw, &e) == nil && e.Error.Message != "" {
-			msg = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, e.Error.Message)
+			// Capability refusals carry a stable type (e.g.
+			// capability_unsupported); surface it so a script can branch on it.
+			// Legacy errors are untyped and keep their old message.
+			if e.Error.Type != "" {
+				msg = fmt.Sprintf("HTTP %d: %s: %s", resp.StatusCode, e.Error.Type, e.Error.Message)
+			} else {
+				msg = fmt.Sprintf("HTTP %d: %s", resp.StatusCode, e.Error.Message)
+			}
+			// No account can serve the declared profile: that is a definite
+			// deny, not a usage error or an outage.
+			if e.Error.Type == "capability_unsupported" {
+				return exitError{1, "admit: " + msg}
+			}
 		}
 		return exitError{2, "admit: " + msg}
 	}

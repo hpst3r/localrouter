@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/auth"
+	"github.com/hpst3r/localrouter/internal/budget"
 	"github.com/hpst3r/localrouter/internal/claudelog"
 	"github.com/hpst3r/localrouter/internal/config"
 	"github.com/hpst3r/localrouter/internal/connlim"
@@ -71,12 +72,23 @@ type App struct {
 	// Logger is the server logger.
 	Logger *slog.Logger
 
-	serving     atomic.Bool
-	current     atomic.Pointer[runtimeGeneration]
-	lastReload  atomic.Pointer[core.ReloadStatus]
-	reloadMu    sync.Mutex
-	reloadBase  *config.Config
-	reloadClock core.Clock
+	serving atomic.Bool
+	// budgetStore and budgetOwnership are set by Build when cfg.Budgets is
+	// present, and left nil otherwise. Every runtime generation shares the one
+	// store (each builds its own immutable Gate over it); the ownership lock is
+	// held for the whole process, so a second Build against the same DataDir is
+	// denied and no other process may own or reconcile this database. Both are
+	// written in Build before the App is published, and released (set nil) by
+	// Close under reloadMu; every other access is on a goroutine that holds
+	// reloadMu (Build is single-threaded and pre-publication), so a reload's
+	// budgetGate read and Close's release are ordered on that one lock.
+	budgetStore     *budget.Store
+	budgetOwnership *budget.Ownership
+	current         atomic.Pointer[runtimeGeneration]
+	lastReload      atomic.Pointer[core.ReloadStatus]
+	reloadMu        sync.Mutex
+	reloadBase      *config.Config
+	reloadClock     core.Clock
 
 	// srvMu guards the one-shot Serve lifecycle fields below. Serve publishes
 	// an active server to at most one caller; Shutdown may run concurrently on
@@ -225,8 +237,17 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 	a.serving.Store(true)
 	a.reloadBase = cfg
 	a.reloadClock = clock
+	if cfg.Budgets != nil {
+		owner, store, err := openBudgetStore(cfg)
+		if err != nil {
+			_ = led.Close()
+			return nil, err
+		}
+		a.budgetOwnership, a.budgetStore = owner, store
+	}
 	generation, _, err := a.makeGeneration(cfg, 1)
 	if err != nil {
+		a.closeBudget()
 		_ = led.Close()
 		return nil, err
 	}
@@ -291,5 +312,94 @@ func (a *App) Start(ctx context.Context) {
 	}
 }
 
-// Close releases the ledger.
-func (a *App) Close() error { return a.Ledger.Close() }
+// budgetStartupTimeout bounds the one-shot orphan reconciliation Build performs
+// while it holds the process-wide budget lock, before any request is served.
+const budgetStartupTimeout = 5 * time.Second
+
+// openBudgetStore takes process-wide ownership of the budget database, opens
+// it, and reconciles orphan reservations a previous process left behind.
+//
+// Order matters. Ownership is acquired BEFORE the store is opened and
+// reconciliation runs BEFORE the store is shared with any generation, so no
+// other process can be reconciling this file concurrently and this process
+// never opens a database another owner is still driving. Any failure releases
+// exactly what was acquired, so a failed Build leaves ownership free for the
+// next attempt.
+func openBudgetStore(cfg *config.Config) (*budget.Ownership, *budget.Store, error) {
+	owner, err := budget.AcquireOwnership(filepath.Join(cfg.DataDir, "budgets.lock"))
+	if err != nil {
+		return nil, nil, fmt.Errorf("budget ownership: %w", err)
+	}
+	store, err := budget.Open(filepath.Join(cfg.DataDir, "budgets.db"))
+	if err != nil {
+		_ = owner.Close()
+		return nil, nil, fmt.Errorf("budget store: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), budgetStartupTimeout)
+	defer cancel()
+	if err := store.ReconcileOrphans(ctx); err != nil {
+		_ = store.Close()
+		_ = owner.Close()
+		return nil, nil, fmt.Errorf("budget reconcile: %w", err)
+	}
+	return owner, store, nil
+}
+
+// closeBudget releases the budget store and then its ownership lock, in that
+// order: the store is closed first so none of our writes are still on the file
+// at the instant the lock drops and another process could become owner and
+// reconcile. It is idempotent and safe when both fields are nil.
+//
+// Callers: Build's failure cleanup, before the App is published and while no
+// handler can be running, and Close, which holds reloadMu so the nil-ing of the
+// fields is serialized with the reload path that reads them.
+func (a *App) closeBudget() {
+	if a.budgetStore != nil {
+		_ = a.budgetStore.Close()
+		a.budgetStore = nil
+	}
+	if a.budgetOwnership != nil {
+		_ = a.budgetOwnership.Close()
+		a.budgetOwnership = nil
+	}
+}
+
+// Close releases the budget store and its ownership lock, then the ledger, and
+// makes the lifecycle terminal.
+//
+// Lifecycle: Close is a terminal transition, not merely a resource release. It
+// takes reloadMu with the same lock order Reload uses (reloadMu -> srvMu) and,
+// under srvMu, marks the app both not-serving and stopped. That single latch is
+// what makes the release safe:
+//
+//   - no later Reload can pass the serving gate in reloadConfigLocked, so no
+//     generation whose budget gate was built from a released (nil) store is ever
+//     published (the fail-open the review found on the undrained path);
+//   - no later Serve can start, because Serve rejects a stopped app.
+//
+// The budget store is then released while reloadMu is still held, so the write
+// that nils a.budgetStore and a concurrent reload's read in budgetGate are
+// ordered on the same lock, and concurrent Close calls serialize on it too.
+// Releasing the store before its ownership keeps the closeBudget order (store
+// then owner): nothing of ours is still writing the file when the lock drops.
+//
+// Close does not stop the server and does not wait for in-flight handlers to
+// drain; draining remains the caller's responsibility (cmd/localrouter drives
+// Serve/Shutdown first), exactly as it already is for the ledger. What Close
+// guarantees is only that no new generation is published and no Serve starts
+// after it, and that once the store is closed no later write goes through it
+// (the closed store fails closed). It is idempotent and nil-safe, and its
+// ledger release keeps the existing ledger.Close semantics.
+func (a *App) Close() error {
+	a.reloadMu.Lock()
+	defer a.reloadMu.Unlock()
+	a.srvMu.Lock()
+	a.serving.Store(false)
+	a.stopped = true
+	a.srvMu.Unlock()
+	a.closeBudget()
+	if a.Ledger == nil {
+		return nil
+	}
+	return a.Ledger.Close()
+}

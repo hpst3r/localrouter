@@ -119,10 +119,20 @@ type orEnv struct {
 
 // newOREnv builds the real app with one openrouter account ("or") and,
 // optionally, a fallback openai_compat account ("fb") second in the route.
-func newOREnv(t *testing.T, withMgmt, withFallback bool) *orEnv {
+//
+// An optional setup callback mutates the fake upstream BEFORE the app is built
+// and started, so a test can seed the state the very first quota poll observes.
+// Mutating the fake after Start races that poll: an urgent RequestRefresh
+// issued while the initial fetch is in flight is coalesced into it (single
+// flight), so the published snapshot keeps the pre-mutation state and a later
+// wait for the mutated state times out.
+func newOREnv(t *testing.T, withMgmt, withFallback bool, setup ...func(*fakeOpenRouter)) *orEnv {
 	t.Helper()
 	dir := t.TempDir()
 	f := newFakeOpenRouter(t)
+	if len(setup) > 0 && setup[0] != nil {
+		setup[0](f)
+	}
 	e := &orEnv{t: t, f: f, logs: &lockedBuffer{}}
 	var err error
 	if e.client, err = auth.GenerateKey(); err != nil {
@@ -343,9 +353,12 @@ func TestE2EOpenRouterStreamBalanceAndExhaustion(t *testing.T) {
 // Without a management key a 403 on /credits leaves the balance unavailable
 // (not zero), /key data still shows, and inference still works.
 func TestE2EOpenRouterCreditsForbiddenWithoutManagementKey(t *testing.T) {
-	e := newOREnv(t, false, false)
-	e.f.set(func(f *fakeOpenRouter) { f.requireMgmt = true })
-	e.app.Quota.RequestRefresh("or", true)
+	// Seed requireMgmt=true BEFORE Start so the app's first quota poll observes
+	// it directly. Setting it after Start and then calling RequestRefresh(urgent)
+	// is nondeterministic: if the initial /credits fetch is already in flight the
+	// urgent request is coalesced into it, the pre-mutation "credits available"
+	// snapshot is published, and the wait below can never be satisfied.
+	e := newOREnv(t, false, false, func(f *fakeOpenRouter) { f.requireMgmt = true })
 	st := e.waitStatus("or", func(s orAccountStatus) bool {
 		return s.Credits != nil && s.Credits.Error != nil && s.Key != nil && s.Key.Available
 	})

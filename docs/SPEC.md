@@ -71,6 +71,13 @@ Body is forwarded verbatim except:
 - Codex `/responses`: normalize the body per upstream attempt by removing
   `max_output_tokens`, `max_tokens`, `max_completion_tokens`, and `metadata`,
   and forcing `store: false` (required by the Codex backend).
+- The serving candidate's `upstream_model` (see "Capability routing") rewrites
+  the body's top-level `model`. A route with no `upstreams` uses its route-wide
+  `upstream_model` for every candidate, exactly as before. Both legacy and
+  per-candidate values are sent verbatim; empty means the client model is
+  forwarded unchanged. The ledger keeps the client-facing `model` for analytics
+  and the resolved `upstream_model` for backend attribution. Legacy routes retain
+  client-model pricing; capability-constrained routes price the resolved backend.
 
 Request headers forwarded: `Content-Type`, `Accept`, `OpenAI-Beta`,
 `session_id`, `conversation_id`, `x-request-id`. Client `Authorization` is
@@ -84,6 +91,99 @@ Each is truncated to 128 bytes on a UTF-8 boundary, with invalid UTF-8 and
 control characters replaced by U+FFFD.
 `X-LocalRouter-Class: background` lets an interactive-class key downgrade
 itself; a background key can never upgrade.
+
+## Capability routing (`routes[].upstreams`)
+
+`routes[]` MAY carry an optional `upstreams` map from candidate account id to a
+capability descriptor. It is additive and opt-in, and it lives on the route (not
+on `accounts[]`) so a capability edit rides the existing `routes[]` reload path.
+
+```yaml
+routes:
+  - name: gpt
+    models: [gpt-5.6-sol]
+    upstream_model: gpt-5.6-sol      # legacy shorthand: applies to every candidate
+    interactive: [codex-primary, ollama-cloud]
+    background:  [ollama-cloud]
+    upstreams:                       # NEW, optional; absent == today
+      codex-primary:
+        upstream_model: gpt-5.6-sol  # "" = inherit the route's upstream_model
+        protocols: [responses]       # explicit non-empty subset of chat,responses
+        input_modalities: [text]     # explicit non-empty subset of text,image
+        tools: true
+        json_schema: true
+        stream: true
+      ollama-cloud:
+        protocols: [chat, responses]
+        input_modalities: [text, image]
+```
+
+Two unknown semantics are fixed here, not inferred:
+
+1. A route with no `upstreams` (absent, `null` or `{}`) is **unconstrained**: the
+   legacy permissive path, byte-identical to a build without this feature.
+2. Inside a non-empty `upstreams`, a field that is absent means the candidate
+   does not support it: `protocols` and `input_modalities` must be explicitly
+   supplied; an absent `tools`/`json_schema`/`stream` boolean is unsupported.
+
+A non-empty `upstreams` opts the route into capability routing and is validated
+strictly. It MUST contain a descriptor for **every** candidate in
+`interactive ∪ background`; a missing descriptor, or a key that is not a
+candidate, is an error (typos are caught at `localrouter check`, like reserves).
+Per descriptor:
+
+- `upstream_model` overrides the route-wide value for that candidate. Optional;
+  empty inherits the route's `upstream_model` (which, when also empty, forwards
+  the client model unchanged). The legacy route-wide `upstream_model` is not
+  otherwise validated - any string is still accepted, exactly as before.
+- `protocols` is required and must be an explicit, non-empty, duplicate-free
+  subset of `chat`, `responses`. A `codex`-provider candidate may not list
+  `chat` (it would break the documented `/v1/responses`-only contract).
+- `input_modalities` is required and must be an explicit, non-empty,
+  duplicate-free subset of `text`, `image`. A candidate that declares only
+  `image` is vision-only: `text` is never implied. A candidate that declares
+  only `text` is simply not image-capable.
+- `tools`, `json_schema` and `stream` are booleans; absent is `false`
+  (unsupported).
+- String values are whitespace-trimmed before validation and before projection.
+
+Validation deliberately imposes no other demand: a text-only route is not
+required to have an image-capable candidate, and capability declarations only
+narrow a candidate's applicability - they never add a candidate, nor relax one
+to satisfy a request at admission time. This is a declarative routing mechanism,
+not a security boundary: a client can still embed data in a field the request
+classifier does not model.
+
+`config.CoreRoutes` deep-copies every route map and slice into `core.Route`,
+including the `map[string]core.UpstreamSpec` and each descriptor's slices, so a
+caller can never mutate the loaded config through the projection. `core.Route`
+gains `Upstreams map[string]UpstreamSpec`; `core.UpstreamSpec` carries
+`UpstreamModel, Protocols, InputModalities, Tools, JSONSchema, Stream`. An empty
+route descriptor map preserves legacy behavior, not an empty descriptor inside
+a constrained route.
+
+On constrained routes, request classification inspects typed content, never
+prompt strings or fetched URLs. Text and image requirements reflect actual
+content: image-only inputs may reach image-only backends; mixed inputs require
+both modalities. `json_object` and `json_schema` require structured-output
+support (`json_schema: true`). A lone `tool_choice: none` does not require tools,
+but declared tools do. Unknown or malformed content and opaque server-side
+context (`previous_response_id`, non-null `conversation` or `prompt`,
+`item_reference`) are rejected as unclassifiable. The classifier reads member
+names case-sensitively. An object with a duplicate or a case variant of a member
+it reads is also rejected, so the router and every upstream reader see the same
+value. Known unsupported audio/file inputs produce `capability_unsupported`,
+rather than being silently treated as text. Legacy routes bypass this
+classification. A legacy route that rewrites the body (route `upstream_model`, or
+`include_usage` on a streaming chat request) still requires one strict JSON
+object and returns 400 before any lease otherwise.
+
+When a capability-constrained route serves a request, the resolved backend model
+for the attempt is the serving candidate's `upstream_model`, else the route's
+`upstream_model`, else the client model. The ledger row keeps the client-facing
+`model` for analytics. `UpstreamModel` identifies the actual backend;
+`PricingModel` selects that backend's price on constrained routes. An unpriced
+backend stays unpriced: it never falls back to a potentially unrelated alias.
 
 ## Workload classes
 
@@ -205,7 +305,16 @@ One table `requests` (no prompt/response content, ever):
 `id, started_at, finished_at, client, class, route, model, provider,
 account_id, upstream_identity, status, failover_of, input_tokens,
 cached_input_tokens, output_tokens, reasoning_tokens, usage_known,
-cost_usd, cost_basis, latency_ms, bytes_out, session, task, agent, error`.
+cost_usd, cost_basis, latency_ms, bytes_out, session, task, agent, error,
+upstream_model, pricing_model`.
+
+Migration 4 adds nullable `upstream_model` and `pricing_model` columns. Historical
+rows retain NULL values and client-model pricing. New proxied attempts record
+the actual resolved backend in `upstream_model`; only capability-constrained
+routes populate `pricing_model`. Both fields are additive on the record wire.
+Legacy routes retain their existing client-model pricing even if their upstream
+model also has a price entry. Repricing uses the same explicit pricing key.
+Usable OpenRouter-reported cost takes precedence regardless of token knowledge.
 
 `cost_basis`: `api_equivalent` (subscription accounts: what it would cost at
 API list price), `metered` (API-key billing), `provider_reported` (the cost the
@@ -260,6 +369,13 @@ responses stay JSON-encodable.
   any usage record makes the response's usage unknown (`usage_known = false`)
   rather than storing it. Cached input is clamped to at most input, and
   reasoning to at most output (usage stays known).
+- Stream completion is tracked separately from usage: a successful (`< 400`)
+  chat stream is complete only after `data: [DONE]`, a Responses stream only
+  after `response.completed`/`response.incomplete`/`response.failed` with its
+  `response` object (usage optional). A clean EOF without that terminal is
+  incomplete: `usage_known = false`, error
+  `upstream stream ended without completion`, outcome `transport_error`.
+  Non-stream JSON bodies need no marker.
 - Client disconnect or missing usage ⇒ `usage_known = false`; lease still
   released. An already observed provider cost is retained alongside the
   transport/request error, independently of token knowledge; for an interrupted
@@ -388,9 +504,13 @@ with a sanitized `reason` and, for a restart-only rejection, the offending
 and reloads are serialized.
 
 Reloadable in place: `clients[]` (`name`, `class`, `key_file`/`key_files`,
-`host`, `ingest`), `routes[]`, `accounts[].reserve`, `pricing_file` contents,
+`host`, `ingest`), `routes[]` (including the optional capability `upstreams`
+descriptors), `accounts[].reserve`, `pricing_file` contents,
 `policy.stale_after`/`safety_margin`/`inflight_estimate`/`max_failovers`, and
 `limits.max_concurrent`/`max_concurrent_per_client` (active counts preserved).
+Because parsing is strict (`KnownFields(true)`), a config that adds `upstreams`
+does not parse on a binary that predates this feature: the upgrade is one-way,
+and rolling back requires deleting the new keys.
 
 Pricing is **frozen per request by generation**, not resolved at ledger-write
 time. One accepted generation publishes its handler, auth, routes, limits,
@@ -810,7 +930,7 @@ to LocalRouter only through the documented control API.
   happens in Go (do NOT trust SQLite localtime). Must handle 1M rows in < 1s
   on a laptop: aggregate in SQL by hour (`started_at/3600000`), then fold
   hours into local days in Go. Add index (started_at, host) if useful
-  (migration v4).
+  (a future migration v5; not implemented by capability routing).
 - Sums use the existing overflow-safe approach (REAL/TOTAL); counts
   (requests, unknown_usage, unpriced) per point; cost_usd per point nil if
   the point has requests but none priced, else sum of priced; same rule as

@@ -14,7 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hpst3r/localrouter/internal/budget"
 	"github.com/hpst3r/localrouter/internal/core"
+	"github.com/hpst3r/localrouter/internal/routing"
 )
 
 const (
@@ -54,6 +56,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 	exclude := map[string]bool{}
 	var (
 		prevID    string
+		rootID    string // record ID of the first attempt; the request correlation ID
 		pending   *failure
 		lastErr   string
 		failovers int
@@ -90,7 +93,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 			return
 		}
 		acctID := lease.AccountID()
-		res := p.attempt(w, r, req, lease, &prevID, failovers < p.opts.MaxFailovers)
+		res := p.attempt(w, r, req, lease, &prevID, &rootID, failovers < p.opts.MaxFailovers)
 		if res.done {
 			return
 		}
@@ -117,8 +120,9 @@ func (l *onceLease) Release(o core.Outcome) {
 
 // attempt sends the request to the leased account, retrying the same account
 // once after a 401/403 with a refreshed credential. It always releases the
-// lease, and records one ledger row per upstream try.
-func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, lease core.Lease, prevID *string, canFailover bool) attemptResult {
+// lease, records one ledger row per upstream try, and emits one structured
+// completion event per try.
+func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, lease core.Lease, prevID, rootID *string, canFailover bool) attemptResult {
 	ctx := r.Context()
 	acctID := lease.AccountID()
 	account, ok := p.deps.Accounts[acctID]
@@ -135,30 +139,99 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		defer cancelUp()
 		rec := p.newRecord(req, account, *prevID)
 		*prevID = rec.ID
+		if *rootID == "" {
+			*rootID = rec.ID
+		}
+		ev := attemptEvent{
+			requestID: *rootID,
+			attemptID: rec.ID,
+			prevID:    rec.FailoverOf,
+			client:    req.client.Name,
+			account:   account.ID,
+			provider:  account.Provider,
+			class:     req.class,
+		}
 
 		cred, err := p.deps.Creds.Credential(ctx, acctID)
 		if err != nil {
 			p.log.Warn("credential unavailable", "account", acctID, "err", err)
 			lease.Release(core.Outcome{})
 			rec.Error = "credential unavailable"
-			p.record(ctx, rec)
+			rec = p.record(ctx, rec)
+			ev.outcome = outcomeTransportError
+			ev.failoverEligible = canFailover
+			ev.latencyMS = rec.LatencyMS
+			p.emitAttempt(ev)
 			return p.noResponse(w, canFailover, "upstream credential unavailable")
 		}
 		rec.UpstreamIdentity = cred.Identity
+
+		// Reserve budget AFTER the credential is resolved — so a credential
+		// failure never places a hold — and immediately before the send, on
+		// every attempt including this loop's credential-refresh retry. A
+		// reservation error is terminal: a denied client must not fail over
+		// onto another account's budget, and a store error must not be papered
+		// over by spending. Neither is settled, because neither was reserved.
+		// Each denial still writes a ledger row, so it emits that row's
+		// completion event too: terminal, never failover-eligible, status 0.
+		if p.deps.Budget != nil {
+			if err := p.deps.Budget.Reserve(ctx, rec); err != nil {
+				lease.Release(core.Outcome{})
+				if errors.Is(err, budget.ErrExceeded) {
+					p.log.Info("budget exceeded", "client", rec.Client, "class", req.class,
+						"account", acctID, "model", req.model)
+					rec.Error = "budget exceeded"
+					rec = p.record(ctx, rec)
+					ev.outcome = outcomeBudgetExceeded
+					ev.latencyMS = rec.LatencyMS
+					p.emitAttempt(ev)
+					writeError(w, http.StatusTooManyRequests, "localrouter: budget exceeded", "budget_exceeded")
+					return attemptResult{done: true}
+				}
+				// A client that went away mid-Reserve is a disconnect, not a
+				// store outage: nothing was reserved and nobody reads a reply.
+				if ctx.Err() != nil {
+					rec.Error = "client disconnected"
+					rec = p.record(ctx, rec)
+					ev.outcome = outcomeClientCancelled
+					ev.latencyMS = rec.LatencyMS
+					p.emitAttempt(ev)
+					return attemptResult{done: true}
+				}
+				// Log a sanitized class only: the store's own error text can
+				// embed filesystem paths or DSNs.
+				p.log.Error("budget reserve failed", "client", rec.Client, "account", acctID,
+					"class", budgetErrClass(err))
+				rec.Error = "budget store error"
+				rec = p.record(ctx, rec)
+				ev.outcome = outcomeBudgetStoreError
+				ev.latencyMS = rec.LatencyMS
+				p.emitAttempt(ev)
+				writeError(w, http.StatusServiceUnavailable, "localrouter: budget store unavailable", "budget_store_error")
+				return attemptResult{done: true}
+			}
+		}
 
 		resp, err := p.send(upCtx, req, account, cred)
 		if err != nil {
 			if ctx.Err() != nil {
 				lease.Release(core.Outcome{})
 				rec.Error = "client disconnected"
-				p.record(ctx, rec)
+				rec = p.recordBudget(ctx, rec)
+				ev.outcome = outcomeClientCancelled
+				ev.latencyMS = rec.LatencyMS
+				p.emitAttempt(ev)
 				return attemptResult{done: true}
 			}
 			msg := sanitizeErr(err)
 			p.log.Warn("upstream transport error", "account", acctID, "model", req.model, "err", msg)
 			lease.Release(core.Outcome{})
 			rec.Error = "upstream transport error: " + msg
-			p.record(ctx, rec)
+			rec = p.recordBudget(ctx, rec)
+			ev.outcome = outcomeTransportError
+			ev.failoverEligible = canFailover
+			ev.latencyMS = rec.LatencyMS
+			p.emitAttempt(ev)
 			return p.noResponse(w, canFailover, "upstream unreachable")
 		}
 		p.deps.Quota.ObserveHeaders(acctID, resp.Header)
@@ -178,8 +251,14 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			rec.Status = status
 			rec.Error = errIdleErrorBody
 			p.log.Warn("upstream idle timeout reading error body", "account", acctID, "model", req.model, "status", status)
-			p.record(ctx, rec)
-			if canFailover && retryableFor(account.Provider, status) {
+			rec = p.recordBudget(ctx, rec)
+			eligible := canFailover && retryableFor(account.Provider, status)
+			ev.status = status
+			ev.outcome = outcomeUpstreamError
+			ev.failoverEligible = eligible
+			ev.latencyMS = rec.LatencyMS
+			p.emitAttempt(ev)
+			if eligible {
 				return attemptResult{failure: f}
 			}
 			relayFailure(w, f)
@@ -189,7 +268,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			// The same request would fail the same way on any account, so a
 			// replay elsewhere is only amplification: relay it as the answer.
 			p.log.Info("upstream rejected request", "account", acctID, "class", req.class, "model", req.model, "status", status)
-			p.stream(w, r, req, resp, lease, rec, cancelUp, true)
+			p.stream(w, r, req, resp, lease, rec, cancelUp, true, ev)
 			return attemptResult{done: true}
 		}
 
@@ -201,7 +280,12 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			rec.Status = status
 			rec.Error = "upstream " + strconv.Itoa(status) + "; retrying with refreshed credential"
 			p.log.Info("upstream auth rejected; refreshing credential", "account", acctID, "status", status)
-			p.record(ctx, rec)
+			rec = p.recordBudget(ctx, rec)
+			ev.status = status
+			ev.outcome = outcomeUpstreamError
+			ev.authRetry = true
+			ev.latencyMS = rec.LatencyMS
+			p.emitAttempt(ev)
 			continue
 		}
 
@@ -219,11 +303,16 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 				rec.Error = errIdleErrorBody
 			}
 			p.log.Info("upstream failure; failing over", "account", acctID, "class", req.class, "model", req.model, "status", status)
-			p.record(ctx, rec)
+			rec = p.recordBudget(ctx, rec)
+			ev.status = status
+			ev.outcome = outcomeUpstreamError
+			ev.failoverEligible = true
+			ev.latencyMS = rec.LatencyMS
+			p.emitAttempt(ev)
 			return attemptResult{failure: f}
 		}
 
-		p.stream(w, r, req, resp, lease, rec, cancelUp, scoped)
+		p.stream(w, r, req, resp, lease, rec, cancelUp, scoped, ev)
 		return attemptResult{done: true}
 	}
 }
@@ -235,6 +324,11 @@ const invalidateGap = 60 * time.Second
 // errIdleErrorBody is the ledger error for an upstream error body that
 // stalled for StreamIdleTimeout before the response was relayed.
 const errIdleErrorBody = "upstream idle timeout reading error body"
+
+// errUnterminatedStream is the ledger error for a successful event stream
+// that reached a clean EOF without its protocol's terminal (see
+// usageCapture.Completed).
+const errUnterminatedStream = "upstream stream ended without completion"
 
 // classify decides how an upstream status counts against the account.
 // scoped means the failure was caused by this request, not the account, so
@@ -374,10 +468,25 @@ func (p *Proxy) noResponse(w http.ResponseWriter, canFailover bool, msg string) 
 	return attemptResult{done: true}
 }
 
-// send builds and performs the upstream request.
+// send builds and performs the upstream request for one attempt. The upstream
+// model is resolved per attempt from the leased account, so failing over to a
+// different backend sends that backend's alias; and the body is rebuilt from the
+// unmodified client body on every attempt, so no model rewrite, include_usage
+// injection or Codex normalisation can leak between attempts.
 func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cred core.Credential) (*http.Response, error) {
 	u := strings.TrimRight(account.BaseURL, "/") + req.endpoint
-	body := req.body
+	// Only an actual override rewrites the body: a resolved model equal to the
+	// client model is semantically the same request, so it is left byte-identical
+	// (the legacy no-rewrite fast path). The rewrite target is the leased
+	// candidate's alias, else the route-wide alias, else the client model.
+	override := ""
+	if model := routing.ResolveModel(req.route, account.ID, req.model); model != req.model {
+		override = model
+	}
+	body, err := rewriteBody(req.body, override, req.endpoint == "/chat/completions" && req.stream)
+	if err != nil {
+		return nil, err
+	}
 	if account.Provider == core.ProviderCodex {
 		body = codexBody(body)
 	}
@@ -402,10 +511,10 @@ func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cr
 }
 
 // stream relays the upstream response to the client, capturing usage, then
-// releases the lease and records the ledger row. If no upstream bytes arrive
-// for StreamIdleTimeout, cancelUp aborts the upstream request. scoped is
-// passed to policy as Outcome.RequestScoped.
-func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, resp *http.Response, lease core.Lease, rec core.RequestRecord, cancelUp context.CancelFunc, scoped bool) {
+// releases the lease, records the ledger row and emits the completion event.
+// If no upstream bytes arrive for StreamIdleTimeout, cancelUp aborts the
+// upstream request. scoped is passed to policy as Outcome.RequestScoped.
+func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, resp *http.Response, lease core.Lease, rec core.RequestRecord, cancelUp context.CancelFunc, scoped bool, ev attemptEvent) {
 	defer resp.Body.Close()
 	ctx := r.Context()
 	rc := http.NewResponseController(w)
@@ -467,7 +576,14 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	}
 
 	usage, known := capture.Result()
-	if aborted || idledOut || readErr != nil {
+	// A clean EOF is not proof the response finished: a successful event
+	// stream must also have delivered its protocol's terminal. Finality is
+	// never inferred from usage or cost, which an intermediate record can
+	// carry. Error statuses keep their existing handling.
+	unterminated := !aborted && !idledOut && readErr == nil &&
+		resp.StatusCode < 400 && !capture.Completed(req.endpoint)
+	incomplete := aborted || idledOut || readErr != nil || unterminated
+	if incomplete {
 		known = false
 	}
 	out := core.Outcome{Status: resp.StatusCode, UsageKnown: known, BytesToClient: written, RequestScoped: scoped}
@@ -484,46 +600,81 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	}
 	// Provider-reported cost is an independent observation and is only trusted
 	// from OpenRouter; cost fields from other providers are ignored. Read it
-	// after Result above has flushed any final buffered event.
+	// after Result above has flushed any final buffered event. On an incomplete
+	// stream (including one that ended without its terminal) the ledger still
+	// keeps it, but it may come from an intermediate usage record, so the
+	// budget settles it only as a lower bound (below).
 	if rec.Provider == core.ProviderOpenRouter {
 		rec.ReportedCostUSD = capture.ReportedCost()
 	}
 	switch {
 	case aborted:
 		rec.Error = "client disconnected"
+		ev.outcome = outcomeClientCancelled
 	case idledOut:
 		p.log.Warn("upstream stream idle timeout", "account", rec.AccountID, "model", req.model)
 		rec.Error = "stream idle timeout"
+		ev.outcome = outcomeTransportError
 	case readErr != nil:
 		rec.Error = "upstream stream error: " + sanitizeErr(readErr)
+		ev.outcome = outcomeTransportError
+	case unterminated:
+		p.log.Warn("upstream stream ended without completion", "account", rec.AccountID, "model", req.model)
+		rec.Error = errUnterminatedStream
+		ev.outcome = outcomeTransportError
 	case resp.StatusCode >= 400:
 		rec.Error = "upstream " + strconv.Itoa(resp.StatusCode)
+		ev.outcome = outcomeUpstreamError
+	default:
+		ev.outcome = outcomeSuccess
 	}
-	p.record(ctx, rec)
+	ev.status = resp.StatusCode
+	if incomplete {
+		rec = p.recordIncompleteBudget(ctx, rec)
+	} else {
+		rec = p.recordBudget(ctx, rec)
+	}
+	ev.latencyMS = rec.LatencyMS
+	p.emitAttempt(ev)
 }
 
 // newRecord starts a ledger row for one upstream try.
 func (p *Proxy) newRecord(req *request, account core.Account, failoverOf string) core.RequestRecord {
-	return core.RequestRecord{
-		ID:         newID(),
-		StartedAt:  p.clock.Now(),
-		Client:     req.client.Name,
-		Class:      req.class,
-		Route:      req.route.Name,
-		Model:      req.model,
-		Provider:   account.Provider,
-		AccountID:  account.ID,
-		FailoverOf: failoverOf,
-		Session:    req.session,
-		Task:       req.task,
-		Agent:      req.agent,
-		Host:       req.client.Host,
+	resolved := routing.ResolveModel(req.route, account.ID, req.model)
+	rec := core.RequestRecord{
+		ID:        newID(),
+		StartedAt: p.clock.Now(),
+		Client:    req.client.Name,
+		Class:     req.class,
+		Route:     req.route.Name,
+		Model:     req.model,
+		// UpstreamModel is what this attempt actually sent upstream: the
+		// candidate descriptor's alias, the route-level upstream model, or the
+		// client model when no rewrite applies.
+		UpstreamModel: resolved,
+		Provider:      account.Provider,
+		AccountID:     account.ID,
+		FailoverOf:    failoverOf,
+		Session:       req.session,
+		Task:          req.task,
+		Agent:         req.agent,
+		Host:          req.client.Host,
 	}
+	// A capability-constrained route (per-candidate Upstreams) attributes cost
+	// to the backend this attempt actually resolved, so two candidates serving
+	// the same client model are priced at their own backend. A legacy route
+	// keeps the exact legacy pricing path: PricingModel stays empty and the
+	// ledger keys on Model. This never falls back from an unpriced backend to
+	// the client alias — an unpriced backend stays honestly unpriced.
+	if len(req.route.Upstreams) > 0 {
+		rec.PricingModel = resolved
+	}
+	return rec
 }
 
 // record finalizes timing, logs a summary, and writes the ledger row. Ledger
 // failures are logged and never affect the response.
-func (p *Proxy) record(ctx context.Context, rec core.RequestRecord) {
+func (p *Proxy) record(ctx context.Context, rec core.RequestRecord) core.RequestRecord {
 	// Errors can carry upstream/transport text: bound and sanitize them.
 	rec.Error = core.TruncateError(rec.Error)
 	rec.FinishedAt = p.clock.Now()
@@ -536,12 +687,91 @@ func (p *Proxy) record(ctx context.Context, rec core.RequestRecord) {
 		"reasoning_tokens", rec.Usage.ReasoningTokens, "bytes_out", rec.BytesOut,
 		"failover_of", rec.FailoverOf, "error", rec.Error)
 	if p.deps.Ledger == nil {
-		return
+		return rec
 	}
 	lctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerTimeout)
 	defer cancel()
 	if err := p.deps.Ledger.Record(lctx, rec); err != nil {
 		p.log.Error("ledger record failed", "id", rec.ID, "err", err)
+	}
+	return rec
+}
+
+// recordBudget settles the attempt's budget reservation — when one was taken —
+// on a fresh context, then writes the ledger row. Reserve and Settle are
+// paired here for every path that follows a successful Reserve, including the
+// post-401 credential-refresh retry, each failover account, a transport
+// failure or client cancellation, and the stream relay.
+//
+// Budget is optional: with no Budget installed no reservation was ever placed,
+// so recordBudget is exactly record and the legacy path is unchanged.
+//
+// The settlement context is detached from the request (a cancelled client must
+// never lose its hold) with the same bounded budget the ledger write uses.
+// Settling an attempt the store never reserved returns ErrUnknownReservation;
+// that is a wiring fault and is logged rather than silently absorbed. Any
+// other failure leaves the durable hold in place for the reconciler and is
+// logged with a sanitized class only — the store's own error is not surfaced.
+//
+// Every attempt that reached Settle without a usable cost — an auth retry, a
+// failover, a transport error, an upstream error response — is charged at its
+// full hold under the unknown basis. That is deliberate conservative policy:
+// the proxy cannot prove an attempt that reached the upstream was not billed.
+//
+// It returns the finalized row record wrote, so the caller's completion event
+// carries the same latency the ledger does.
+func (p *Proxy) recordBudget(ctx context.Context, rec core.RequestRecord) core.RequestRecord {
+	if p.deps.Budget != nil {
+		p.settleBudget(ctx, rec, p.deps.Budget.Settle)
+	}
+	return p.record(ctx, rec)
+}
+
+// recordIncompleteBudget is recordBudget for a response relay that ended early
+// (client disconnect, idle timeout, upstream read error, or a successful event
+// stream that reached EOF without its protocol terminal). The ledger row keeps
+// any provider-reported cost seen so far, but that cost may come from an
+// intermediate usage record, so the budget settles it with SettleIncomplete:
+// as unknown, charged at max(hold, observed), never as a final cost.
+func (p *Proxy) recordIncompleteBudget(ctx context.Context, rec core.RequestRecord) core.RequestRecord {
+	if p.deps.Budget != nil {
+		p.settleBudget(ctx, rec, p.deps.Budget.SettleIncomplete)
+	}
+	return p.record(ctx, rec)
+}
+
+func (p *Proxy) settleBudget(ctx context.Context, rec core.RequestRecord, settle func(context.Context, core.RequestRecord) error) {
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerTimeout)
+	err := settle(sctx, rec)
+	cancel()
+	switch {
+	case err == nil:
+	case errors.Is(err, budget.ErrUnknownReservation):
+		p.log.Error("budget settlement found no reservation", "id", rec.ID)
+	default:
+		p.log.Error("budget settlement failed; reservation left held for reconciliation",
+			"id", rec.ID, "class", budgetErrClass(err))
+	}
+}
+
+// budgetErrClass maps a budget error to a fixed, sanitized class for logs, so
+// the store's own error text (paths, DSNs, SQLite messages) never reaches them.
+func budgetErrClass(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, budget.ErrClosed):
+		return "closed"
+	case errors.Is(err, budget.ErrNoStore):
+		return "no_store"
+	case errors.Is(err, budget.ErrInvalid):
+		return "invalid"
+	case errors.Is(err, budget.ErrConflict):
+		return "conflict"
+	default:
+		return "store"
 	}
 }
 

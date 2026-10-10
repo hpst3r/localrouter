@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/core"
+	"github.com/hpst3r/localrouter/internal/routing"
 )
 
 //go:embed static/index.html
@@ -68,6 +69,11 @@ type Deps struct {
 	// It folds in process shutdown so /readyz and diagnostics flip not-ready
 	// once the process stops accepting work, independently of storage health.
 	Ready func() bool
+	// Budgets is this generation's read-only spend-control view for the
+	// operator budget report; nil when spend controls are not configured for
+	// the generation. Like ReloadStatus it is consulted per request, so a
+	// reload publishes a fresh source without restarting the server.
+	Budgets BudgetSource
 	// Clock defaults to core.SystemClock.
 	Clock core.Clock
 }
@@ -109,6 +115,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /control/v1/analytics", s.auth(http.HandlerFunc(s.analytics)))
 	mux.Handle("GET /control/v1/analytics/dimensions", s.auth(http.HandlerFunc(s.analyticsDimensions)))
 	mux.Handle("GET /control/v1/diagnostics", s.auth(http.HandlerFunc(s.diagnostics)))
+	mux.Handle("GET /control/v1/budgets", s.auth(http.HandlerFunc(s.budgets)))
 	mux.Handle("POST /control/v1/admit", s.auth(http.HandlerFunc(s.admit)))
 	mux.HandleFunc("POST /control/v1/ingest", s.ingest)
 	return mux
@@ -474,18 +481,172 @@ func parseSince(v string) (time.Duration, error) {
 	return d, nil
 }
 
-// admitRequest names exactly one of Model (dry-run the route's candidates)
-// or Account (dry-run that single account, e.g. a quota-only claude account).
+// admitRequest names exactly one of Model (dry-run the route's candidates) or
+// Account (dry-run that single account, e.g. a quota-only claude account).
+//
+// Requirements is optional. A route that has opted into capability routing
+// (core.Route.Upstreams non-empty) requires it: the dry run then mirrors the
+// inference path — the route's candidates are narrowed by routing.Filter before
+// the policy is consulted — so a caller learns, before sending a real request,
+// whether any candidate can serve the capability profile it declares. A legacy
+// route (no descriptors) has no capability boundary to compare against, so a
+// profile cannot narrow it by capability, exactly as the inference path ignores
+// a body it cannot classify for such a route; the profile's vocabulary is still
+// checked there, and a chat protocol still drops Codex accounts as the
+// inference path does for /v1/chat/completions.
 type admitRequest struct {
-	Class   string `json:"class"`
-	Model   string `json:"model"`
-	Account string `json:"account"`
+	Class        string             `json:"class"`
+	Model        string             `json:"model"`
+	Account      string             `json:"account"`
+	Requirements *capabilityRequest `json:"requirements"`
+}
+
+// capabilityRequest is the control API's wire form of routing.Requirements.
+// routing.Requirements is an internal value type with no JSON tags, so the
+// endpoint declares its own explicitly-tagged mirror and converts, rather than
+// decoding straight into the routing type. The field names are the
+// lowercase-underscore spellings used by the equivalent config keys — notably
+// json_schema.
+type capabilityRequest struct {
+	Protocol   string   `json:"protocol"`
+	Modalities []string `json:"modalities"`
+	Tools      bool     `json:"tools"`
+	JSONSchema bool     `json:"json_schema"`
+	Stream     bool     `json:"stream"`
+}
+
+// Capability admission failures, surfaced as the stable error "type" the client
+// branches on. These names are part of the control API contract; the inference
+// path reports the same capability_unsupported condition.
+const (
+	// errCapabilityRequirementsRequired: a model dry run against a route that
+	// has opted into capability routing omitted — or under-specified — the
+	// explicit capability profile that route needs.
+	errCapabilityRequirementsRequired = "capability_requirements_required"
+	// errCapabilityUnsupported: the declared capability profile rules out every
+	// candidate, or names a protocol or modality the router does not model.
+	errCapabilityUnsupported = "capability_unsupported"
+)
+
+// capabilityError is a refusal from the capability stage of a model dry run. It
+// carries the HTTP status and the stable error type so callers can report both.
+type capabilityError struct {
+	status int
+	typ    string
+	msg    string
+}
+
+// toRouting validates the declared profile and converts it to the value
+// routing.Filter consumes, normalizing it the way routing.Infer normalizes a
+// real request: the protocol is required and must be chat or responses; at least
+// one modality must be named; and every modality must be one the router models
+// (text, image, audio or file, where audio and file are always unsatisfiable and
+// so fail closed). Vocabulary is checked before completeness, so an
+// errCapabilityRequirementsRequired error still returns a validated (possibly
+// empty) Protocol. The declared modalities are used verbatim — deduplicated, with
+// blanks ignored — and text is NEVER folded in implicitly: an image-only profile
+// asks for image alone, exactly as Infer reports an image-only body, so a
+// vision-only candidate can serve it. No default is invented for a field the
+// caller left out: an incomplete profile is refused, never widened.
+func (c *capabilityRequest) toRouting() (routing.Requirements, *capabilityError) {
+	var reqs routing.Requirements
+	reqs.Protocol = strings.TrimSpace(c.Protocol)
+	if reqs.Protocol != "" && reqs.Protocol != routing.ProtocolChat && reqs.Protocol != routing.ProtocolResponses {
+		return routing.Requirements{}, &capabilityError{http.StatusBadRequest, errCapabilityUnsupported,
+			fmt.Sprintf("localrouter: unknown protocol %q (want chat or responses)", reqs.Protocol)}
+	}
+	seen := map[string]bool{}
+	declared := 0
+	for _, m := range c.Modalities {
+		m = strings.TrimSpace(m)
+		if m == "" {
+			continue
+		}
+		declared++
+		switch m {
+		case routing.ModalityText, routing.ModalityImage, routing.ModalityAudio, routing.ModalityFile:
+		default:
+			return routing.Requirements{}, &capabilityError{http.StatusBadRequest, errCapabilityUnsupported,
+				fmt.Sprintf("localrouter: unknown input modality %q (want text, image, audio or file)", m)}
+		}
+		if !seen[m] {
+			seen[m] = true
+			reqs.Modalities = append(reqs.Modalities, m)
+		}
+	}
+	if reqs.Protocol == "" {
+		return reqs, &capabilityError{http.StatusBadRequest, errCapabilityRequirementsRequired,
+			"localrouter: capability requirements must name a protocol (chat or responses)"}
+	}
+	if declared == 0 {
+		return reqs, &capabilityError{http.StatusBadRequest, errCapabilityRequirementsRequired,
+			"localrouter: capability requirements must name at least one input modality"}
+	}
+	reqs.Tools, reqs.JSONSchema, reqs.Stream = c.Tools, c.JSONSchema, c.Stream
+	return reqs, nil
+}
+
+// filterRoute applies capability-aware narrowing to a model dry run, mirroring
+// the inference path as closely as a route lookup without a request body
+// allows. An opted-in route demands an explicit profile (absent or incomplete is
+// a 400 capability_requirements_required — never a silent fall back to the
+// legacy permissive path). The profile is then run through routing.Filter, which
+// only ever removes candidates and keeps the operator's order, and the policy
+// dry run sees exactly that narrowed set. If the narrowing removes every
+// candidate that existed (matching the proxy, which only refuses when it had a
+// candidate to lose), the request is a 400 capability_unsupported.
+//
+// A legacy route keeps the candidates unchanged by capability; a profile given
+// for it must still use the modelled vocabulary (capability_unsupported
+// otherwise) but need not be complete. On either kind of route a chat protocol
+// first drops Codex accounts, exactly as the proxy does for
+// /v1/chat/completions, and refuses the request when only Codex accounts were
+// configured.
+func filterRoute(route core.Route, candidates []string, req *capabilityRequest, isCodex func(string) bool) ([]string, *capabilityError) {
+	constrained := len(route.Upstreams) > 0
+	if req == nil {
+		if !constrained {
+			return candidates, nil
+		}
+		return nil, &capabilityError{http.StatusBadRequest, errCapabilityRequirementsRequired,
+			"localrouter: capability requirements are required for this route"}
+	}
+	reqs, cerr := req.toRouting()
+	if cerr != nil && (constrained || cerr.typ != errCapabilityRequirementsRequired) {
+		return nil, cerr
+	}
+	if reqs.Protocol == routing.ProtocolChat {
+		var keep []string
+		for _, id := range candidates {
+			if !isCodex(id) {
+				keep = append(keep, id)
+			}
+		}
+		if len(keep) == 0 && len(candidates) > 0 {
+			return nil, &capabilityError{http.StatusBadRequest, errCapabilityUnsupported,
+				"localrouter: codex accounts only serve /v1/responses"}
+		}
+		candidates = keep
+	}
+	if !constrained {
+		return candidates, nil
+	}
+	filtered := routing.Filter(route, candidates, reqs)
+	if len(filtered) == 0 && len(candidates) > 0 {
+		return nil, &capabilityError{http.StatusBadRequest, errCapabilityUnsupported,
+			"localrouter: no account supports the capabilities this request needs"}
+	}
+	return filtered, nil
 }
 
 type admitResponse struct {
 	Decision  string `json:"decision"`
 	AccountID string `json:"account_id"`
 	Reason    string `json:"reason"`
+	// Budget is the advisory spend-control estimate for this decision. It is
+	// present only when spend controls are configured for the generation, and
+	// it never changes the decision above and never takes a reservation.
+	Budget *admitBudgetEstimate `json:"budget,omitempty"`
 }
 
 func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
@@ -501,6 +662,13 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 	}
 	if (req.Model == "") == (req.Account == "") {
 		writeError(w, http.StatusBadRequest, "exactly one of model or account is required")
+		return
+	}
+	if req.Account != "" && req.Requirements != nil {
+		// A single-account dry run has no route, so requirements have nothing to
+		// filter and silently ignoring them would be a false guarantee: refuse
+		// the ambiguous request rather than guess which meaning was intended.
+		writeError(w, http.StatusBadRequest, "requirements apply only to a model request")
 		return
 	}
 	var candidates []string
@@ -520,6 +688,17 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 		if class == core.ClassBackground {
 			candidates = slices.Clone(route.Background)
 		}
+		isCodex := func(id string) bool {
+			return slices.ContainsFunc(s.deps.Accounts, func(a core.Account) bool {
+				return a.ID == id && a.Provider == core.ProviderCodex
+			})
+		}
+		filtered, cerr := filterRoute(route, candidates, req.Requirements, isCodex)
+		if cerr != nil {
+			writeErrorCode(w, cerr.status, cerr.msg, cerr.typ)
+			return
+		}
+		candidates = filtered
 	}
 	if s.deps.Policy == nil {
 		writeError(w, http.StatusServiceUnavailable, "policy unavailable")
@@ -533,6 +712,10 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 	if d.Allow {
 		resp.Decision = "allow"
 	}
+	// The advisory estimate is additive: it is attached only by its own
+	// nil-Budgets check, so a deployment without spend controls keeps the
+	// exact legacy response bytes.
+	resp.Budget = s.admitBudget(r, d, candidates)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -564,6 +747,24 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_, _ = w.Write(buf.Bytes())
 }
 
+// errorBody is the control API's error envelope. It mirrors the proxy's
+// ({error:{message,type}}) so a client that already branches on a proxy error
+// type can branch on capability_requirements_required / capability_unsupported
+// here too. Type is omitted for the capability-neutral errors, keeping their
+// bodies byte for byte what they were before this envelope carried a type.
+type errorBody struct {
+	Error struct {
+		Message string `json:"message"`
+		Type    string `json:"type,omitempty"`
+	} `json:"error"`
+}
+
 func writeError(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]any{"error": map[string]string{"message": msg}})
+	writeErrorCode(w, code, msg, "")
+}
+
+func writeErrorCode(w http.ResponseWriter, code int, msg, typ string) {
+	var b errorBody
+	b.Error.Message, b.Error.Type = msg, typ
+	writeJSON(w, code, b)
 }

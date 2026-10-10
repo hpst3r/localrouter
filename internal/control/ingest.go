@@ -302,6 +302,7 @@ func validateRecordFields(i int, rec *core.RequestRecord) error {
 	for _, f := range []struct{ name, v string }{
 		{"model", rec.Model}, {"session", rec.Session}, {"task", rec.Task}, {"agent", rec.Agent},
 		{"upstream_identity", rec.UpstreamIdentity}, {"failover_of", rec.FailoverOf},
+		{"upstream_model", rec.UpstreamModel}, {"pricing_model", rec.PricingModel},
 	} {
 		if core.TruncateLabel(f.v) != f.v {
 			return recErr("records[%d]: %s must be at most %d bytes of UTF-8 without control characters",

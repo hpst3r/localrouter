@@ -13,6 +13,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/hpst3r/localrouter/internal/budget"
 	"github.com/hpst3r/localrouter/internal/core"
 )
 
@@ -27,19 +28,22 @@ type Config struct {
 	// HostName labels usage that happens on this machine: proxied requests
 	// from clients without a host, and the local claude_logs collector.
 	// Default: the short OS hostname, lowercased.
-	HostName    string           `yaml:"host_name"`
-	DataDir     string           `yaml:"data_dir"`
-	PricingFile string           `yaml:"pricing_file"`
-	Quota       QuotaConfig      `yaml:"quota"`
-	Policy      PolicyConfig     `yaml:"policy"`
-	Control     ControlConfig    `yaml:"control"`
-	Limits      LimitsConfig     `yaml:"limits"`
-	Timeouts    TimeoutsConfig   `yaml:"timeouts"`
-	Clients     []ClientConfig   `yaml:"clients"`
-	Accounts    []AccountConfig  `yaml:"accounts"`
-	Routes      []RouteConfig    `yaml:"routes"`
-	ClaudeLogs  ClaudeLogsConfig `yaml:"claude_logs"`
-	HermesLogs  HermesLogsConfig `yaml:"hermes_logs"`
+	HostName    string        `yaml:"host_name"`
+	DataDir     string        `yaml:"data_dir"`
+	PricingFile string        `yaml:"pricing_file"`
+	Quota       QuotaConfig   `yaml:"quota"`
+	Policy      PolicyConfig  `yaml:"policy"`
+	Control     ControlConfig `yaml:"control"`
+	Limits      LimitsConfig  `yaml:"limits"`
+	// Budgets is the optional spend-control block. A nil value disables spend
+	// controls entirely, leaving behavior unchanged.
+	Budgets    *BudgetConfig    `yaml:"budgets"`
+	Timeouts   TimeoutsConfig   `yaml:"timeouts"`
+	Clients    []ClientConfig   `yaml:"clients"`
+	Accounts   []AccountConfig  `yaml:"accounts"`
+	Routes     []RouteConfig    `yaml:"routes"`
+	ClaudeLogs ClaudeLogsConfig `yaml:"claude_logs"`
+	HermesLogs HermesLogsConfig `yaml:"hermes_logs"`
 }
 
 // ClaudeLogsConfig controls ingestion of Claude Code transcript token usage.
@@ -94,6 +98,182 @@ type LimitsConfig struct {
 	// MaxConcurrentPerClient caps a single authenticated client. Clients not
 	// listed here are limited only by the global cap. 0 = unlimited.
 	MaxConcurrentPerClient map[string]int `yaml:"max_concurrent_per_client"`
+}
+
+// BudgetConfig is the optional spend-control block (yaml: budgets). A nil
+// *BudgetConfig disables spend controls entirely, so a config that omits the
+// block behaves exactly as before. Every amount is an exact decimal USD string
+// parsed with budget.ParseUSD and never through float64, so no binary rounding
+// participates in a budget decision. An omitted daily/monthly limit is
+// unlimited; an explicit "0" is a real zero budget that denies every
+// reservation.
+type BudgetConfig struct {
+	// ReserveUSD is the fixed per-attempt reservation, as an exact decimal USD
+	// string. It is required, and must be positive, whenever the block is
+	// present: there is no default and no estimation formula. This is a fixed
+	// reservation only — it is explicitly NOT a cap on the external provider
+	// bill, which can exceed it.
+	ReserveUSD string `yaml:"reserve_usd"`
+	// Clients maps a configured client name to that client's ceilings.
+	Clients map[string]BudgetLimits `yaml:"clients"`
+	// Accounts maps a configured account id to that account's ceilings. Any
+	// configured account is accepted, including a quota-only provider claude
+	// account: it cannot serve inference and so cannot spend, but it may still
+	// carry a ceiling.
+	Accounts map[string]BudgetLimits `yaml:"accounts"`
+}
+
+// BudgetLimits is one client's or account's optional day and month ceilings. A
+// nil pointer is an omitted limit, meaning that budget is unlimited; a non-nil
+// pointer holds the exact decimal USD string the operator wrote, including "0"
+// for a zero budget. The string is never converted to float64.
+type BudgetLimits struct {
+	DailyUSD   *string `yaml:"daily_usd"`
+	MonthlyUSD *string `yaml:"monthly_usd"`
+}
+
+// Limits converts this ceiling into budget.Limit values for scope and key, in
+// day-then-month order. An omitted (nil) period amount contributes no entry —
+// that (scope, key, period) budget is unlimited — while a present amount,
+// including "0", contributes exactly one. Each present amount is parsed with
+// budget.ParseUSD, the same exact-decimal rule Validate enforces, so a parent
+// runtime adapter building the limits for budget.Store.Reserve cannot drift
+// from what the config validated.
+func (l BudgetLimits) Limits(scope, key string) ([]budget.Limit, error) {
+	var out []budget.Limit
+	for _, f := range []struct {
+		period string
+		amount *string
+	}{
+		{budget.PeriodDay, l.DailyUSD},
+		{budget.PeriodMonth, l.MonthlyUSD},
+	} {
+		if f.amount == nil {
+			continue
+		}
+		micros, err := budget.ParseUSD(*f.amount)
+		if err != nil {
+			return nil, fmt.Errorf("budget %s %q %s: %w", scope, key, f.period, err)
+		}
+		out = append(out, budget.Limit{Scope: scope, Key: key, Period: f.period, Micros: micros})
+	}
+	return out, nil
+}
+
+// Limits returns every ceiling in the block as budget.Limit values — clients
+// then accounts — for a parent runtime adapter to pass to
+// budget.Store.Reserve. A nil receiver (spend controls disabled) returns nil.
+func (b *BudgetConfig) Limits() ([]budget.Limit, error) {
+	if b == nil {
+		return nil, nil
+	}
+	var out []budget.Limit
+	for name, l := range b.Clients {
+		ls, err := l.Limits(budget.ScopeClient, name)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ls...)
+	}
+	for id, l := range b.Accounts {
+		ls, err := l.Limits(budget.ScopeAccount, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ls...)
+	}
+	return out, nil
+}
+
+// ReservationMicros parses ReserveUSD into integer micro-USD with
+// budget.ParseUSD. It is the fixed per-attempt reservation, not a cap on the
+// provider bill. A nil receiver (spend controls disabled) is an error.
+func (b *BudgetConfig) ReservationMicros() (int64, error) {
+	if b == nil {
+		return 0, errors.New("budgets disabled")
+	}
+	return budget.ParseUSD(b.ReserveUSD)
+}
+
+// validate checks a present budgets block. reserve_usd is required and must be
+// an explicit positive exact decimal: there is no default and no estimation,
+// because this reservation is a fixed per-attempt hold, not a cap on the
+// external provider bill. At least one ceiling must be configured; every
+// client and account key must name something this config already defines (a
+// configured claude account is fine even though it cannot serve inference, it
+// simply cannot spend); and every present amount must parse exactly as a
+// nonnegative USD decimal, so a negative, malformed, or overflowing value is
+// rejected rather than silently dropping spend controls. An omitted period
+// amount is unlimited; an explicit "0" is a real zero budget.
+func (b *BudgetConfig) validate(knownClients, knownAccounts map[string]bool) []error {
+	var errs []error
+	micros, err := budget.ParseUSD(b.ReserveUSD)
+	switch {
+	case err != nil:
+		errs = append(errs, fmt.Errorf("budgets.reserve_usd %q: %w", b.ReserveUSD, err))
+	case micros == 0:
+		errs = append(errs, fmt.Errorf("budgets.reserve_usd %q must be positive when budgets are enabled", b.ReserveUSD))
+	}
+	// Count present amounts, not map entries: an empty entry or a null/blank
+	// amount is unlimited, so a block made only of those enforces nothing.
+	ceilings := 0
+	for _, lim := range b.Clients {
+		ceilings += lim.present()
+	}
+	for _, lim := range b.Accounts {
+		ceilings += lim.present()
+	}
+	if ceilings == 0 {
+		errs = append(errs, errors.New("budgets: at least one client or account daily_usd/monthly_usd ceiling is required when budgets are enabled"))
+	}
+	for name, lim := range b.Clients {
+		if name == "" || !knownClients[name] {
+			errs = append(errs, fmt.Errorf("budgets.clients names unknown client %q", name))
+		}
+		errs = append(errs, lim.validate(fmt.Sprintf("budgets.clients[%s]", name))...)
+	}
+	for id, lim := range b.Accounts {
+		if id == "" || !knownAccounts[id] {
+			errs = append(errs, fmt.Errorf("budgets.accounts names unknown account %q", id))
+		}
+		errs = append(errs, lim.validate(fmt.Sprintf("budgets.accounts[%s]", id))...)
+	}
+	return errs
+}
+
+// present counts the period amounts that are set (non-nil), i.e. the ceilings
+// this entry contributes.
+func (l BudgetLimits) present() int {
+	n := 0
+	if l.DailyUSD != nil {
+		n++
+	}
+	if l.MonthlyUSD != nil {
+		n++
+	}
+	return n
+}
+
+// validate checks the two optional period amounts under prefix. A nil amount
+// is an omitted limit (unlimited) and contributes nothing; a present amount is
+// parsed with budget.ParseUSD.
+func (l BudgetLimits) validate(prefix string) []error {
+	var errs []error
+	for _, f := range []struct {
+		name   string
+		amount *string
+	}{
+		{"daily_usd", l.DailyUSD},
+		{"monthly_usd", l.MonthlyUSD},
+	} {
+		if f.amount == nil {
+			continue
+		}
+		if _, err := budget.ParseUSD(*f.amount); err != nil {
+			errs = append(errs, fmt.Errorf("%s.%s %q: %w", prefix, f.name, *f.amount, err))
+		}
+	}
+	return errs
 }
 
 // TimeoutsConfig bounds inbound request handling. Every value must be
@@ -171,6 +351,33 @@ type RouteConfig struct {
 	UpstreamModel string   `yaml:"upstream_model"`
 	Interactive   []string `yaml:"interactive"`
 	Background    []string `yaml:"background"`
+	// Upstreams, when non-empty, opts the route into capability routing. It
+	// maps a candidate account id (from interactive ∪ background) to its
+	// capability descriptor; a descriptor is required for every candidate and
+	// unknown keys are rejected. Absent/empty preserves the legacy
+	// unconstrained route.
+	Upstreams map[string]UpstreamSpec `yaml:"upstreams"`
+}
+
+// UpstreamSpec is one candidate account's capability descriptor inside
+// routes[].upstreams. It is a config mirror of core.UpstreamSpec.
+type UpstreamSpec struct {
+	// UpstreamModel overrides the route-wide upstream_model for this
+	// candidate; "" inherits the route's upstream_model (which, when also
+	// empty, forwards the client model unchanged).
+	UpstreamModel string `yaml:"upstream_model"`
+	// Protocols is required (non-empty) when the route opts in: an explicit
+	// subset of {"chat", "responses"}. Codex accounts cannot serve "chat".
+	Protocols []string `yaml:"protocols"`
+	// InputModalities is required (non-empty) when the route opts in: an
+	// explicit subset of {"text", "image"}. Declaring only "image" is a
+	// vision-only candidate and does not imply "text".
+	InputModalities []string `yaml:"input_modalities"`
+	// Tools / JSONSchema / Stream are tri-state by convention: absent (false)
+	// means the optional feature is unsupported for this candidate.
+	Tools      bool `yaml:"tools"`
+	JSONSchema bool `yaml:"json_schema"`
+	Stream     bool `yaml:"stream"`
 }
 
 // Duration parses Go duration strings in YAML.
@@ -521,6 +728,7 @@ func (c *Config) Validate() error {
 				errs = append(errs, fmt.Errorf("route %s: account %q is a quota-only claude account and cannot serve inference", r.Name, id))
 			}
 		}
+		errs = append(errs, validateUpstreams(r, provider)...)
 	}
 	if c.ClaudeLogs.Enabled {
 		if c.ClaudeLogs.Account == "" {
@@ -529,7 +737,97 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("claude_logs.account %q must be a configured claude account", c.ClaudeLogs.Account))
 		}
 	}
+	if c.Budgets != nil {
+		errs = append(errs, c.Budgets.validate(seenC, accts)...)
+	}
 	return errors.Join(errs...)
+}
+
+// Capability-routing vocabulary. Kept unexported: the values are part of the
+// wire/config contract, but proxy/control match them as plain strings so the
+// frozen core package gains no new exported identifiers.
+const (
+	protocolChat      = "chat"
+	protocolResponses = "responses"
+	modalityText      = "text"
+	modalityImage     = "image"
+)
+
+// validateUpstreams enforces the capability-routing contract for one route. A
+// nil/empty Upstreams map means the route is unconstrained (legacy permissive)
+// and is skipped entirely. When the route opts in, every candidate in
+// interactive ∪ background MUST have a descriptor and no other keys may
+// appear; protocols must be an explicit non-empty subset of {chat, responses}
+// with no duplicates (and codex accounts may not advertise chat);
+// input_modalities must be an explicit non-empty subset of {text, image} with
+// no duplicates (declaring image alone is a vision-only candidate and does not
+// imply text). The boolean feature flags are tri-state by absence: false means
+// unsupported, so they need no further validation. Deliberately NOT enforced:
+// requiring an image-capable candidate on a text-only route — capability
+// declarations only narrow a candidate's applicability, they never make a new
+// demand on the route.
+func validateUpstreams(r RouteConfig, provider map[string]string) []error {
+	if len(r.Upstreams) == 0 {
+		return nil
+	}
+	var errs []error
+	cands := map[string]bool{}
+	for _, id := range r.Interactive {
+		cands[id] = true
+	}
+	for _, id := range r.Background {
+		cands[id] = true
+	}
+	for id := range r.Upstreams {
+		if !cands[id] {
+			errs = append(errs, fmt.Errorf("route %s: upstreams names unknown candidate account %q", r.Name, id))
+		}
+	}
+	for id := range cands {
+		if _, ok := r.Upstreams[id]; !ok {
+			errs = append(errs, fmt.Errorf("route %s: upstreams is missing a descriptor for candidate %q", r.Name, id))
+		}
+	}
+	for id, spec := range r.Upstreams {
+		if len(spec.Protocols) == 0 {
+			errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: protocols must be a non-empty subset of chat,responses", r.Name, id))
+		} else {
+			seen := map[string]bool{}
+			for _, p := range spec.Protocols {
+				p = strings.TrimSpace(p)
+				if p != protocolChat && p != protocolResponses {
+					errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: invalid protocol %q (want chat or responses)", r.Name, id, p))
+					continue
+				}
+				if seen[p] {
+					errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: duplicate protocol %q", r.Name, id, p))
+					continue
+				}
+				seen[p] = true
+				if p == protocolChat && provider[id] == core.ProviderCodex {
+					errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: codex accounts cannot serve chat", r.Name, id))
+				}
+			}
+		}
+		if len(spec.InputModalities) == 0 {
+			errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: input_modalities must be a non-empty subset of text,image", r.Name, id))
+			continue
+		}
+		seen := map[string]bool{}
+		for _, m := range spec.InputModalities {
+			m = strings.TrimSpace(m)
+			if m != modalityText && m != modalityImage {
+				errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: invalid input modality %q (want text or image)", r.Name, id, m))
+				continue
+			}
+			if seen[m] {
+				errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: duplicate input modality %q", r.Name, id, m))
+				continue
+			}
+			seen[m] = true
+		}
+	}
+	return errs
 }
 
 // CoreAccounts converts account config into core.Account values.
@@ -546,7 +844,10 @@ func (c *Config) CoreAccounts() []core.Account {
 }
 
 // CoreRoutes converts route config into core.Route values. A route with no
-// background list falls back to its interactive list.
+// background list falls back to its interactive list. The projection is a
+// deep copy: every map and slice is freshly allocated (and the new capability
+// descriptors have their whitespace trimmed), so a returned core.Route never
+// aliases the loaded config and callers cannot mutate shared state.
 func (c *Config) CoreRoutes() []core.Route {
 	out := make([]core.Route, 0, len(c.Routes))
 	for _, r := range c.Routes {
@@ -554,7 +855,42 @@ func (c *Config) CoreRoutes() []core.Route {
 		if len(bg) == 0 {
 			bg = r.Interactive
 		}
-		out = append(out, core.Route{Name: r.Name, Models: r.Models, UpstreamModel: r.UpstreamModel, Interactive: r.Interactive, Background: bg})
+		var ups map[string]core.UpstreamSpec
+		if len(r.Upstreams) > 0 {
+			ups = make(map[string]core.UpstreamSpec, len(r.Upstreams))
+			for id, s := range r.Upstreams {
+				ups[id] = core.UpstreamSpec{
+					UpstreamModel:   strings.TrimSpace(s.UpstreamModel),
+					Protocols:       copyTrimmed(s.Protocols),
+					InputModalities: copyTrimmed(s.InputModalities),
+					Tools:           s.Tools,
+					JSONSchema:      s.JSONSchema,
+					Stream:          s.Stream,
+				}
+			}
+		}
+		out = append(out, core.Route{
+			Name:          r.Name,
+			Models:        append([]string(nil), r.Models...),
+			UpstreamModel: r.UpstreamModel,
+			Interactive:   append([]string(nil), r.Interactive...),
+			Background:    append([]string(nil), bg...),
+			Upstreams:     ups,
+		})
+	}
+	return out
+}
+
+// copyTrimmed returns a whitespace-trimmed copy of in, or nil when in is empty
+// (an empty slice means "text only" for input_modalities). It never aliases
+// the caller's slice.
+func copyTrimmed(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, len(in))
+	for i, v := range in {
+		out[i] = strings.TrimSpace(v)
 	}
 	return out
 }

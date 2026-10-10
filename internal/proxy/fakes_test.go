@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -208,21 +209,32 @@ func (b *syncBuffer) String() string {
 
 // harness wires a Proxy to fakes and per-account upstream servers.
 type harness struct {
-	t        *testing.T
-	policy   *fakePolicy
-	creds    *fakeCreds
-	quota    *fakeQuota
-	ledger   *fakeLedger
-	logs     *syncBuffer
+	t      *testing.T
+	policy *fakePolicy
+	creds  *fakeCreds
+	quota  *fakeQuota
+	ledger *fakeLedger
+	logs   *syncBuffer
+	// logHandler, when set before start(), replaces the default text handler.
+	// Tests that decode structured records install a JSON handler writing to
+	// logs; leaving it nil preserves the original text output.
+	logHandler slog.Handler
+	// clock, when set before start(), replaces fixedClock{testNow}.
+	clock    core.Clock
 	limiter  Limiter
 	lim      *fakeLimiter
 	gates    []chan struct{} // upstream handlers blocked until closed
 	accounts map[string]core.Account
 	routes   []core.Route
 	opts     Options
-	clock    core.Clock  // nil means fixedClock{testNow}
 	pol      core.Policy // nil means the fake policy
-	srv      *httptest.Server
+	// budget, when set before start(), is installed as Deps.Budget.
+	budget Budget
+	// led, when set before start(), replaces the fake ledger as Deps.Ledger.
+	led core.Ledger
+	srv *httptest.Server
+	// handled counts proxy handler invocations that have returned.
+	handled atomic.Int64
 }
 
 func newHarness(t *testing.T) *harness {
@@ -276,6 +288,22 @@ func (h *harness) start() {
 			h.srv.Close()
 		}
 	})
+	ph := h.newProxy().Handler()
+	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer h.handled.Add(1)
+		ph.ServeHTTP(w, r)
+	}))
+	h.t.Cleanup(h.srv.Close)
+}
+
+// newProxy builds the harness's proxy from its fakes and every optional
+// override (logHandler, clock, pol, budget, led), for start() and for tests
+// that drive the handler directly.
+func (h *harness) newProxy() *Proxy {
+	var handler slog.Handler = slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})
+	if h.logHandler != nil {
+		handler = h.logHandler
+	}
 	var clock core.Clock = fixedClock{testNow}
 	if h.clock != nil {
 		clock = h.clock
@@ -284,10 +312,14 @@ func (h *harness) start() {
 	if h.pol != nil {
 		pol = h.pol
 	}
-	p := New(Deps{
+	var led core.Ledger = h.ledger
+	if h.led != nil {
+		led = h.led
+	}
+	return New(Deps{
 		Accounts: h.accounts, Routes: h.routes, Creds: h.creds, Quota: h.quota,
-		Policy: pol, Ledger: h.ledger, Clock: clock, Limiter: h.limiter,
-		Logger: slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		Policy: pol, Ledger: led, Clock: clock, Limiter: h.limiter, Budget: h.budget,
+		Logger: slog.New(handler),
 		Authenticate: func(bearer string) (core.Client, bool) {
 			switch bearer {
 			case clientKey:
@@ -298,8 +330,20 @@ func (h *harness) start() {
 			return core.Client{}, false
 		},
 	}, h.opts)
-	h.srv = httptest.NewServer(p.Handler())
-	h.t.Cleanup(h.srv.Close)
+}
+
+// waitHandled waits until n proxy handler invocations have returned, so
+// nothing the handler does synchronously (ledger rows, log records) can still
+// be pending.
+func (h *harness) waitHandled(n int) {
+	h.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.handled.Load() < int64(n) {
+		if time.Now().After(deadline) {
+			h.t.Fatalf("timed out waiting for %d handlers to return, have %d", n, h.handled.Load())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func (h *harness) post(path, key, body string, hdr map[string]string) *http.Response {
