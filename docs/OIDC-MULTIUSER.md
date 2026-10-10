@@ -35,7 +35,9 @@ sessions and static-key registry in `identity.db`), `internal/authz` and
   that also carries `Authorization` gets 400.
 - **Users are identified by an exact (issuer, `sub`) pair** and receive an
   opaque ID (`u_` followed by 26 base32 characters). Email and display name are
-  stored for display only. They are never used for matching, and they never
+  stored for display only, with control and Unicode format characters (bidi,
+  zero-width) removed; key names containing them are refused. Admin
+  confirmations show the email and user ID as well as the name. They are never used for matching, and they never
   appear in the ledger or budgets.
 - **There is no SCIM, no IdP push and no refresh token.** LocalRouter learns
   about changes at the IdP only when that person logs in again (see
@@ -82,7 +84,7 @@ below the ceilings.
 | `oidc.allow_private_network` | `false` | Lets the IdP resolve to loopback, RFC 1918, CGNAT or ULA addresses. Link-local and metadata addresses stay blocked. |
 | `oidc.extra_endpoint_hosts` | `[]` | Bare host names that discovery may use besides the issuer host. |
 | `oidc.http_timeout` | `10s` | At most `60s`. |
-| `access.claim` | — | Required. The ID-token claim (string or string array) to match, e.g. `groups` or `roles`. Identity and profile claims (`sub`, `email`, `name`, …, `hasgroups`) are refused. |
+| `access.claim` | — | Required. The ID-token claim (string or string array) to match, e.g. `groups` or `roles`. It must be a claim only an IdP administrator can set. JWT/OIDC protocol claims, every OIDC standard profile claim (`name`, `nickname`, `given_name`, `website`, `locale`, …) and provider identity claims (`tid`, `oid`, `upn`, `idp`, `hasgroups`, …) are refused; matching is exact and case-sensitive. |
 | `access.user_values` / `admin_values` | — | Exact, case-sensitive values. At least one value overall, and no value in both lists. |
 | `access.admin_subjects` | — | Exact `sub` values to promote to admin. Each still needs an allowed claim value. You need `admin_values` or `admin_subjects`. |
 | `keys.max_ttl` | `2160h` (90 d) | Ceiling. Default lifetime of a new key. Tightening it also shortens existing keys. |
@@ -99,7 +101,11 @@ Shorter session lifetimes apply to newly created sessions. Existing sessions
 retain their stored deadlines (never beyond the original 24h/8h ceilings);
 disable the user to revoke them immediately.
 
-The `identity` block is restart-only. Run `localrouter check -config PATH`
+The `identity` block is restart-only (see §6 for what an access-policy change
+does at restart). In multi-user mode a reload runs the same file checks as
+startup and `check`. A failure keeps the running configuration and reports
+`configuration invalid`. No static client key may equal the client secret,
+even from a separate file. Run `localrouter check -config PATH`
 after every edit. It validates the block and checks the secret file's mode,
 size and content without printing it. It also rejects a `k_`/`u_` client name
 and a static key file that starts with the reserved `lrk_` prefix.
@@ -116,13 +122,18 @@ Configure the provider like this:
    `<public_base_url>/auth/callback`; do not use a wildcard or regex.
 2. **Signing.** Asymmetric ID-token signing (RS256 unless `signing_algs`
    says otherwise).
-3. **`auth_time`.** The ID token must carry `auth_time`. The callback accepts
+3. **Immutable `sub`.** LocalRouter identifies a person only by the exact
+   (issuer, `sub`) pair, and `admin_subjects` match `sub`. The provider must
+   issue a `sub` that never changes and is never reassigned. A `sub` derived
+   from a username or email that users can edit lets one user take over
+   another's account.
+4. **`auth_time`.** The ID token must carry `auth_time`. The callback accepts
    it only if it falls between 5 minutes before the login started and 5
    minutes after now. If it is missing or older, the login fails with
    `stale_auth`. This prevents an old IdP session from renewing the 30-day key
    window. A provider that honours neither `max_age=0` nor `prompt=login`
    therefore fails closed for users with an older IdP session.
-4. **Access claim.** The ID token itself must carry `access.claim`.
+5. **Access claim.** The ID token itself must carry `access.claim`.
    LocalRouter never calls userinfo and never follows distributed claims. The
    claim is evaluated as follows:
    - A string or array of strings is matched exactly.
@@ -133,7 +144,7 @@ Configure the provider like this:
      `claim: groups`.
    - Denying a known user also revokes all of their keys, sessions and owned
      static keys.
-5. **Discovery.** Discovery is fetched lazily at the first login, with no
+6. **Discovery.** Discovery is fetched lazily at the first login, with no
    redirects, a body cap and a timeout. `/readyz` reflects only the local
    identity database, never IdP reachability.
 
@@ -180,6 +191,9 @@ Facts are from the [OAuth2 provider docs][a-doc] and the authentik source
 commit `a40205dc`, fetched 2026-10-10).
 
 - Create an OAuth2/OpenID provider with client type **Confidential**.
+- **Keep Subject mode at "Based on the User's hashed ID"** (the default) or
+  use the user's UUID. The username, email and UPN modes make `sub` editable,
+  and authentik does not require unique emails.
 - Set a strict redirect URI. If the field is left empty, authentik stores
   whichever URI is used first.
 - **Select a Signing Key.** Without one, authentik signs with HS256 using the
@@ -209,7 +223,8 @@ in the config, and every admin also needs an allowed claim value.
    Roles are taken from the claim at every login.
 3. Each person signs in and creates keys in the UI. Every key has a name and
    an expiry of at most `max_ttl`. The token is shown once and never stored in
-   plaintext. Applications send it as `Authorization: Bearer lrk_…` to
+   plaintext. Key lists show every live key first, then the newest revoked or
+   expired ones (at most 200 in total). Applications send it as `Authorization: Bearer lrk_…` to
    `/v1/*`.
 4. **Static key owned by a user (optional).** The owner signs in once. Find
    their ID with `localrouter users list -config PATH` or in the admin UI.
@@ -251,6 +266,15 @@ in the config, and every admin also needs an allowed claim value.
   1. Enable the user (after a disable).
   2. Wait for the user's next allowed login.
   3. Write a new key to the file and reload.
+- **Narrowing the access policy in the config takes effect at restart.** At
+  every start the `access` block is compared with the one recorded in
+  `identity.db`. It counts as narrowed if `claim` changed, an admin value or
+  admin subject was removed, or a user value is no longer in `user_values` or
+  `admin_values`. On a narrowing, every session ends, every admin becomes a
+  user, and every user's keys and owned static keys stop working until that
+  person's next allowed login. The keys are suspended, not revoked. The
+  audit log records `access_policy.narrowed` and the server log warns. Adding
+  values, or restarting with the same policy, changes nothing.
 - **IdP-side removal is not immediate.**
   - If the person attempts a new login after being removed from the allowed
     groups, LocalRouter denies it and revokes everything.
@@ -312,7 +336,7 @@ one fixed code:
 
 | Principal | status / diagnostics / budgets | usage / analytics / dimensions | admit | ingest |
 |---|---|---|---|---|
-| user key, `role: user` static key | 403 | own data only (`filter.user` rejected) | `{class, model}` only, see below | 403 |
+| user key, `role: user` static key | 403 | own data only (`filter.user`, `group=account` and `filter.account` rejected; usage groups by `model` by default) | `{class, model}` only, see below | 403 |
 | `role: service` | global | all users | full, as in single-user mode | only with `ingest: true` |
 
 For a user key, admit returns only the decision. `account_id` is empty, and
@@ -320,6 +344,21 @@ For a user key, admit returns only the decision. `account_id` is empty, and
 only the caller's own client and user buckets, so a shared account ceiling
 that is exhausted does not show there (the proxy still enforces it). The
 `{class, account}` form returns 403 whether or not the account exists.
+
+**Inference requests** (`/v1/*`, every principal, multi-user mode only). The
+upstream accounts are shared, so request fields that pick other models or
+providers, change billing, or refer to state stored on the account are
+refused with 400 `field "<name>" is not allowed on this gateway`. Key names
+are matched case-insensitively:
+- always refused: `models`, `route`, `provider`, `plugins`, `transforms`,
+  `preset`;
+- `service_tier` unless `null`, `"auto"` or `"default"`; `background` unless
+  `null` or `false`;
+- `previous_response_id`, `conversation` and `prompt` unless `null`.
+
+A non-OpenRouter 429/403 that reports a request-size error (context length,
+"Request too large") is returned as final and does not cool the account down
+or fail over.
 
 **Inference responses** (`/v1/*`, every principal, multi-user mode only):
 - Relayed responses carry only `Content-Type` and a registered
@@ -347,6 +386,8 @@ localrouter users delete  -config PATH --yes USER_ID   # irreversible
 **Recovery when no admin can log in.**
 1. Use `users enable` if the admin was disabled.
 2. Fix `admin_values`/`admin_subjects` or the IdP assignment, then restart.
+   Removing an admin value or subject on restart ends every session and
+   demotes every admin until they sign in again (§6).
 3. Sign in again.
 
 A deleted subject can never be re-provisioned, so delete only when that is
@@ -361,6 +402,9 @@ intended.
   Multi-user mode also creates `identity.db` at schema 2. Older binaries
   refuse to start on these files ("database schema version … is newer than
   supported"). To roll back, restore the pre-upgrade backup.
+- **First start of this version with existing users** records the access
+  policy for the first time and treats that as a narrowing (§6). Everyone,
+  admins included, signs in once more before their keys work again.
 - **Owned static keys of users disabled before the upgrade.** Rotate them
   after the owner's next login. The new registry has no record of the older
   disable, so a key it has never seen is accepted if the owner is now active
@@ -384,7 +428,8 @@ intended.
   - Email and name are cleared.
   - Every key is revoked, and key names and digests are wiped.
   - Sessions and the owner's static-key digests are deleted.
-  - The issuer and subject are replaced by a digest tombstone.
+  - The issuer and subject are replaced by an unkeyed SHA-256 tombstone, so
+    anyone holding the file can confirm a guessed subject.
 
   Removing the old values from the SQLite file and WAL is best effort. While
   another reader (the CLI or a backup) holds an older snapshot, the cleanup is
