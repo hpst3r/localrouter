@@ -4,7 +4,9 @@ import (
 	"math"
 	"net/http"
 	"regexp"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/hpst3r/localrouter/internal/budget"
 	"github.com/hpst3r/localrouter/internal/identity"
@@ -87,6 +89,12 @@ func (s *Server) meCreateKey(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ttl = time.Duration(n) * time.Second
+	}
+	// Format characters (bidi controls, zero-width, BOM) could make a name
+	// read as something else in key lists and admin dialogs.
+	if strings.ContainsFunc(req.Name, func(r rune) bool { return unicode.Is(unicode.Cf, r) }) {
+		identityFailed(w, identity.ErrInvalid)
+		return
 	}
 	k, err := s.deps.Identity.CreateKey(r.Context(), a.principal.UserID, req.Name, ttl)
 	if err != nil {

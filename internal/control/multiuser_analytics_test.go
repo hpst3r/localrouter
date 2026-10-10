@@ -106,7 +106,11 @@ func TestMultiUserDimensionsScoped(t *testing.T) {
 		}
 	}
 	for _, dim := range core.AnalyticsDimensions {
-		if _, ok := doc.Dimensions[dim]; !ok {
+		_, ok := doc.Dimensions[dim]
+		if dim == "account" && ok {
+			t.Fatal("account dimension exposed to a user scope")
+		}
+		if dim != "account" && !ok {
 			t.Fatalf("missing legacy dimension %s", dim)
 		}
 	}

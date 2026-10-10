@@ -339,7 +339,9 @@ func idpErrorCode(e string) string {
 }
 
 // Informational claims are display-only. They are bounded and stripped of
-// control characters; an email that does not fit is dropped rather than cut.
+// control and format characters (bidi overrides and isolates, zero-width
+// characters, BOM, soft hyphen); an email that does not fit is dropped rather
+// than cut, and a value left with only whitespace is empty.
 const (
 	maxEmailLen   = 254
 	maxDisplayLen = 128
@@ -348,12 +350,16 @@ const (
 func infoString(v any) string {
 	str, _ := v.(string)
 	str = strings.ToValidUTF8(str, "")
-	return strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+	str = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
 			return -1
 		}
 		return r
 	}, str)
+	if strings.TrimSpace(str) == "" {
+		return ""
+	}
+	return str
 }
 
 func sanitizeEmail(v any) string {

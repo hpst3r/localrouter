@@ -52,8 +52,8 @@ func TestOwnUsageScopedBeforeRankingAndOther(t *testing.T) {
 		if strings.Join(keys, ",") != "m-alice-big,"+core.AnalyticsOtherKey {
 			t.Errorf("%s top-1 series = %v", name, keys)
 		}
-		for _, q := range []string{"usage?group=model", "usage?group=client", "usage?group=key", "usage?group=account",
-			"analytics?range=24h&group=account", "analytics/dimensions?range=24h"} {
+		for _, q := range []string{"usage?group=model", "usage?group=client", "usage?group=key", "usage",
+			"analytics?range=24h&group=route", "analytics/dimensions?range=24h"} {
 			r := get(q)
 			wantStatus(t, r, http.StatusOK)
 			for _, s := range foreign {

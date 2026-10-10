@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/authz"
@@ -183,8 +184,13 @@ func (s *Server) widgetRedirect(w http.ResponseWriter, r *http.Request) {
 // scopedGroups adds the owner dimensions of a scoped read to base. "key" is open to
 // every scope (an owner sees only their own key ids, because the owner
 // predicate is applied before grouping); "user" is a global-reader dimension.
+// "account" is removed for an owner scope: account ids are operator
+// configuration that admit also withholds from ordinary users.
 func scopedGroups(base []string, scope core.DataScope) []string {
 	out := append([]string(nil), base...)
+	if !scope.AllUsers {
+		out = slices.DeleteFunc(out, func(d string) bool { return d == "account" })
+	}
 	out = append(out, "key")
 	if scope.AllUsers {
 		out = append(out, "user")
