@@ -671,3 +671,45 @@ test("generic tables group thousands and label USD columns", async () => {
   assert.deepEqual(table, ["Key", "Input tokens", "Cost (USD)"]);
   assert.deepEqual(rowsOf(t.$("usage-summary"))[0].map((c) => c.textContent), ["m", "1,234,567", "$2.0000"]);
 });
+
+// Admin confirmations name the target by opaque id (and email) as well as
+// display name, so two users with look-alike IdP names cannot be confused.
+test("admin confirmations identify the target user and key by id", async () => {
+  const L = "\u201c", R = "\u201d";
+  const t = await adminUsers({
+    "GET /ui/v1/admin/users/u_a/keys": { status: 200, body: keysDoc },
+    "GET /ui/v1/admin/users": {
+      status: 200,
+      body: {
+        users: [
+          userRow("u_self", "active", { role: "admin" }),
+          userRow("u_a", "active", { display_name: "Alice" }),
+          userRow("u_n", "disabled", { display_name: "", email: "" }),
+        ],
+      },
+    },
+  });
+  const confirmText = async (row, label) => {
+    rowButton(t, row, label).click();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(t.$("confirm").open, true);
+    const text = t.$("confirm-text").textContent;
+    t.$("confirm-cancel").click();
+    await t.idle();
+    return text;
+  };
+  const startsWith = (text, want) => assert.ok(text.startsWith(want), JSON.stringify(text) + " should start with " + JSON.stringify(want));
+  startsWith(await confirmText(1, "Disable"), "Disable " + L + "Alice" + R + " (u_a@example.test, u_a)? ");
+  startsWith(await confirmText(1, "Delete"), "Delete " + L + "Alice" + R + " (u_a@example.test, u_a)? ");
+  startsWith(await confirmText(2, "Delete"), "Delete " + L + "u_n" + R + "? ");
+
+  rowButton(t, 1, "Keys").click();
+  await t.idle();
+  descendants(t.$("user-keys-list"), "button").find((b) => b.textContent === "Revoke").click();
+  await new Promise((r) => setImmediate(r));
+  startsWith(t.$("confirm-text").textContent, "Revoke key " + L + HOSTILE + R + " (k_live) of " + L + "Alice" + R + " (u_a@example.test, u_a)? ");
+  t.$("confirm-cancel").click();
+  await t.idle();
+  assert.equal(t.calls.filter((c) => c.method !== "GET").length, 0);
+  assert.deepEqual(t.unknown, []);
+});

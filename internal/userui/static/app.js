@@ -330,11 +330,15 @@
     const rows = usersList.map((u) => {
       const name = str(u.display_name);
       const label = name || str(u.email) || u.id;
+      // Confirmations quote the IdP-supplied label and add the email and
+      // opaque id, which a look-alike display name cannot imitate.
+      const ids = [str(u.email), u.id].filter((v, i, a) => v && v !== label && a.indexOf(v) === i);
+      const target = "\u201c" + label + "\u201d" + (ids.length ? " (" + ids.join(", ") + ")" : "");
       const status = str(u.status);
       const actions = el("span", { class: "row-actions" });
       const button = (text, cls, aria, fn) => {
         const b = el("button", { type: "button", class: cls, "aria-label": aria + " " + label }, text);
-        b.addEventListener("click", () => run(() => fn(u, label)));
+        b.addEventListener("click", () => run(() => fn(u, label, target)));
         actions.appendChild(b);
       };
       button("Keys", null, "Show keys of", showUserKeys);
@@ -353,14 +357,13 @@
     $("users-more").hidden = usersCursor === "";
   }
 
-  async function showUserKeys(u, label) {
+  async function showUserKeys(u, label, target) {
     const base = "/ui/v1/admin/users/" + encodeURIComponent(u.id) + "/keys";
     const list = $("user-keys-list");
     $("user-keys-title").textContent = "Keys of " + label;
     $("user-keys").hidden = false;
     const revoke = async (k) => {
-      const name = str(k.name) || str(k.id);
-      if (!(await confirmAction("Revoke key \u201c" + name + "\u201d of \u201c" + label + "\u201d? Applications using it stop working immediately.", "Revoke key"))) return;
+      if (!(await confirmAction("Revoke key " + keyTarget(k) + " of " + target + "? Applications using it stop working immediately.", "Revoke key"))) return;
       clearError();
       await api("DELETE", base + "/" + encodeURIComponent(k.id));
       showNotice("Key revoked.");
@@ -388,8 +391,15 @@
     await loadUsers(false);
   }
 
-  async function disableUser(u, label) {
-    const msg = "Disable \u201c" + label + "\u201d? Their API keys and sessions are revoked immediately and are not restored if the account is enabled again.";
+  // keyTarget quotes a key's user-chosen name and adds its opaque id.
+  function keyTarget(k) {
+    const id = str(k.id);
+    const name = str(k.name) || id;
+    return "\u201c" + name + "\u201d" + (id && id !== name ? " (" + id + ")" : "");
+  }
+
+  async function disableUser(u, label, target) {
+    const msg = "Disable " + target + "? Their API keys and sessions are revoked immediately and are not restored if the account is enabled again.";
     if (await confirmAction(msg, "Disable user")) await userAction(u, "disable", "User disabled.");
   }
 
@@ -397,8 +407,8 @@
     await userAction(u, "enable", "User enabled.");
   }
 
-  async function deleteUser(u, label) {
-    const msg = "Delete \u201c" + label + "\u201d? Their profile, keys and sessions are removed and they cannot sign in again. This cannot be undone.";
+  async function deleteUser(u, label, target) {
+    const msg = "Delete " + target + "? Their profile, keys and sessions are removed and they cannot sign in again. This cannot be undone.";
     if (await confirmAction(msg, "Delete user")) await userAction(u, "delete", "User deleted.");
   }
 
@@ -517,8 +527,7 @@
   }
 
   async function revokeOwnKey(k) {
-    const label = str(k.name) || str(k.id);
-    if (!(await confirmAction("Revoke key \u201c" + label + "\u201d? Applications using it stop working immediately.", "Revoke key"))) return;
+    if (!(await confirmAction("Revoke key " + keyTarget(k) + "? Applications using it stop working immediately.", "Revoke key"))) return;
     clearError();
     await api("DELETE", "/ui/v1/me/keys/" + encodeURIComponent(k.id));
     showNotice("Key revoked.");
