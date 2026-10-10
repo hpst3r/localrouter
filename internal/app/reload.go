@@ -182,6 +182,13 @@ func (a *App) Reload(path string) (core.ReloadStatus, error) {
 	if err != nil {
 		return a.reloadFailure("configuration invalid", nil, err)
 	}
+	// Multi-user mode reapplies the startup file checks (notably that no key
+	// file aliases the OIDC client secret). Legacy reload is unchanged.
+	if c.Identity != nil {
+		if err = c.CheckFiles(path); err != nil {
+			return a.reloadFailure("configuration invalid", nil, err)
+		}
+	}
 	return a.reloadConfigLocked(c)
 }
 func (a *App) ReloadConfig(c *config.Config) (core.ReloadStatus, error) {
@@ -271,6 +278,18 @@ func (a *App) makeGeneration(c *config.Config, number uint64) (*runtimeGeneratio
 		// The identity block is restart-only; a generation whose mode does
 		// not match the process's open identity runtime is never published.
 		return nil, "identity invalid", errors.New("identity configuration does not match the running identity store")
+	}
+	if multiUser {
+		// Defense in depth beyond CheckFiles' distinct-file rule: a static key
+		// equal in content to the OIDC client secret would make that secret a
+		// live bearer. Lookup compares in constant time; neither value is logged.
+		secret, err := c.Identity.OIDC.ReadClientSecret()
+		if err != nil {
+			return nil, "identity invalid", err
+		}
+		if name, ok := keys.Lookup(secret); ok {
+			return nil, "client keys invalid", errors.New("client " + name + ": a key equals the OIDC client secret")
+		}
 	}
 	lim, err := a.Limiter.ViewWithUsers(c.Limits.MaxConcurrent, c.Limits.MaxConcurrentPerClient, c.Limits.MaxConcurrentPerUser)
 	if err != nil {
