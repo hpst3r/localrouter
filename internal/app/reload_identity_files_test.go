@@ -66,11 +66,23 @@ func TestMakeGenerationRefusesKeyEqualToClientSecret(t *testing.T) {
 	copyKey := filepath.Join(f.dir, "mon.key")
 	bcWrite(t, copyKey, fixtureClientSecret+"\n")
 	f.clients = "  - {name: mon, class: background, key_file: " + copyKey + ", role: service}\n"
-	// Separate files with equal bytes pass CheckFiles; makeGeneration must
-	// still refuse the generation.
-	assertReloadRefusedOldServing(t, a, f.write())
-	if st := a.ReloadStatus(); st.Reason != "client keys invalid" {
-		t.Fatalf("reason = %q, want client keys invalid", st.Reason)
+	path := f.write()
+	// Reload's file checks (CheckFiles) refuse a key equal to the secret.
+	assertReloadRefusedOldServing(t, a, path)
+	if st := a.ReloadStatus(); st.Reason != "configuration invalid" {
+		t.Fatalf("reload reason = %q, want configuration invalid", st.Reason)
+	}
+	// ReloadConfig skips CheckFiles; makeGeneration must still refuse.
+	before := a.ReloadStatus().Generation
+	st, err := a.ReloadConfig(f.load())
+	if err == nil || st.OK || st.Generation != before || st.Reason != "client keys invalid" {
+		t.Fatalf("ReloadConfig = %+v, %v; want refused with client keys invalid", st, err)
+	}
+	if strings.Contains(err.Error(), fixtureClientSecret) {
+		t.Fatalf("refusal leaks the client secret: %v", err)
+	}
+	if w := serve(a, "GET", "/control/v1/status", "", withBearer(fixtureClientSecret)); w.Code != http.StatusUnauthorized {
+		t.Fatalf("OIDC client secret as bearer: %d, want 401", w.Code)
 	}
 }
 
