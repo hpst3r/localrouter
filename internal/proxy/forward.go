@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hpst3r/localrouter/internal/budget"
 	"github.com/hpst3r/localrouter/internal/core"
 	"github.com/hpst3r/localrouter/internal/routing"
 )
@@ -147,19 +148,54 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		}
 		rec.UpstreamIdentity = cred.Identity
 
+		// Reserve budget AFTER the credential is resolved — so a credential
+		// failure never places a hold — and immediately before the send, on
+		// every attempt including this loop's credential-refresh retry. A
+		// reservation error is terminal: a denied client must not fail over
+		// onto another account's budget, and a store error must not be papered
+		// over by spending. Neither is settled, because neither was reserved.
+		if p.deps.Budget != nil {
+			if err := p.deps.Budget.Reserve(ctx, rec); err != nil {
+				lease.Release(core.Outcome{})
+				if errors.Is(err, budget.ErrExceeded) {
+					p.log.Info("budget exceeded", "client", rec.Client, "class", req.class,
+						"account", acctID, "model", req.model)
+					rec.Error = "budget exceeded"
+					p.record(ctx, rec)
+					writeError(w, http.StatusTooManyRequests, "localrouter: budget exceeded", "budget_exceeded")
+					return attemptResult{done: true}
+				}
+				// A client that went away mid-Reserve is a disconnect, not a
+				// store outage: nothing was reserved and nobody reads a reply.
+				if ctx.Err() != nil {
+					rec.Error = "client disconnected"
+					p.record(ctx, rec)
+					return attemptResult{done: true}
+				}
+				// Log a sanitized class only: the store's own error text can
+				// embed filesystem paths or DSNs.
+				p.log.Error("budget reserve failed", "client", rec.Client, "account", acctID,
+					"class", budgetErrClass(err))
+				rec.Error = "budget store error"
+				p.record(ctx, rec)
+				writeError(w, http.StatusServiceUnavailable, "localrouter: budget store unavailable", "budget_store_error")
+				return attemptResult{done: true}
+			}
+		}
+
 		resp, err := p.send(upCtx, req, account, cred)
 		if err != nil {
 			if ctx.Err() != nil {
 				lease.Release(core.Outcome{})
 				rec.Error = "client disconnected"
-				p.record(ctx, rec)
+				p.recordBudget(ctx, rec)
 				return attemptResult{done: true}
 			}
 			msg := sanitizeErr(err)
 			p.log.Warn("upstream transport error", "account", acctID, "model", req.model, "err", msg)
 			lease.Release(core.Outcome{})
 			rec.Error = "upstream transport error: " + msg
-			p.record(ctx, rec)
+			p.recordBudget(ctx, rec)
 			return p.noResponse(w, canFailover, "upstream unreachable")
 		}
 		p.deps.Quota.ObserveHeaders(acctID, resp.Header)
@@ -179,7 +215,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			rec.Status = status
 			rec.Error = errIdleErrorBody
 			p.log.Warn("upstream idle timeout reading error body", "account", acctID, "model", req.model, "status", status)
-			p.record(ctx, rec)
+			p.recordBudget(ctx, rec)
 			if canFailover && retryableFor(account.Provider, status) {
 				return attemptResult{failure: f}
 			}
@@ -202,7 +238,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			rec.Status = status
 			rec.Error = "upstream " + strconv.Itoa(status) + "; retrying with refreshed credential"
 			p.log.Info("upstream auth rejected; refreshing credential", "account", acctID, "status", status)
-			p.record(ctx, rec)
+			p.recordBudget(ctx, rec)
 			continue
 		}
 
@@ -220,7 +256,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 				rec.Error = errIdleErrorBody
 			}
 			p.log.Info("upstream failure; failing over", "account", acctID, "class", req.class, "model", req.model, "status", status)
-			p.record(ctx, rec)
+			p.recordBudget(ctx, rec)
 			return attemptResult{failure: f}
 		}
 
@@ -483,7 +519,8 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	}
 
 	usage, known := capture.Result()
-	if aborted || idledOut || readErr != nil {
+	incomplete := aborted || idledOut || readErr != nil
+	if incomplete {
 		known = false
 	}
 	out := core.Outcome{Status: resp.StatusCode, UsageKnown: known, BytesToClient: written, RequestScoped: scoped}
@@ -500,7 +537,9 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	}
 	// Provider-reported cost is an independent observation and is only trusted
 	// from OpenRouter; cost fields from other providers are ignored. Read it
-	// after Result above has flushed any final buffered event.
+	// after Result above has flushed any final buffered event. On an incomplete
+	// stream the ledger still keeps it, but it may come from an intermediate
+	// usage record, so the budget settles it only as a lower bound (below).
 	if rec.Provider == core.ProviderOpenRouter {
 		rec.ReportedCostUSD = capture.ReportedCost()
 	}
@@ -515,7 +554,11 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	case resp.StatusCode >= 400:
 		rec.Error = "upstream " + strconv.Itoa(resp.StatusCode)
 	}
-	p.record(ctx, rec)
+	if incomplete {
+		p.recordIncompleteBudget(ctx, rec)
+		return
+	}
+	p.recordBudget(ctx, rec)
 }
 
 // newRecord starts a ledger row for one upstream try.
@@ -573,6 +616,80 @@ func (p *Proxy) record(ctx context.Context, rec core.RequestRecord) {
 	defer cancel()
 	if err := p.deps.Ledger.Record(lctx, rec); err != nil {
 		p.log.Error("ledger record failed", "id", rec.ID, "err", err)
+	}
+}
+
+// recordBudget settles the attempt's budget reservation — when one was taken —
+// on a fresh context, then writes the ledger row. Reserve and Settle are
+// paired here for every path that follows a successful Reserve, including the
+// post-401 credential-refresh retry, each failover account, a transport
+// failure or client cancellation, and the stream relay.
+//
+// Budget is optional: with no Budget installed no reservation was ever placed,
+// so recordBudget is exactly record and the legacy path is unchanged.
+//
+// The settlement context is detached from the request (a cancelled client must
+// never lose its hold) with the same bounded budget the ledger write uses.
+// Settling an attempt the store never reserved returns ErrUnknownReservation;
+// that is a wiring fault and is logged rather than silently absorbed. Any
+// other failure leaves the durable hold in place for the reconciler and is
+// logged with a sanitized class only — the store's own error is not surfaced.
+//
+// Every attempt that reached Settle without a usable cost — an auth retry, a
+// failover, a transport error, an upstream error response — is charged at its
+// full hold under the unknown basis. That is deliberate conservative policy:
+// the proxy cannot prove an attempt that reached the upstream was not billed.
+func (p *Proxy) recordBudget(ctx context.Context, rec core.RequestRecord) {
+	if p.deps.Budget != nil {
+		p.settleBudget(ctx, rec, p.deps.Budget.Settle)
+	}
+	p.record(ctx, rec)
+}
+
+// recordIncompleteBudget is recordBudget for a response relay that ended early
+// (client disconnect, idle timeout, upstream read error). The ledger row keeps
+// any provider-reported cost seen so far, but that cost may come from an
+// intermediate usage record, so the budget settles it with SettleIncomplete:
+// as unknown, charged at max(hold, observed), never as a final cost.
+func (p *Proxy) recordIncompleteBudget(ctx context.Context, rec core.RequestRecord) {
+	if p.deps.Budget != nil {
+		p.settleBudget(ctx, rec, p.deps.Budget.SettleIncomplete)
+	}
+	p.record(ctx, rec)
+}
+
+func (p *Proxy) settleBudget(ctx context.Context, rec core.RequestRecord, settle func(context.Context, core.RequestRecord) error) {
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ledgerTimeout)
+	err := settle(sctx, rec)
+	cancel()
+	switch {
+	case err == nil:
+	case errors.Is(err, budget.ErrUnknownReservation):
+		p.log.Error("budget settlement found no reservation", "id", rec.ID)
+	default:
+		p.log.Error("budget settlement failed; reservation left held for reconciliation",
+			"id", rec.ID, "class", budgetErrClass(err))
+	}
+}
+
+// budgetErrClass maps a budget error to a fixed, sanitized class for logs, so
+// the store's own error text (paths, DSNs, SQLite messages) never reaches them.
+func budgetErrClass(err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, budget.ErrClosed):
+		return "closed"
+	case errors.Is(err, budget.ErrNoStore):
+		return "no_store"
+	case errors.Is(err, budget.ErrInvalid):
+		return "invalid"
+	case errors.Is(err, budget.ErrConflict):
+		return "conflict"
+	default:
+		return "store"
 	}
 }
 

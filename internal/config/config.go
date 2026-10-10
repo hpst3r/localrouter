@@ -13,6 +13,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/hpst3r/localrouter/internal/budget"
 	"github.com/hpst3r/localrouter/internal/core"
 )
 
@@ -27,19 +28,22 @@ type Config struct {
 	// HostName labels usage that happens on this machine: proxied requests
 	// from clients without a host, and the local claude_logs collector.
 	// Default: the short OS hostname, lowercased.
-	HostName    string           `yaml:"host_name"`
-	DataDir     string           `yaml:"data_dir"`
-	PricingFile string           `yaml:"pricing_file"`
-	Quota       QuotaConfig      `yaml:"quota"`
-	Policy      PolicyConfig     `yaml:"policy"`
-	Control     ControlConfig    `yaml:"control"`
-	Limits      LimitsConfig     `yaml:"limits"`
-	Timeouts    TimeoutsConfig   `yaml:"timeouts"`
-	Clients     []ClientConfig   `yaml:"clients"`
-	Accounts    []AccountConfig  `yaml:"accounts"`
-	Routes      []RouteConfig    `yaml:"routes"`
-	ClaudeLogs  ClaudeLogsConfig `yaml:"claude_logs"`
-	HermesLogs  HermesLogsConfig `yaml:"hermes_logs"`
+	HostName    string        `yaml:"host_name"`
+	DataDir     string        `yaml:"data_dir"`
+	PricingFile string        `yaml:"pricing_file"`
+	Quota       QuotaConfig   `yaml:"quota"`
+	Policy      PolicyConfig  `yaml:"policy"`
+	Control     ControlConfig `yaml:"control"`
+	Limits      LimitsConfig  `yaml:"limits"`
+	// Budgets is the optional spend-control block. A nil value disables spend
+	// controls entirely, leaving behavior unchanged.
+	Budgets    *BudgetConfig    `yaml:"budgets"`
+	Timeouts   TimeoutsConfig   `yaml:"timeouts"`
+	Clients    []ClientConfig   `yaml:"clients"`
+	Accounts   []AccountConfig  `yaml:"accounts"`
+	Routes     []RouteConfig    `yaml:"routes"`
+	ClaudeLogs ClaudeLogsConfig `yaml:"claude_logs"`
+	HermesLogs HermesLogsConfig `yaml:"hermes_logs"`
 }
 
 // ClaudeLogsConfig controls ingestion of Claude Code transcript token usage.
@@ -94,6 +98,182 @@ type LimitsConfig struct {
 	// MaxConcurrentPerClient caps a single authenticated client. Clients not
 	// listed here are limited only by the global cap. 0 = unlimited.
 	MaxConcurrentPerClient map[string]int `yaml:"max_concurrent_per_client"`
+}
+
+// BudgetConfig is the optional spend-control block (yaml: budgets). A nil
+// *BudgetConfig disables spend controls entirely, so a config that omits the
+// block behaves exactly as before. Every amount is an exact decimal USD string
+// parsed with budget.ParseUSD and never through float64, so no binary rounding
+// participates in a budget decision. An omitted daily/monthly limit is
+// unlimited; an explicit "0" is a real zero budget that denies every
+// reservation.
+type BudgetConfig struct {
+	// ReserveUSD is the fixed per-attempt reservation, as an exact decimal USD
+	// string. It is required, and must be positive, whenever the block is
+	// present: there is no default and no estimation formula. This is a fixed
+	// reservation only — it is explicitly NOT a cap on the external provider
+	// bill, which can exceed it.
+	ReserveUSD string `yaml:"reserve_usd"`
+	// Clients maps a configured client name to that client's ceilings.
+	Clients map[string]BudgetLimits `yaml:"clients"`
+	// Accounts maps a configured account id to that account's ceilings. Any
+	// configured account is accepted, including a quota-only provider claude
+	// account: it cannot serve inference and so cannot spend, but it may still
+	// carry a ceiling.
+	Accounts map[string]BudgetLimits `yaml:"accounts"`
+}
+
+// BudgetLimits is one client's or account's optional day and month ceilings. A
+// nil pointer is an omitted limit, meaning that budget is unlimited; a non-nil
+// pointer holds the exact decimal USD string the operator wrote, including "0"
+// for a zero budget. The string is never converted to float64.
+type BudgetLimits struct {
+	DailyUSD   *string `yaml:"daily_usd"`
+	MonthlyUSD *string `yaml:"monthly_usd"`
+}
+
+// Limits converts this ceiling into budget.Limit values for scope and key, in
+// day-then-month order. An omitted (nil) period amount contributes no entry —
+// that (scope, key, period) budget is unlimited — while a present amount,
+// including "0", contributes exactly one. Each present amount is parsed with
+// budget.ParseUSD, the same exact-decimal rule Validate enforces, so a parent
+// runtime adapter building the limits for budget.Store.Reserve cannot drift
+// from what the config validated.
+func (l BudgetLimits) Limits(scope, key string) ([]budget.Limit, error) {
+	var out []budget.Limit
+	for _, f := range []struct {
+		period string
+		amount *string
+	}{
+		{budget.PeriodDay, l.DailyUSD},
+		{budget.PeriodMonth, l.MonthlyUSD},
+	} {
+		if f.amount == nil {
+			continue
+		}
+		micros, err := budget.ParseUSD(*f.amount)
+		if err != nil {
+			return nil, fmt.Errorf("budget %s %q %s: %w", scope, key, f.period, err)
+		}
+		out = append(out, budget.Limit{Scope: scope, Key: key, Period: f.period, Micros: micros})
+	}
+	return out, nil
+}
+
+// Limits returns every ceiling in the block as budget.Limit values — clients
+// then accounts — for a parent runtime adapter to pass to
+// budget.Store.Reserve. A nil receiver (spend controls disabled) returns nil.
+func (b *BudgetConfig) Limits() ([]budget.Limit, error) {
+	if b == nil {
+		return nil, nil
+	}
+	var out []budget.Limit
+	for name, l := range b.Clients {
+		ls, err := l.Limits(budget.ScopeClient, name)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ls...)
+	}
+	for id, l := range b.Accounts {
+		ls, err := l.Limits(budget.ScopeAccount, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ls...)
+	}
+	return out, nil
+}
+
+// ReservationMicros parses ReserveUSD into integer micro-USD with
+// budget.ParseUSD. It is the fixed per-attempt reservation, not a cap on the
+// provider bill. A nil receiver (spend controls disabled) is an error.
+func (b *BudgetConfig) ReservationMicros() (int64, error) {
+	if b == nil {
+		return 0, errors.New("budgets disabled")
+	}
+	return budget.ParseUSD(b.ReserveUSD)
+}
+
+// validate checks a present budgets block. reserve_usd is required and must be
+// an explicit positive exact decimal: there is no default and no estimation,
+// because this reservation is a fixed per-attempt hold, not a cap on the
+// external provider bill. At least one ceiling must be configured; every
+// client and account key must name something this config already defines (a
+// configured claude account is fine even though it cannot serve inference, it
+// simply cannot spend); and every present amount must parse exactly as a
+// nonnegative USD decimal, so a negative, malformed, or overflowing value is
+// rejected rather than silently dropping spend controls. An omitted period
+// amount is unlimited; an explicit "0" is a real zero budget.
+func (b *BudgetConfig) validate(knownClients, knownAccounts map[string]bool) []error {
+	var errs []error
+	micros, err := budget.ParseUSD(b.ReserveUSD)
+	switch {
+	case err != nil:
+		errs = append(errs, fmt.Errorf("budgets.reserve_usd %q: %w", b.ReserveUSD, err))
+	case micros == 0:
+		errs = append(errs, fmt.Errorf("budgets.reserve_usd %q must be positive when budgets are enabled", b.ReserveUSD))
+	}
+	// Count present amounts, not map entries: an empty entry or a null/blank
+	// amount is unlimited, so a block made only of those enforces nothing.
+	ceilings := 0
+	for _, lim := range b.Clients {
+		ceilings += lim.present()
+	}
+	for _, lim := range b.Accounts {
+		ceilings += lim.present()
+	}
+	if ceilings == 0 {
+		errs = append(errs, errors.New("budgets: at least one client or account daily_usd/monthly_usd ceiling is required when budgets are enabled"))
+	}
+	for name, lim := range b.Clients {
+		if name == "" || !knownClients[name] {
+			errs = append(errs, fmt.Errorf("budgets.clients names unknown client %q", name))
+		}
+		errs = append(errs, lim.validate(fmt.Sprintf("budgets.clients[%s]", name))...)
+	}
+	for id, lim := range b.Accounts {
+		if id == "" || !knownAccounts[id] {
+			errs = append(errs, fmt.Errorf("budgets.accounts names unknown account %q", id))
+		}
+		errs = append(errs, lim.validate(fmt.Sprintf("budgets.accounts[%s]", id))...)
+	}
+	return errs
+}
+
+// present counts the period amounts that are set (non-nil), i.e. the ceilings
+// this entry contributes.
+func (l BudgetLimits) present() int {
+	n := 0
+	if l.DailyUSD != nil {
+		n++
+	}
+	if l.MonthlyUSD != nil {
+		n++
+	}
+	return n
+}
+
+// validate checks the two optional period amounts under prefix. A nil amount
+// is an omitted limit (unlimited) and contributes nothing; a present amount is
+// parsed with budget.ParseUSD.
+func (l BudgetLimits) validate(prefix string) []error {
+	var errs []error
+	for _, f := range []struct {
+		name   string
+		amount *string
+	}{
+		{"daily_usd", l.DailyUSD},
+		{"monthly_usd", l.MonthlyUSD},
+	} {
+		if f.amount == nil {
+			continue
+		}
+		if _, err := budget.ParseUSD(*f.amount); err != nil {
+			errs = append(errs, fmt.Errorf("%s.%s %q: %w", prefix, f.name, *f.amount, err))
+		}
+	}
+	return errs
 }
 
 // TimeoutsConfig bounds inbound request handling. Every value must be
@@ -556,6 +736,9 @@ func (c *Config) Validate() error {
 		} else if provider[c.ClaudeLogs.Account] != core.ProviderClaude {
 			errs = append(errs, fmt.Errorf("claude_logs.account %q must be a configured claude account", c.ClaudeLogs.Account))
 		}
+	}
+	if c.Budgets != nil {
+		errs = append(errs, c.Budgets.validate(seenC, accts)...)
 	}
 	return errors.Join(errs...)
 }

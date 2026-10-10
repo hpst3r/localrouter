@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -52,6 +53,37 @@ type Deps struct {
 	// until the response (including any stream and every failover attempt) has
 	// fully ended. Nil means unlimited.
 	Limiter Limiter
+	// Budget gates every upstream attempt against the client's and account's
+	// configured spend ceilings. It is optional: nil admits every attempt and
+	// settles nothing, exactly as before this seam existed.
+	//
+	// Reserve is called once per upstream attempt, after the credential is
+	// resolved and immediately before the send (so a credential failure never
+	// holds budget), and the matching Settle is called once on every path that
+	// follows a successful Reserve. A Reserve error is terminal: the attempt is
+	// not sent, does not fail over, and is not settled.
+	Budget Budget
+}
+
+// Budget gates one upstream attempt against the budget store. It is satisfied by
+// internal/budget.Gate; the proxy depends on the behaviour rather than the
+// concrete type so it never constructs the store or knows the money arithmetic.
+//
+// Implementations must be safe for concurrent use and must not retain rec.
+type Budget interface {
+	// Reserve claims this attempt's fixed reservation. An error wrapping
+	// budget.ErrExceeded denies the attempt because the client is out of
+	// budget; any other error means the budget store is unavailable. Either
+	// way the attempt must not be sent and must not be settled.
+	Reserve(ctx context.Context, rec core.RequestRecord) error
+	// Settle books the attempt's resolved cost once its outcome is known. It
+	// must be called only for an attempt Reserve admitted.
+	Settle(ctx context.Context, rec core.RequestRecord) error
+	// SettleIncomplete settles an admitted attempt whose response was cut
+	// short mid-relay (client disconnect, idle timeout, upstream read error).
+	// Any cost observed so far is only a lower bound, so it must be booked as
+	// unknown and charged at no less than the hold — never as a final cost.
+	SettleIncomplete(ctx context.Context, rec core.RequestRecord) error
 }
 
 // Limiter bounds how many inference requests may be active at once. It is

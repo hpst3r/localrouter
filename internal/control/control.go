@@ -69,6 +69,11 @@ type Deps struct {
 	// It folds in process shutdown so /readyz and diagnostics flip not-ready
 	// once the process stops accepting work, independently of storage health.
 	Ready func() bool
+	// Budgets is this generation's read-only spend-control view for the
+	// operator budget report; nil when spend controls are not configured for
+	// the generation. Like ReloadStatus it is consulted per request, so a
+	// reload publishes a fresh source without restarting the server.
+	Budgets BudgetSource
 	// Clock defaults to core.SystemClock.
 	Clock core.Clock
 }
@@ -110,6 +115,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /control/v1/analytics", s.auth(http.HandlerFunc(s.analytics)))
 	mux.Handle("GET /control/v1/analytics/dimensions", s.auth(http.HandlerFunc(s.analyticsDimensions)))
 	mux.Handle("GET /control/v1/diagnostics", s.auth(http.HandlerFunc(s.diagnostics)))
+	mux.Handle("GET /control/v1/budgets", s.auth(http.HandlerFunc(s.budgets)))
 	mux.Handle("POST /control/v1/admit", s.auth(http.HandlerFunc(s.admit)))
 	mux.HandleFunc("POST /control/v1/ingest", s.ingest)
 	return mux
@@ -637,6 +643,10 @@ type admitResponse struct {
 	Decision  string `json:"decision"`
 	AccountID string `json:"account_id"`
 	Reason    string `json:"reason"`
+	// Budget is the advisory spend-control estimate for this decision. It is
+	// present only when spend controls are configured for the generation, and
+	// it never changes the decision above and never takes a reservation.
+	Budget *admitBudgetEstimate `json:"budget,omitempty"`
 }
 
 func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
@@ -702,6 +712,10 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 	if d.Allow {
 		resp.Decision = "allow"
 	}
+	// The advisory estimate is additive: it is attached only by its own
+	// nil-Budgets check, so a deployment without spend controls keeps the
+	// exact legacy response bytes.
+	resp.Budget = s.admitBudget(r, d, candidates)
 	writeJSON(w, http.StatusOK, resp)
 }
 

@@ -10,6 +10,7 @@ import (
 	"sort"
 
 	"github.com/hpst3r/localrouter/internal/auth"
+	"github.com/hpst3r/localrouter/internal/budget"
 	"github.com/hpst3r/localrouter/internal/config"
 	"github.com/hpst3r/localrouter/internal/connlim"
 	"github.com/hpst3r/localrouter/internal/control"
@@ -56,6 +57,7 @@ func restartFields(base, candidate *config.Config) []string {
 		for i := range c.Accounts {
 			c.Accounts[i].Reserve = nil
 		}
+		c.Budgets = budgetPresence(c.Budgets)
 	}
 	l := reflect.ValueOf(*left)
 	r := reflect.ValueOf(*right)
@@ -68,6 +70,54 @@ func restartFields(base, candidate *config.Config) []string {
 	}
 	sort.Strings(fields)
 	return fields
+}
+
+// budgetPresence normalizes the optional budgets block to a single bit before
+// the restart-only comparison: nil (disabled) or an empty &BudgetConfig{}
+// (enabled). Enabling or disabling spend controls requires a restart — the
+// process-wide store and its ownership lock exist only when Build saw the block
+// — but everything inside it (reserve_usd and every client/account ceiling) is
+// live-reloadable, so the whole block is erased for the comparison. A future
+// field added to BudgetConfig is therefore reloadable by default; to make it
+// restart-only, zero it explicitly here as well.
+func budgetPresence(b *config.BudgetConfig) *config.BudgetConfig {
+	if b == nil {
+		return nil
+	}
+	return &config.BudgetConfig{}
+}
+
+// budgetGate builds a generation's immutable budget adapter over the shared
+// store. It returns a nil gate only when spend controls are disabled for the
+// process (no budgets block and no store). The gate pins this generation's
+// limits and fixed reserve, so a reload publishes a fresh gate without
+// disturbing a request still holding the previous generation's.
+//
+// A configuration that enables budgets is never allowed to publish a nil gate:
+// the proxy treats a nil gate as "no enforcement", so resolving budgets-enabled
+// to nil would fail open. If the block is present but the process has no store
+// (released by Close, or the block appeared without the restart it requires),
+// that is a hard error. budgetStore is read here on a goroutine that holds
+// reloadMu, the same lock Close holds while releasing it.
+func (a *App) budgetGate(c *config.Config, prices *ledger.Pricing) (proxy.Budget, string, error) {
+	if c.Budgets != nil && a.budgetStore == nil {
+		return nil, "budgets invalid", errors.New("budgets are configured but the budget store is not open")
+	}
+	if a.budgetStore == nil {
+		return nil, "", nil
+	}
+	if c.Budgets == nil {
+		return nil, "budgets invalid", errors.New("budget store is open but this configuration has no budgets block")
+	}
+	limits, err := c.Budgets.Limits()
+	if err != nil {
+		return nil, "budgets invalid", err
+	}
+	reserve, err := c.Budgets.ReservationMicros()
+	if err != nil {
+		return nil, "budgets invalid", err
+	}
+	return budget.NewGate(a.budgetStore, prices, limits, reserve), "", nil
 }
 
 func (a *App) generationStatus(g *runtimeGeneration) core.ReloadStatus {
@@ -185,6 +235,10 @@ func (a *App) makeGeneration(c *config.Config, number uint64) (*runtimeGeneratio
 		return nil, "limits invalid", err
 	}
 	priceView := a.Ledger.WithPricing(prices)
+	gate, reason, err := a.budgetGate(c, prices)
+	if err != nil {
+		return nil, reason, err
+	}
 	authenticate := func(bearer string) (core.Client, bool) {
 		name, ok := keys.Lookup(bearer)
 		if !ok {
@@ -193,9 +247,9 @@ func (a *App) makeGeneration(c *config.Config, number uint64) (*runtimeGeneratio
 		return clients[name], true
 	}
 	routes := c.CoreRoutes()
-	px := proxy.New(proxy.Deps{Accounts: acctMap, Routes: routes, Creds: a.Auth, Quota: a.Quota, Policy: pol, Ledger: priceView, Authenticate: authenticate, Clock: a.reloadClock, Logger: a.Logger, Limiter: lim}, proxy.Options{MaxFailovers: c.Policy.MaxFailovers})
+	px := proxy.New(proxy.Deps{Accounts: acctMap, Routes: routes, Creds: a.Auth, Quota: a.Quota, Policy: pol, Ledger: priceView, Budget: gate, Authenticate: authenticate, Clock: a.reloadClock, Logger: a.Logger, Limiter: lim}, proxy.Options{MaxFailovers: c.Policy.MaxFailovers})
 	g := &runtimeGeneration{pricing: priceView, status: core.ReloadStatus{Generation: number, OK: true, At: a.reloadClock.Now()}}
-	deps := control.Deps{Accounts: accounts, Quota: a.Quota, Policy: pol, Ledger: priceView, Routes: routes, Authenticate: authenticate, Clock: a.reloadClock, Storage: a.Ledger, Inflight: viewInflight{lim}, Ready: a.Serving, ReloadStatus: func() core.ReloadStatus { return a.generationStatus(g) }}
+	deps := control.Deps{Accounts: accounts, Quota: a.Quota, Policy: pol, Ledger: priceView, Routes: routes, Authenticate: authenticate, Clock: a.reloadClock, Storage: a.Ledger, Inflight: viewInflight{lim}, Ready: a.Serving, ReloadStatus: func() core.ReloadStatus { return a.generationStatus(g) }, Budgets: a.budgetSource(c.Budgets)}
 	for _, cl := range c.Clients {
 		deps.Clients = append(deps.Clients, control.ClientInfo{Name: cl.Name, Class: cl.Class, Host: clients[cl.Name].Host, Ingest: cl.Ingest})
 	}

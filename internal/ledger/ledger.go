@@ -348,6 +348,40 @@ func resolveCost(r core.RequestRecord, pricing *Pricing, basis func(accountID st
 	return cost, costBasis
 }
 
+// Settlement cost bases reported by ResolveRecordCost. "reported" is a cost the
+// provider observed and the ledger trusts, "estimated" is one computed from the
+// local price table, and "unknown" means neither was available. The string
+// values match budget.BasisReported/BasisEstimated/BasisUnknown so the budget
+// store accepts them directly; the ledger spells them out itself rather than
+// importing package budget, which imports the ledger.
+const (
+	CostBasisReported  = "reported"
+	CostBasisEstimated = "estimated"
+	CostBasisUnknown   = "unknown"
+)
+
+// ResolveRecordCost reports the cost the budget runtime should settle for one
+// attempt and the provenance to settle it under, given the immutable price
+// table p. It is a pure wrapper over resolveCost: a trusted provider-reported
+// OpenRouter cost (explicit, finite, non-negative — including zero) resolves as
+// CostBasisReported; otherwise a record with known usage that the table prices
+// resolves as CostBasisEstimated; otherwise the cost is nil and the basis is
+// CostBasisUnknown, leaving the caller to settle at its own floor.
+//
+// It reads no mutable ledger state and mutates nothing, so a caller may hold a
+// generation-pinned price table and resolve costs against it concurrently.
+func ResolveRecordCost(r core.RequestRecord, p *Pricing) (*float64, string) {
+	cost, costBasis := resolveCost(r, p, nil)
+	if !cost.Valid {
+		return nil, CostBasisUnknown
+	}
+	c := cost.Float64
+	if costBasis.Valid && costBasis.String == costBasisProviderReported {
+		return &c, CostBasisReported
+	}
+	return &c, CostBasisEstimated
+}
+
 // Reprice recomputes cost_usd and cost_basis for every row with known usage
 // using the ledger's current pricing (e.g. after importing prices). Each row is
 // repriced under the same key the row was originally attributed with — the
