@@ -140,16 +140,16 @@ func (s *Store) keyExpiry(createdMS, expiresMS int64) int64 {
 }
 
 // liveUser loads userID inside tx and requires it to be active with an
-// allowed login within Options.LoginMaxAge and not before the policy epoch.
-// It returns the user's role.
+// allowed login within Options.LoginMaxAge under the current policy
+// generation. It returns the user's role.
 func (s *Store) liveUser(ctx context.Context, tx *sql.Tx, userID string, now time.Time) (core.Role, error) {
 	var (
 		status, role string
 		lastLogin    sql.NullInt64
-		epoch        int64
+		current      bool
 	)
-	err := tx.QueryRowContext(ctx, `SELECT status, role, last_login_at, `+policyEpochSQL+` FROM users WHERE id = ?`, userID).
-		Scan(&status, &role, &lastLogin, &epoch)
+	err := tx.QueryRowContext(ctx, `SELECT status, role, last_login_at, `+loginCurrentSQL+` FROM users WHERE id = ?`, userID).
+		Scan(&status, &role, &lastLogin, &current)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -163,16 +163,17 @@ func (s *Store) liveUser(ctx context.Context, tx *sql.Tx, userID string, now tim
 	default:
 		return "", ErrUserDeleted
 	}
-	if !s.loginFresh(lastLogin, epoch, now) {
+	if !s.loginFresh(lastLogin, current, now) {
 		return "", ErrStaleLogin
 	}
 	return core.Role(role), nil
 }
 
 // loginFresh reports whether a last allowed login is within LoginMaxAge and
-// not before the policy epoch (see ApplyAccessPolicy).
-func (s *Store) loginFresh(lastLogin sql.NullInt64, epoch int64, now time.Time) bool {
-	return lastLogin.Valid && lastLogin.Int64 >= epoch && now.Sub(fromMS(lastLogin.Int64)) <= s.opts.LoginMaxAge
+// was made under the current policy generation (current, read with
+// loginCurrentSQL; see ApplyAccessPolicy).
+func (s *Store) loginFresh(lastLogin sql.NullInt64, current bool, now time.Time) bool {
+	return lastLogin.Valid && current && now.Sub(fromMS(lastLogin.Int64)) <= s.opts.LoginMaxAge
 }
 
 // ListKeys returns userID's keys (metadata only), at most MaxListLimit:
@@ -308,7 +309,8 @@ var dummyDigest = make([]byte, sha256.Size)
 // SHA-256 digest of the whole token is compared in constant time. It
 // succeeds only if the key is unrevoked and unexpired (see keyExpiry), its
 // owner is active and the owner's last allowed login is within
-// Options.LoginMaxAge and not before the policy epoch (ApplyAccessPolicy).
+// Options.LoginMaxAge and under the current policy generation
+// (ApplyAccessPolicy).
 //
 // The principal is Kind PrincipalUserKey, Role RoleUser (also for admins:
 // admin powers are browser-session only), Client{Class: ClassInteractive}
@@ -331,13 +333,13 @@ func (s *Store) AuthenticateKey(ctx context.Context, token string) (core.Princip
 		revoked   sql.NullInt64
 		status    string
 		lastLogin sql.NullInt64
-		epoch     int64
+		current   bool
 	)
 	err := s.read(ctx, func(ctx context.Context) error {
 		err := s.db.QueryRowContext(ctx,
-			`SELECT k.token_hash, k.user_id, k.created_at, k.expires_at, k.revoked_at, u.status, u.last_login_at, `+policyEpochSQL+`
+			`SELECT k.token_hash, k.user_id, k.created_at, k.expires_at, k.revoked_at, u.status, u.last_login_at, `+loginCurrentSQL+`
 			 FROM api_keys k JOIN users u ON u.id = k.user_id WHERE k.id = ?`, keyID).
-			Scan(&stored, &userID, &created, &expires, &revoked, &status, &lastLogin, &epoch)
+			Scan(&stored, &userID, &created, &expires, &revoked, &status, &lastLogin, &current)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -353,7 +355,7 @@ func (s *Store) AuthenticateKey(ctx context.Context, token string) (core.Princip
 	match := subtle.ConstantTimeCompare(presented, stored) == 1
 	now := s.now()
 	if !found || !match || revoked.Valid || toMS(now) >= s.keyExpiry(created, expires) ||
-		UserStatus(status) != StatusActive || !s.loginFresh(lastLogin, epoch, now) {
+		UserStatus(status) != StatusActive || !s.loginFresh(lastLogin, current, now) {
 		return core.Principal{}, core.ErrUnauthenticated
 	}
 	return core.Principal{

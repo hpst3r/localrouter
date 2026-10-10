@@ -106,6 +106,10 @@ var migrations = []string{
 		revoke_reason TEXT NOT NULL DEFAULT ''
 	);
 	CREATE INDEX static_keys_user ON static_keys(user_id);`,
+	// v3: the policy generation of each user's last allowed login
+	// (policy.go). Existing users get 0, the generation before any
+	// narrowing.
+	`ALTER TABLE users ADD COLUMN login_generation INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // Open opens (creating if needed) the identity database at path. The parent
