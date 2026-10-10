@@ -168,15 +168,20 @@ func (s *Store) loginFresh(lastLogin sql.NullInt64, now time.Time) bool {
 	return lastLogin.Valid && now.Sub(fromMS(lastLogin.Int64)) <= s.opts.LoginMaxAge
 }
 
-// ListKeys returns userID's keys (metadata only), newest first, at most
-// MaxListLimit. ExpiresAt is the effective expiry under the current
-// Options.KeyMaxTTL (see keyExpiry).
+// ListKeys returns userID's keys (metadata only), at most MaxListLimit:
+// every live key (unrevoked and unexpired, see keyExpiry; at most
+// MaxKeysPerUserCeiling) newest first, then the newest revoked or expired
+// keys, so no amount of history hides a key that still authenticates.
+// ExpiresAt is the effective expiry under the current Options.KeyMaxTTL.
 func (s *Store) ListKeys(ctx context.Context, userID string) ([]APIKey, error) {
 	var out []APIKey
+	nowMS := toMS(s.now())
 	err := s.read(ctx, func(ctx context.Context) error {
 		rows, err := s.db.QueryContext(ctx,
 			`SELECT id, user_id, name, created_at, expires_at, revoked_at, revoke_reason
-			 FROM api_keys WHERE user_id = ? ORDER BY created_at DESC, id LIMIT ?`, userID, MaxListLimit)
+			 FROM api_keys WHERE user_id = ?
+			 ORDER BY (revoked_at IS NULL AND MIN(expires_at, created_at + ?) > ?) DESC, created_at DESC, id
+			 LIMIT ?`, userID, s.opts.KeyMaxTTL.Milliseconds(), nowMS, MaxListLimit)
 		if err != nil {
 			return err
 		}
