@@ -81,10 +81,10 @@ NGINX_IMAGE_DEFAULT = (
 )
 PROVIDER_IMAGE_DEFAULT = "docker.io/library/python:3.13-slim"
 BUILD_BASE_IMAGES = (
-    "docker.io/library/golang:1.26.8-alpine"
-    "@sha256:8ac98ca534ac3f51e1f420a1dd2c15e74c75cfa0f23f3ad27eb5d7236c349a0c",
-    "docker.io/library/alpine:3.22"
-    "@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8",
+    "docker.io/library/golang:1.27.0-alpine"
+    "@sha256:4c9fe60190a2a3350ddc51de80d0224b8a6698d12bdfc999fee45ea9d6c46dbc",
+    "docker.io/library/alpine:3.24"
+    "@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6",
 )
 
 ROUTER_CONTAINER_PORT = 8787          # inside the container netns only
