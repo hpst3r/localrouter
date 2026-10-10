@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"io"
@@ -645,7 +646,8 @@ func (c *Config) otherSecretFiles() []labeledPath {
 func (c *Config) checkIdentityFiles() []error {
 	var errs []error
 	secret := c.Identity.OIDC.ClientSecretFile
-	if _, err := c.Identity.OIDC.ReadClientSecret(); err != nil {
+	secretValue, err := c.Identity.OIDC.ReadClientSecret()
+	if err != nil {
 		errs = append(errs, err)
 	}
 	sfi, serr := os.Stat(secret)
@@ -668,6 +670,9 @@ func (c *Config) checkIdentityFiles() []error {
 			}
 			if strings.HasPrefix(strings.TrimSpace(string(b)), userKeyPrefix) {
 				errs = append(errs, fmt.Errorf("%s %s starts with the reserved user API key prefix %s; generate a new static key", label, p, userKeyPrefix))
+			}
+			if secretValue != "" && subtle.ConstantTimeCompare([]byte(strings.TrimSpace(string(b))), []byte(secretValue)) == 1 {
+				errs = append(errs, fmt.Errorf("%s %s holds the OIDC client secret; generate a new static key", label, p))
 			}
 		}
 	}

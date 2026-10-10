@@ -140,6 +140,22 @@ clients:
 	}
 }
 
+// A static key with the same value as the OIDC client secret, even in a
+// separate file, would make the client secret a bearer: check refuses it.
+func TestIdentityStaticKeyEqualToClientSecret(t *testing.T) {
+	p, c := identityFixture(t, `
+clients:
+  - {name: svc, class: background, key_file: svc.key, role: service}
+`, map[string]string{"svc.key": "  " + testSecret + "\n"})
+	err := c.CheckFiles(p)
+	if err == nil || !strings.Contains(err.Error(), "client svc key file") {
+		t.Fatalf("static key equal to the client secret accepted: %v", err)
+	}
+	if strings.Contains(err.Error(), testSecret) {
+		t.Fatalf("error leaks the secret: %v", err)
+	}
+}
+
 // Legacy mode never reads key content in CheckFiles: behavior unchanged.
 func TestLegacyCheckFilesIgnoresKeyContent(t *testing.T) {
 	p, c := secFixture(t)
