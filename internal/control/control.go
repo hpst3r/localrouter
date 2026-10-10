@@ -463,11 +463,14 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 		}
 		since = d
 	}
+	scope := scopeFrom(r.Context())
 	group := q.Get("group")
 	if group == "" {
 		group = "account"
+		if scope != nil && !scope.AllUsers {
+			group = "model" // owner scopes cannot group by account
+		}
 	}
-	scope := scopeFrom(r.Context())
 	groups := usageGroups
 	if scope != nil {
 		groups = scopedGroups(usageGroups, *scope)
