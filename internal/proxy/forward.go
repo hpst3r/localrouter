@@ -344,12 +344,21 @@ const errUnterminatedStream = "upstream stream ended without completion"
 // policy must not cool the account down; final additionally means no other
 // account would answer differently, so the response is relayed without
 // credential refresh or failover. idledOut reports that the body read
-// needed for classification stalled and the upstream was canceled. Only
-// OpenRouter distinguishes these; other providers' 401/403/429 stay
-// account-level.
+// needed for classification stalled and the upstream was canceled. Other
+// providers' 401/403/429 stay account-level, except that in multi-user mode,
+// where one user's oversized request must not cool a shared account down for
+// everyone, a 429/403 naming a request-size limit is scoped and final.
 func (p *Proxy) classify(account core.Account, status int, resp *http.Response, cancelUp context.CancelFunc) (scoped, final, idledOut bool) {
 	if account.Provider != core.ProviderOpenRouter {
-		return false, false, false
+		if !p.deps.MultiUser || (status != http.StatusTooManyRequests && status != http.StatusForbidden) {
+			return false, false, false
+		}
+		body, timedOut := p.peekBody(resp, cancelUp)
+		if timedOut {
+			return false, false, true
+		}
+		sized := isRequestSized(body)
+		return sized, sized, false
 	}
 	switch status {
 	case http.StatusForbidden:
@@ -385,6 +394,13 @@ func (p *Proxy) classify(account core.Account, status int, resp *http.Response, 
 var affordRE = regexp.MustCompile(`requires more credits, or fewer max_tokens|can only afford [0-9]+`)
 
 func isAffordability(body []byte) bool { return affordRE.Match(body) }
+
+// requestSizedRE matches upstream 429/403 bodies that reject this request's
+// size ("Request too large for gpt-x ... Requested 50000", context-length
+// errors) rather than the account's rate or usage limit.
+var requestSizedRE = regexp.MustCompile(`context_length_exceeded|maximum context length|Request too large|string_above_max_length|request_too_large`)
+
+func isRequestSized(body []byte) bool { return requestSizedRE.Match(body) }
 
 // copyIdle copies up to limit bytes from src to dst. If no bytes arrive for
 // idle (0 disables), it calls cancelUp to abort the upstream and reports

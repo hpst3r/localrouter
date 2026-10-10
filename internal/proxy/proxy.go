@@ -449,6 +449,12 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 		writeError(w, http.StatusBadRequest, "localrouter: "+err.Error(), "invalid_request_error")
 		return
 	}
+	if p.deps.MultiUser && head.Refused != "" {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("localrouter: field %q is not allowed on this gateway", core.TruncateLabel(head.Refused)),
+			"invalid_request_error")
+		return
+	}
 	route, ok := p.routes[head.Model]
 	if !ok {
 		writeError(w, http.StatusNotFound, "localrouter: unknown model", "model_not_found")
@@ -530,6 +536,35 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 type requestHead struct {
 	Model  string
 	Stream bool
+	// Refused is the first top-level key the multi-user field policy
+	// (refusedField) rejects, as sent; empty if none.
+	Refused string
+}
+
+// refusedField reports whether a top-level key with value raw is refused in
+// multi-user mode, where upstream accounts are shared: provider routing and
+// cost controls, and references to state stored on the upstream account.
+// Keys match case-insensitively, as upstreams decoding with encoding/json
+// would. The policy is provider-independent so it fails closed.
+func refusedField(key string, raw json.RawMessage) bool {
+	switch {
+	case strings.EqualFold(key, "models"), strings.EqualFold(key, "route"),
+		strings.EqualFold(key, "provider"), strings.EqualFold(key, "plugins"),
+		strings.EqualFold(key, "transforms"), strings.EqualFold(key, "preset"):
+		return true
+	case strings.EqualFold(key, "background"):
+		return string(raw) != "null" && string(raw) != "false"
+	case strings.EqualFold(key, "service_tier"):
+		var tier string
+		if string(raw) == "null" {
+			return false
+		}
+		return raw[0] != '"' || json.Unmarshal(raw, &tier) != nil || (tier != "auto" && tier != "default")
+	case strings.EqualFold(key, "previous_response_id"), strings.EqualFold(key, "conversation"),
+		strings.EqualFold(key, "prompt"):
+		return string(raw) != "null"
+	}
+	return false
 }
 
 var errBodyShape = errors.New("request body must be a single JSON object with a model")
@@ -578,6 +613,8 @@ func parseHead(body []byte) (requestHead, error) {
 			}
 		case strings.EqualFold(key, "model"), strings.EqualFold(key, "stream"):
 			return h, fmt.Errorf("ambiguous key %q in request body", core.TruncateLabel(key))
+		case h.Refused == "" && refusedField(key, raw):
+			h.Refused = key
 		}
 	}
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
