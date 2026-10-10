@@ -5,7 +5,7 @@ package budget
 // Contract under test (all types owned by store.go):
 //
 //	Limit       {Scope, Key, Period string; Micros int64}
-//	Reservation {ID, Client, Account string; At time.Time; Micros int64}
+//	Reservation {ID, Client, Account, User string; At time.Time; Micros int64}
 //	Settlement  {ID string; Micros int64; Basis string}
 //	Snapshot    {Reported, Estimated, Unknown, Reserved int64}
 //	Open(path) (*Store, error)

@@ -97,8 +97,8 @@ func TestMigrateV3ToV4PreservesLegacyRows(t *testing.T) {
 
 	var v int
 	l.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v)
-	if v != 4 || len(migrations) != 4 {
-		t.Fatalf("version = %d, migrations = %d; want 4/4", v, len(migrations))
+	if v != 5 || len(migrations) != 5 {
+		t.Fatalf("version = %d, migrations = %d; want 5/5", v, len(migrations))
 	}
 	var in, creation int64
 	var host string
@@ -139,8 +139,8 @@ func TestMigrateV3ToV4PreservesLegacyRows(t *testing.T) {
 	}
 	defer l2.Close()
 	l2.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v)
-	if v != 4 {
-		t.Fatalf("reopen version = %d; want 4", v)
+	if v != 5 {
+		t.Fatalf("reopen version = %d; want 5", v)
 	}
 }
 

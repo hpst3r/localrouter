@@ -30,6 +30,9 @@ type Gate struct {
 	pricing       *ledger.Pricing
 	limits        []Limit
 	reserveMicros int64
+	// userDefaults are the per-user default ceilings set by WithUserLimits;
+	// nil means none were set (an empty slice means set, with no periods).
+	userDefaults []userDefault
 }
 
 // NewGate builds the adapter the proxy drives. store holds the durable budget;
@@ -53,9 +56,12 @@ func NewGate(store *Store, pricing *ledger.Pricing, limits []Limit, reserveMicro
 
 // Reserve claims the fixed per-attempt hold for rec against every configured
 // ceiling. It names the reservation from the attempt itself: its id, its
-// client and account keys, and its started-at time, which fixes the day and
-// month instances the hold is written to. The hold is the gate's fixed
-// reserveMicros and must be positive.
+// client and account keys, its owning user (rec.UserID, set by the proxy from
+// the authenticated principal; "" for an unowned static client), and its
+// started-at time, which fixes the day and month instances the hold is written
+// to. The hold is the gate's fixed reserveMicros and must be positive. A user's
+// ceiling is enforced through a Limit{Scope: ScopeUser, Key: rec.UserID}
+// entry among the gate's limits, or through the defaults of WithUserLimits.
 //
 // The returned error is the store's: it wraps ErrExceeded when a ceiling has no
 // room (a denial), ErrConflict when the id was already reserved with a
@@ -77,9 +83,10 @@ func (g *Gate) Reserve(ctx context.Context, rec core.RequestRecord) error {
 		ID:      rec.ID,
 		Client:  rec.Client,
 		Account: rec.AccountID,
+		User:    rec.UserID,
 		At:      rec.StartedAt,
 		Micros:  g.reserveMicros,
-	}, g.limits)
+	}, g.limitsFor(rec))
 }
 
 // Settle closes the reservation Reserve took for rec and books the cost the
@@ -134,4 +141,81 @@ func (g *Gate) settle(ctx context.Context, rec core.RequestRecord, incomplete bo
 		micros = m
 	}
 	return g.store.Settle(ctx, Settlement{ID: rec.ID, Micros: micros, Basis: basis})
+}
+
+// WithUserLimits returns a copy of g that also enforces a global default
+// ceiling for every user: day and month are the per-user day and month budgets
+// in micro-USD, and a nil pointer leaves that period without a default
+// (unlimited unless an explicit limit names the user). Zero is a real budget of
+// zero.
+//
+// At each Reserve for an attempt with a rec.UserID, the copy adds exactly one
+// Limit{Scope: ScopeUser, Key: rec.UserID} per defaulted period. An explicit
+// ScopeUser limit among the gate's own limits for that same user and period
+// takes precedence and the default is not added for it, so an override is
+// never duplicated; duplicate explicit entries remain the store's ErrInvalid
+// (a denial). An attempt without a user gets no user limit. The user budget is
+// keyed by the user id, never the key, so creating or rotating keys cannot
+// reset it.
+//
+// g itself is not modified and the values are copied, so each config
+// generation keeps an immutable view. It returns ErrNoStore for a nil or
+// storeless gate and ErrInvalid for a negative amount or a gate that already
+// carries defaults.
+func (g *Gate) WithUserLimits(day, month *int64) (*Gate, error) {
+	if g == nil || g.store == nil {
+		return nil, ErrNoStore
+	}
+	if g.userDefaults != nil {
+		return nil, fmt.Errorf("%w: user default limits are already set on this gate", ErrInvalid)
+	}
+	cp := *g
+	cp.userDefaults = []userDefault{}
+	for _, d := range []struct {
+		period string
+		micros *int64
+	}{{PeriodDay, day}, {PeriodMonth, month}} {
+		if d.micros == nil {
+			continue
+		}
+		if *d.micros < 0 {
+			return nil, fmt.Errorf("%w: user default %s limit is negative (%d)", ErrInvalid, d.period, *d.micros)
+		}
+		cp.userDefaults = append(cp.userDefaults, userDefault{period: d.period, micros: *d.micros})
+	}
+	return &cp, nil
+}
+
+// userDefault is one global per-user default ceiling.
+type userDefault struct {
+	period string
+	micros int64
+}
+
+// limitsFor returns the limits that gate rec: the explicit limits plus, for an
+// attempt with a user, that user's default ceilings not overridden explicitly.
+// The gate's own slice is never appended to.
+func (g *Gate) limitsFor(rec core.RequestRecord) []Limit {
+	if rec.UserID == "" || len(g.userDefaults) == 0 {
+		return g.limits
+	}
+	out := append(make([]Limit, 0, len(g.limits)+len(g.userDefaults)), g.limits...)
+	for _, d := range g.userDefaults {
+		if g.hasExplicitUserLimit(rec.UserID, d.period) {
+			continue
+		}
+		out = append(out, Limit{Scope: ScopeUser, Key: rec.UserID, Period: d.period, Micros: d.micros})
+	}
+	return out
+}
+
+// hasExplicitUserLimit reports whether the gate's explicit limits name user
+// and period.
+func (g *Gate) hasExplicitUserLimit(user, period string) bool {
+	for _, l := range g.limits {
+		if l.Scope == ScopeUser && l.Key == user && l.Period == period {
+			return true
+		}
+	}
+	return false
 }

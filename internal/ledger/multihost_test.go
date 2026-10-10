@@ -50,7 +50,7 @@ func TestMigrateV2ToV3Host(t *testing.T) {
 	defer l.Close()
 	var v int
 	l.db.QueryRow(`SELECT version FROM schema_version`).Scan(&v)
-	if v != 4 {
+	if v != 5 {
 		t.Fatalf("version = %d", v)
 	}
 	var host string
