@@ -14,7 +14,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hpst3r/localrouter/internal/authz"
 	"github.com/hpst3r/localrouter/internal/core"
+	"github.com/hpst3r/localrouter/internal/identity"
 	"github.com/hpst3r/localrouter/internal/routing"
 )
 
@@ -76,6 +78,23 @@ type Deps struct {
 	Budgets BudgetSource
 	// Clock defaults to core.SystemClock.
 	Clock core.Clock
+
+	// Multi-user (identity) mode seams. They are consulted only when
+	// MultiUser or Options.MultiUser is set; legacy mode ignores them.
+	//
+	// AuthenticatePrincipal authenticates every /control/v1 bearer in
+	// multi-user mode. It replaces Authenticate there entirely: a nil seam
+	// fails closed with 503 and never falls back to Authenticate.
+	AuthenticatePrincipal core.BearerAuthenticator
+	// MultiUser enables multi-user mode (as does Options.MultiUser).
+	MultiUser bool
+	// Identity backs the browser-session API under /ui/v1 (sessions, own
+	// keys, admin user lifecycle and audit). Nil fails those routes with 503.
+	Identity *identity.Store
+	// PublicBaseURL is the configured https public origin. Unsafe /ui/v1
+	// requests must carry exactly this Origin; it is never derived from
+	// request or forwarded headers.
+	PublicBaseURL string
 }
 
 // Options tune the control server.
@@ -84,12 +103,20 @@ type Options struct {
 	RequireAuth bool
 	// StaleAfter marks snapshots older than this as stale (default 10m).
 	StaleAfter time.Duration
+	// MultiUser enables multi-user (identity) mode: every /control/v1 route
+	// requires a bearer authenticated by Deps.AuthenticatePrincipal and
+	// authorized by internal/authz, reads are owner-scoped, the /ui/v1
+	// session API is served and the legacy widget redirects to /ui/.
+	MultiUser bool
 }
 
 // Server implements the control API and widget.
 type Server struct {
 	deps Deps
 	opts Options
+	// origin is the normalized Deps.PublicBaseURL ("" when unset or not an
+	// https origin, which fails unsafe session requests closed).
+	origin string
 }
 
 // New builds a control server. Nil Clock defaults to the system clock and a
@@ -101,11 +128,14 @@ func New(deps Deps, opts Options) *Server {
 	if opts.StaleAfter <= 0 {
 		opts.StaleAfter = defaultStaleAfter
 	}
-	return &Server{deps: deps, opts: opts}
+	return &Server{deps: deps, opts: opts, origin: normalizeOrigin(deps.PublicBaseURL)}
 }
 
 // Handler returns the HTTP handler for all control routes.
 func (s *Server) Handler() http.Handler {
+	if s.multiUser() {
+		return s.multiUserHandler()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.HandleFunc("GET /readyz", s.readyz)
@@ -437,8 +467,13 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 	if group == "" {
 		group = "account"
 	}
-	if !slices.Contains(usageGroups, group) {
-		writeError(w, http.StatusBadRequest, "group must be one of "+strings.Join(usageGroups, ", "))
+	scope := scopeFrom(r.Context())
+	groups := usageGroups
+	if scope != nil {
+		groups = scopedGroups(usageGroups, *scope)
+	}
+	if !slices.Contains(groups, group) {
+		writeError(w, http.StatusBadRequest, "group must be one of "+strings.Join(groups, ", "))
 		return
 	}
 	if s.deps.Ledger == nil {
@@ -446,7 +481,13 @@ func (s *Server) usage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	from := s.deps.Clock.Now().Add(-since)
-	rows, err := s.deps.Ledger.Summary(r.Context(), from, group)
+	var rows []core.UsageRow
+	var err error
+	if scope != nil {
+		rows, err = s.scopedSummary(r.Context(), from, group, *scope)
+	} else {
+		rows, err = s.deps.Ledger.Summary(r.Context(), from, group)
+	}
 	if err != nil {
 		slog.Warn("control: usage summary failed", "group", group, "err", err)
 		writeError(w, http.StatusInternalServerError, "usage summary failed")
@@ -639,6 +680,14 @@ func filterRoute(route core.Route, candidates []string, req *capabilityRequest, 
 	return filtered, nil
 }
 
+// Generic admit reasons for a multi-user principal that is not a global
+// reader. The policy's own reason names every skipped account with its quota
+// state and balance, which only the operator may see (as on the proxy's 429).
+const (
+	admitReasonAdmitted  = "admitted"
+	admitReasonNoAccount = "no_admissible_account"
+)
+
 type admitResponse struct {
 	Decision  string `json:"decision"`
 	AccountID string `json:"account_id"`
@@ -662,6 +711,13 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 	}
 	if (req.Model == "") == (req.Account == "") {
 		writeError(w, http.StatusBadRequest, "exactly one of model or account is required")
+		return
+	}
+	detail := admitDetail(r)
+	if req.Account != "" && !detail {
+		// A single-account dry run is account status. It is refused before the
+		// account is looked up, so a known and an unknown id look the same.
+		writeError(w, http.StatusForbidden, msgForbidden)
 		return
 	}
 	if req.Account != "" && req.Requirements != nil {
@@ -712,11 +768,29 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 	if d.Allow {
 		resp.Decision = "allow"
 	}
+	if !detail {
+		resp.AccountID, resp.Reason = "", admitReasonNoAccount
+		if d.Allow {
+			resp.Reason = admitReasonAdmitted
+		}
+	}
 	// The advisory estimate is additive: it is attached only by its own
 	// nil-Budgets check, so a deployment without spend controls keeps the
 	// exact legacy response bytes.
-	resp.Budget = s.admitBudget(r, d, candidates)
+	resp.Budget = s.admitBudget(r, d, candidates, detail)
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// admitDetail reports whether the caller of admit may see account-level
+// detail: chosen account, policy reason and account budgets. Legacy requests
+// and multi-user global readers (service clients) may; a user bearer may not.
+func admitDetail(r *http.Request) bool {
+	a, multi := authFrom(r.Context())
+	if !multi {
+		return true
+	}
+	sc, err := authz.ReadScope(a.principal)
+	return err == nil && sc.AllUsers
 }
 
 func (s *Server) findRoute(model string) (core.Route, bool) {

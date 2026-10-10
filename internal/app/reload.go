@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"reflect"
 	"sort"
+	"strings"
 
 	"github.com/hpst3r/localrouter/internal/auth"
 	"github.com/hpst3r/localrouter/internal/budget"
@@ -19,6 +20,7 @@ import (
 	"github.com/hpst3r/localrouter/internal/policy"
 	"github.com/hpst3r/localrouter/internal/proxy"
 	"github.com/hpst3r/localrouter/internal/quota"
+	"github.com/hpst3r/localrouter/internal/userui"
 )
 
 var ErrRestartRequired = errors.New("configuration change requires restart")
@@ -27,6 +29,9 @@ type runtimeGeneration struct {
 	handler http.Handler
 	pricing *ledger.PricingView
 	status  core.ReloadStatus
+	// budgets is the read-only spend view handed to this generation's
+	// control server (nil when spend controls are disabled).
+	budgets control.BudgetSource
 }
 
 func cloneConfig(c *config.Config) (*config.Config, error) {
@@ -117,7 +122,38 @@ func (a *App) budgetGate(c *config.Config, prices *ledger.Pricing) (proxy.Budget
 	if err != nil {
 		return nil, "budgets invalid", err
 	}
-	return budget.NewGate(a.budgetStore, prices, limits, reserve), "", nil
+	gate := budget.NewGate(a.budgetStore, prices, limits, reserve)
+	if c.Budgets.Users != nil {
+		day, month, err := userDefaultMicros(c.Budgets.Users)
+		if err != nil {
+			return nil, "budgets invalid", err
+		}
+		if gate, err = gate.WithUserLimits(day, month); err != nil {
+			return nil, "budgets invalid", err
+		}
+	}
+	return gate, "", nil
+}
+
+// userDefaultMicros parses the global per-user default ceiling (budgets.users)
+// into the day and month amounts budget.Gate.WithUserLimits takes; a nil
+// pointer is an unlimited period. It uses BudgetLimits.Limits, the same exact
+// decimal rule config validation applied.
+func userDefaultMicros(u *config.BudgetLimits) (day, month *int64, err error) {
+	ls, err := u.Limits(budget.ScopeUser, "")
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, l := range ls {
+		m := l.Micros
+		switch l.Period {
+		case budget.PeriodDay:
+			day = &m
+		case budget.PeriodMonth:
+			month = &m
+		}
+	}
+	return day, month, nil
 }
 
 func (a *App) generationStatus(g *runtimeGeneration) core.ReloadStatus {
@@ -230,7 +266,13 @@ func (a *App) makeGeneration(c *config.Config, number uint64) (*runtimeGeneratio
 	if err != nil {
 		return nil, "policy invalid", err
 	}
-	lim, err := a.Limiter.View(c.Limits.MaxConcurrent, c.Limits.MaxConcurrentPerClient)
+	multiUser := c.Identity != nil
+	if multiUser != (a.Identity != nil) || multiUser && a.WebLogin == nil {
+		// The identity block is restart-only; a generation whose mode does
+		// not match the process's open identity runtime is never published.
+		return nil, "identity invalid", errors.New("identity configuration does not match the running identity store")
+	}
+	lim, err := a.Limiter.ViewWithUsers(c.Limits.MaxConcurrent, c.Limits.MaxConcurrentPerClient, c.Limits.MaxConcurrentPerUser)
 	if err != nil {
 		return nil, "limits invalid", err
 	}
@@ -246,19 +288,56 @@ func (a *App) makeGeneration(c *config.Config, number uint64) (*runtimeGeneratio
 		}
 		return clients[name], true
 	}
+	var principal core.BearerAuthenticator
+	var storage control.StoragePinger = a.Ledger
+	if multiUser {
+		// Multi-user mode authenticates only through the principal seam. The
+		// legacy closure is replaced by one that admits nobody, so a code path
+		// that still consulted it would deny rather than bypass roles/owners.
+		authenticate = func(string) (core.Client, bool) { return core.Client{}, false }
+		statics := make(map[string]staticPrincipal, len(c.Clients))
+		for _, cl := range c.Clients {
+			if strings.HasPrefix(cl.Name, userKeyClientPrefix) {
+				return nil, "clients invalid", errors.New("static client names must not start with \"" + userKeyClientPrefix + "\" (the user API key namespace) in multi-user mode")
+			}
+			statics[cl.Name] = staticPrincipal{client: clients[cl.Name], role: core.Role(cl.Role), owner: cl.Owner}
+		}
+		if reason, err := registerOwnedKeys(a.Identity, c.Clients, a.Logger); err != nil {
+			return nil, reason, err
+		}
+		principal = (&bearerAuth{store: a.Identity, lookup: keys.Lookup, statics: statics}).Authenticate
+		storage = storagePingers{a.Ledger, a.Identity}
+	}
 	routes := c.CoreRoutes()
-	px := proxy.New(proxy.Deps{Accounts: acctMap, Routes: routes, Creds: a.Auth, Quota: a.Quota, Policy: pol, Ledger: priceView, Budget: gate, Authenticate: authenticate, Clock: a.reloadClock, Logger: a.Logger, Limiter: lim}, proxy.Options{MaxFailovers: c.Policy.MaxFailovers})
+	px := proxy.New(proxy.Deps{Accounts: acctMap, Routes: routes, Creds: a.Auth, Quota: a.Quota, Policy: pol, Ledger: priceView, Budget: gate, Authenticate: authenticate, Clock: a.reloadClock, Logger: a.Logger, Limiter: lim, AuthenticatePrincipal: principal, MultiUser: multiUser}, proxy.Options{MaxFailovers: c.Policy.MaxFailovers})
 	g := &runtimeGeneration{pricing: priceView, status: core.ReloadStatus{Generation: number, OK: true, At: a.reloadClock.Now()}}
-	deps := control.Deps{Accounts: accounts, Quota: a.Quota, Policy: pol, Ledger: priceView, Routes: routes, Authenticate: authenticate, Clock: a.reloadClock, Storage: a.Ledger, Inflight: viewInflight{lim}, Ready: a.Serving, ReloadStatus: func() core.ReloadStatus { return a.generationStatus(g) }, Budgets: a.budgetSource(c.Budgets)}
+	g.budgets = a.budgetSource(c.Budgets)
+	deps := control.Deps{Accounts: accounts, Quota: a.Quota, Policy: pol, Ledger: priceView, Routes: routes, Authenticate: authenticate, Clock: a.reloadClock, Storage: storage, Inflight: viewInflight{lim}, Ready: a.Serving, ReloadStatus: func() core.ReloadStatus { return a.generationStatus(g) }, Budgets: g.budgets}
+	if multiUser {
+		deps.MultiUser = true
+		deps.AuthenticatePrincipal = principal
+		deps.Identity = a.Identity
+		deps.PublicBaseURL = c.Identity.PublicBaseURL
+	}
 	for _, cl := range c.Clients {
 		deps.Clients = append(deps.Clients, control.ClientInfo{Name: cl.Name, Class: cl.Class, Host: clients[cl.Name].Host, Ingest: cl.Ingest})
 	}
 	deps.Ingester = a.Quota
 	deps.IsSnapshotStale = func(err error) bool { return errors.Is(err, quota.ErrSnapshotStale) }
-	ctl := control.New(deps, control.Options{RequireAuth: c.Control.RequireAuth, StaleAfter: c.Policy.StaleAfter.D()})
+	ctl := control.New(deps, control.Options{RequireAuth: c.Control.RequireAuth, StaleAfter: c.Policy.StaleAfter.D(), MultiUser: multiUser})
+	ctlHandler := ctl.Handler()
 	mux := http.NewServeMux()
 	mux.Handle("/v1/", px.Handler())
-	mux.Handle("/", ctl.Handler())
+	if multiUser {
+		// Browser surface: OIDC login/logout, the static user UI and its
+		// session JSON API (served by the control server, which also
+		// redirects the legacy widget at / to /ui/). All of it stays behind
+		// HostGuard below; PublicBaseURL's host is admitted by config.
+		mux.Handle("/auth/", a.WebLogin.Handler())
+		mux.Handle("/ui/", userui.Handler())
+		mux.Handle("/ui/v1/", ctlHandler)
+	}
+	mux.Handle("/", ctlHandler)
 	var allowed []string
 	if c.AllowNonLoopback {
 		allowed = c.AllowedHosts
@@ -313,8 +392,9 @@ func (e errInvalidCollectorRecord) Error() string {
 func (errInvalidCollectorRecord) Permanent() bool { return true }
 
 // sanitizeCollectorRecord bounds free-form labels (core.TruncateLabel,
-// core.TruncateError) and rejects any token count outside
-// [0, core.MaxRecordTokens]. Valid records are returned unchanged.
+// core.TruncateError), clears any owner (UserID/KeyID) and rejects any token
+// count outside [0, core.MaxRecordTokens]. Valid, unowned records are
+// returned unchanged.
 func sanitizeCollectorRecord(r core.RequestRecord) (core.RequestRecord, error) {
 	u := r.Usage
 	for _, v := range []int64{u.InputTokens, u.CachedInputTokens, u.CacheCreationInputTokens, u.OutputTokens, u.ReasoningTokens} {
@@ -327,6 +407,10 @@ func sanitizeCollectorRecord(r core.RequestRecord) (core.RequestRecord, error) {
 	}
 	r.Class = core.Class(core.TruncateLabel(string(r.Class)))
 	r.Error = core.TruncateError(r.Error)
+	// Collectors parse local log files: their rows are never attributed to an
+	// identity user or key (nothing authenticated them), whatever the record
+	// or its client label says. Unowned rows are visible to global views only.
+	r.UserID, r.KeyID = "", ""
 	return r, nil
 }
 func (l collectorLedger) Close() error { return nil }

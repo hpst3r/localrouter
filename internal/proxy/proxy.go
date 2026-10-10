@@ -38,6 +38,8 @@ const (
 
 // Deps are the collaborators the proxy needs. All interface fields are required
 // except Clock and Logger, which default to core.SystemClock and slog.Default().
+// Authenticate is the legacy single-user authenticator; AuthenticatePrincipal
+// replaces it when MultiUser is set.
 type Deps struct {
 	Accounts     map[string]core.Account
 	Routes       []core.Route
@@ -63,6 +65,20 @@ type Deps struct {
 	// follows a successful Reserve. A Reserve error is terminal: the attempt is
 	// not sent, does not fail over, and is not settled.
 	Budget Budget
+	// MultiUser selects multi-user authentication: every request is
+	// authenticated by AuthenticatePrincipal only (never Authenticate, never
+	// cookies), its ledger row and budget reservation are attributed to the
+	// principal's UserID/KeyID, the Limiter must implement PrincipalLimiter,
+	// and policy denials omit the policy's reason. False keeps the legacy
+	// behaviour exactly.
+	MultiUser bool
+	// AuthenticatePrincipal authenticates the Authorization bearer token in
+	// multi-user mode. An error wrapping core.ErrAuthUnavailable answers 503,
+	// any other error 401; a nil authenticator in multi-user mode fails closed
+	// with 503. The returned principal must be an inference principal (see
+	// validInferencePrincipal); a user key's empty Client.Name is set to its
+	// KeyID. Unused when MultiUser is false.
+	AuthenticatePrincipal core.BearerAuthenticator
 }
 
 // Budget gates one upstream attempt against the budget store. It is satisfied by
@@ -94,6 +110,16 @@ type Limiter interface {
 	// saturated. The returned release must be called exactly once however the
 	// request ends.
 	Acquire(client string) (release func(), ok bool)
+}
+
+// PrincipalLimiter is the optional Limiter capability multi-user mode
+// requires: it admits an authenticated principal, counting it against the
+// global and per-client limits and also against its owning user's limit across
+// all of that user's credentials. It is satisfied by *connlim.Controller and
+// *connlim.View. In multi-user mode a Limiter without it fails closed (503);
+// legacy mode always uses Acquire.
+type PrincipalLimiter interface {
+	AcquirePrincipal(p core.Principal) (release func(), ok bool)
 }
 
 // Options tune proxy behaviour.
@@ -207,13 +233,127 @@ func (p *Proxy) authenticate(r *http.Request) (core.Client, bool) {
 	return p.deps.Authenticate(strings.TrimSpace(h[len(prefix):]))
 }
 
+// errAuthNotConfigured is the fail-closed outcome of multi-user mode without a
+// principal authenticator: a wiring error, never a fallback to legacy auth.
+var errAuthNotConfigured = fmt.Errorf("proxy: multi-user mode without AuthenticatePrincipal: %w", core.ErrAuthUnavailable)
+
+// authenticatePrincipal authenticates r from its Authorization bearer header
+// only; cookies and every other header are ignored. In legacy mode it wraps the
+// legacy Authenticate result as a RoleLegacy static-client principal, exactly as
+// before. In multi-user mode it calls only AuthenticatePrincipal: an error
+// wrapping core.ErrAuthUnavailable (including a missing authenticator) is
+// returned as such so the caller answers 503, and every other failure as
+// core.ErrUnauthenticated (401). A user key's empty client name becomes its key
+// id, its opaque, stable client identity.
+func (p *Proxy) authenticatePrincipal(r *http.Request) (core.Principal, error) {
+	if !p.deps.MultiUser {
+		client, ok := p.authenticate(r)
+		if !ok {
+			return core.Principal{}, core.ErrUnauthenticated
+		}
+		return core.Principal{Kind: core.PrincipalStaticClient, Role: core.RoleLegacy, Client: client}, nil
+	}
+	h := r.Header.Get("Authorization")
+	const prefix = "bearer "
+	if len(h) <= len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
+		return core.Principal{}, core.ErrUnauthenticated
+	}
+	if p.deps.AuthenticatePrincipal == nil {
+		return core.Principal{}, errAuthNotConfigured
+	}
+	pr, err := p.deps.AuthenticatePrincipal(r.Context(), strings.TrimSpace(h[len(prefix):]))
+	switch {
+	case errors.Is(err, core.ErrAuthUnavailable):
+		return core.Principal{}, err
+	case err != nil:
+		return core.Principal{}, core.ErrUnauthenticated
+	}
+	if pr.Kind == core.PrincipalUserKey && pr.Client.Name == "" {
+		pr.Client.Name = pr.KeyID
+	}
+	if !validInferencePrincipal(pr) {
+		// A shape the authenticator should never produce: fail closed. Only
+		// the fixed kind/role enums are logged, never ids or names.
+		p.log.Warn("inference principal rejected", "kind", core.TruncateLabel(string(pr.Kind)),
+			"role", core.TruncateLabel(string(pr.Role)))
+		return core.Principal{}, core.ErrUnauthenticated
+	}
+	return pr, nil
+}
+
+// validInferencePrincipal reports whether pr may run inference in multi-user
+// mode. Accepted shapes are exactly:
+//
+//   - a static client (PrincipalStaticClient) with RoleService (optionally
+//     owned) or RoleUser (owner required), a configured name, a real class and
+//     no key id;
+//   - a user API key (PrincipalUserKey) with RoleUser, an owner and a key id,
+//     whose client identity is the key id itself, interactive, with no host and
+//     no ingest right.
+//
+// Sessions (browser cookies are never inference credentials), admin and legacy
+// roles, unknown kinds and malformed opaque ids are rejected, so a principal
+// can never claim another client's name, class or budget.
+func validInferencePrincipal(pr core.Principal) bool {
+	switch pr.Kind {
+	case core.PrincipalStaticClient:
+		if pr.Client.Name == "" || pr.KeyID != "" || !validClass(pr.Client.Class) {
+			return false
+		}
+		switch pr.Role {
+		case core.RoleService:
+			return pr.UserID == "" || validOpaqueID(pr.UserID)
+		case core.RoleUser:
+			return validOpaqueID(pr.UserID)
+		}
+		return false
+	case core.PrincipalUserKey:
+		return pr.Role == core.RoleUser && validOpaqueID(pr.UserID) && validOpaqueID(pr.KeyID) &&
+			pr.Client.Name == pr.KeyID && pr.Client.Class == core.ClassInteractive &&
+			pr.Client.Host == "" && !pr.Client.Ingest
+	}
+	return false
+}
+
+func validClass(c core.Class) bool {
+	return c == core.ClassInteractive || c == core.ClassBackground
+}
+
+// validOpaqueID reports whether id is a well-formed opaque identifier: 1 to
+// 128 bytes of ASCII letters, digits, '_' and '-' (identity ids are "u_…" and
+// "k_…"). It is a shape check only.
+func validOpaqueID(id string) bool {
+	if id == "" || len(id) > 128 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		b := id[i]
+		if !('a' <= b && b <= 'z' || 'A' <= b && b <= 'Z' || '0' <= b && b <= '9' || b == '_' || b == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// writeAuthFailure answers an authentication failure: 503 when the
+// authentication backend is unavailable, 401 otherwise. Neither reveals the
+// token or the backend's error text.
+func (p *Proxy) writeAuthFailure(w http.ResponseWriter, err error) {
+	if errors.Is(err, core.ErrAuthUnavailable) {
+		p.log.Error("inference authentication unavailable")
+		writeError(w, http.StatusServiceUnavailable, "localrouter: authentication temporarily unavailable", "authentication_unavailable")
+		return
+	}
+	writeUnauthorized(w)
+}
+
 func (p *Proxy) serveModels(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "localrouter: method not allowed", "invalid_request_error")
 		return
 	}
-	if _, ok := p.authenticate(r); !ok {
-		writeUnauthorized(w)
+	if _, err := p.authenticatePrincipal(r); err != nil {
+		p.writeAuthFailure(w, err)
 		return
 	}
 	type model struct {
@@ -234,6 +374,7 @@ func (p *Proxy) serveModels(w http.ResponseWriter, r *http.Request) {
 // request is one parsed downstream inference request.
 type request struct {
 	endpoint   string // "/responses" or "/chat/completions"
+	principal  core.Principal
 	client     core.Client
 	class      core.Class
 	model      string
@@ -255,11 +396,12 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 		writeError(w, http.StatusMethodNotAllowed, "localrouter: method not allowed", "invalid_request_error")
 		return
 	}
-	client, ok := p.authenticate(r)
-	if !ok {
-		writeUnauthorized(w)
+	principal, err := p.authenticatePrincipal(r)
+	if err != nil {
+		p.writeAuthFailure(w, err)
 		return
 	}
+	client := principal.Client
 	class := client.Class
 	if class == core.ClassInteractive && strings.EqualFold(strings.TrimSpace(r.Header.Get("X-LocalRouter-Class")), string(core.ClassBackground)) {
 		class = core.ClassBackground
@@ -270,7 +412,21 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 	// no work). The slot is held until forward returns, i.e. for the whole
 	// response including streams, aborts and every failover attempt.
 	if p.deps.Limiter != nil {
-		release, ok := p.deps.Limiter.Acquire(client.Name)
+		var (
+			release func()
+			ok      bool
+		)
+		if p.deps.MultiUser {
+			pl, can := p.deps.Limiter.(PrincipalLimiter)
+			if !can {
+				p.log.Error("concurrency limiter cannot count users in multi-user mode")
+				writeError(w, http.StatusServiceUnavailable, "localrouter: concurrency limiter unavailable", "server_error")
+				return
+			}
+			release, ok = pl.AcquirePrincipal(principal)
+		} else {
+			release, ok = p.deps.Limiter.Acquire(client.Name)
+		}
 		if !ok {
 			writeConcurrencyLimit(w, r)
 			return
@@ -355,6 +511,7 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 
 	p.forward(w, r, &request{
 		endpoint:   endpoint,
+		principal:  principal,
 		client:     client,
 		class:      class,
 		model:      head.Model,
