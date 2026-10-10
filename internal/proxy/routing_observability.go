@@ -11,6 +11,10 @@ const (
 	outcomeUpstreamError   = "upstream_error"   // upstream answered 4xx/5xx (or a buffered retryable status)
 	outcomeTransportError  = "transport_error"  // no usable upstream response (dial/TLS/mid-stream failure, credential unavailable)
 	outcomeClientCancelled = "client_cancelled" // the downstream client went away
+	// The budget denied the attempt before any upstream contact. The values
+	// match the proxy's own error types for these answers.
+	outcomeBudgetExceeded   = "budget_exceeded"    // a spend ceiling had no room for the hold
+	outcomeBudgetStoreError = "budget_store_error" // the budget store could not reserve
 )
 
 // eventRoutingAttemptCompleted is the value of the "event" attribute carried by

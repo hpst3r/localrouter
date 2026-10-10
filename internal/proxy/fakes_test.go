@@ -228,7 +228,11 @@ type harness struct {
 	routes   []core.Route
 	opts     Options
 	pol      core.Policy // nil means the fake policy
-	srv      *httptest.Server
+	// budget, when set before start(), is installed as Deps.Budget.
+	budget Budget
+	// led, when set before start(), replaces the fake ledger as Deps.Ledger.
+	led core.Ledger
+	srv *httptest.Server
 	// handled counts proxy handler invocations that have returned.
 	handled atomic.Int64
 }
@@ -284,6 +288,18 @@ func (h *harness) start() {
 			h.srv.Close()
 		}
 	})
+	ph := h.newProxy().Handler()
+	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer h.handled.Add(1)
+		ph.ServeHTTP(w, r)
+	}))
+	h.t.Cleanup(h.srv.Close)
+}
+
+// newProxy builds the harness's proxy from its fakes and every optional
+// override (logHandler, clock, pol, budget, led), for start() and for tests
+// that drive the handler directly.
+func (h *harness) newProxy() *Proxy {
 	var handler slog.Handler = slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})
 	if h.logHandler != nil {
 		handler = h.logHandler
@@ -296,9 +312,13 @@ func (h *harness) start() {
 	if h.pol != nil {
 		pol = h.pol
 	}
-	p := New(Deps{
+	var led core.Ledger = h.ledger
+	if h.led != nil {
+		led = h.led
+	}
+	return New(Deps{
 		Accounts: h.accounts, Routes: h.routes, Creds: h.creds, Quota: h.quota,
-		Policy: pol, Ledger: h.ledger, Clock: clock, Limiter: h.limiter,
+		Policy: pol, Ledger: led, Clock: clock, Limiter: h.limiter, Budget: h.budget,
 		Logger: slog.New(handler),
 		Authenticate: func(bearer string) (core.Client, bool) {
 			switch bearer {
@@ -310,12 +330,6 @@ func (h *harness) start() {
 			return core.Client{}, false
 		},
 	}, h.opts)
-	ph := p.Handler()
-	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer h.handled.Add(1)
-		ph.ServeHTTP(w, r)
-	}))
-	h.t.Cleanup(h.srv.Close)
 }
 
 // waitHandled waits until n proxy handler invocations have returned, so

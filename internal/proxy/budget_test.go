@@ -6,9 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
-	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -124,39 +122,19 @@ func (b *fakeBudget) waitSettles(t *testing.T, n int) []core.RequestRecord {
 	return b.settled()
 }
 
-// startBudget serves the harness's proxy with Budget installed. harness.start
-// does not wire a budget, so the budget tests build the same proxy from the
-// same fakes with the extra dependency.
+// startBudget serves the harness's proxy with Budget installed. It is
+// harness.start with the extra dependency, so every other harness override
+// (logHandler, clock, pol, led) and the handled counter still apply.
 func (h *harness) startBudget(b Budget) {
-	// Registered after the per-upstream servers so it runs first: release any
-	// blocked upstream handler and stop the proxy before their servers close.
-	h.t.Cleanup(func() {
-		h.closeGates()
-		if h.srv != nil {
-			h.srv.CloseClientConnections()
-			h.srv.Close()
-		}
-	})
-	h.srv = httptest.NewServer(h.budgetProxy(b).Handler())
+	h.budget = b
+	h.start()
 }
 
 // budgetProxy builds the harness's proxy with Budget installed, for tests that
 // drive the handler directly rather than through startBudget's server.
 func (h *harness) budgetProxy(b Budget) *Proxy {
-	return New(Deps{
-		Accounts: h.accounts, Routes: h.routes, Creds: h.creds, Quota: h.quota,
-		Policy: h.policy, Ledger: h.ledger, Clock: fixedClock{testNow}, Limiter: h.limiter, Budget: b,
-		Logger: slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
-		Authenticate: func(bearer string) (core.Client, bool) {
-			switch bearer {
-			case clientKey:
-				return core.Client{Name: "alice", Class: core.ClassInteractive}, true
-			case bgKey:
-				return core.Client{Name: "batch", Class: core.ClassBackground, Host: "vm1"}, true
-			}
-			return core.Client{}, false
-		},
-	}, h.opts)
+	h.budget = b
+	return h.newProxy()
 }
 
 // acquires is the number of times the policy admitted an attempt, i.e. how

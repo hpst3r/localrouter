@@ -172,6 +172,8 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		// reservation error is terminal: a denied client must not fail over
 		// onto another account's budget, and a store error must not be papered
 		// over by spending. Neither is settled, because neither was reserved.
+		// Each denial still writes a ledger row, so it emits that row's
+		// completion event too: terminal, never failover-eligible, status 0.
 		if p.deps.Budget != nil {
 			if err := p.deps.Budget.Reserve(ctx, rec); err != nil {
 				lease.Release(core.Outcome{})
@@ -179,7 +181,10 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 					p.log.Info("budget exceeded", "client", rec.Client, "class", req.class,
 						"account", acctID, "model", req.model)
 					rec.Error = "budget exceeded"
-					p.record(ctx, rec)
+					rec = p.record(ctx, rec)
+					ev.outcome = outcomeBudgetExceeded
+					ev.latencyMS = rec.LatencyMS
+					p.emitAttempt(ev)
 					writeError(w, http.StatusTooManyRequests, "localrouter: budget exceeded", "budget_exceeded")
 					return attemptResult{done: true}
 				}
@@ -187,7 +192,10 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 				// store outage: nothing was reserved and nobody reads a reply.
 				if ctx.Err() != nil {
 					rec.Error = "client disconnected"
-					p.record(ctx, rec)
+					rec = p.record(ctx, rec)
+					ev.outcome = outcomeClientCancelled
+					ev.latencyMS = rec.LatencyMS
+					p.emitAttempt(ev)
 					return attemptResult{done: true}
 				}
 				// Log a sanitized class only: the store's own error text can
@@ -195,7 +203,10 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 				p.log.Error("budget reserve failed", "client", rec.Client, "account", acctID,
 					"class", budgetErrClass(err))
 				rec.Error = "budget store error"
-				p.record(ctx, rec)
+				rec = p.record(ctx, rec)
+				ev.outcome = outcomeBudgetStoreError
+				ev.latencyMS = rec.LatencyMS
+				p.emitAttempt(ev)
 				writeError(w, http.StatusServiceUnavailable, "localrouter: budget store unavailable", "budget_store_error")
 				return attemptResult{done: true}
 			}
