@@ -23,10 +23,17 @@ type budgetReport struct {
 	store  *budget.Store
 	limits []budget.Limit
 	hold   int64
+	// users are the generation's global per-user default ceilings
+	// (budgets.users) with an empty Key; UserLimits instantiates them.
+	users []budget.Limit
 }
 
-// budgetReport implements exactly control.BudgetSource.
-var _ control.BudgetSource = (*budgetReport)(nil)
+// budgetReport implements control.BudgetSource and, for multi-user
+// generations, control.UserBudgetSource.
+var (
+	_ control.BudgetSource     = (*budgetReport)(nil)
+	_ control.UserBudgetSource = (*budgetReport)(nil)
+)
 
 // budgetSource builds this generation's read-only budget view over the shared
 // store, with the ceilings and fixed reservation copied from the generation's
@@ -47,7 +54,29 @@ func (a *App) budgetSource(b *config.BudgetConfig) control.BudgetSource {
 	if err != nil {
 		return nil
 	}
-	return &budgetReport{store: a.budgetStore, limits: limits, hold: hold}
+	r := &budgetReport{store: a.budgetStore, limits: limits, hold: hold}
+	if b.Users != nil {
+		if r.users, err = b.Users.Limits(budget.ScopeUser, ""); err != nil {
+			return nil
+		}
+	}
+	return r
+}
+
+// UserLimits returns the per-user ceilings this generation's Gate enforces
+// for userID: the configured default for each period, keyed by the user id
+// (explicit per-user overrides are not configurable in this version). Nil for
+// an empty id or when no user default is configured.
+func (r *budgetReport) UserLimits(userID string) []budget.Limit {
+	if r == nil || userID == "" || len(r.users) == 0 {
+		return nil
+	}
+	out := make([]budget.Limit, len(r.users))
+	for i, l := range r.users {
+		l.Key = userID
+		out[i] = l
+	}
+	return out
 }
 
 // Snapshot reads one period instance (at interpreted in UTC). A nil adapter or

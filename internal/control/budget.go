@@ -13,6 +13,7 @@ import (
 
 	"github.com/hpst3r/localrouter/internal/budget"
 	"github.com/hpst3r/localrouter/internal/core"
+	"github.com/hpst3r/localrouter/internal/identity"
 )
 
 // budgetReadTimeout bounds the store reads a single budget request performs, so
@@ -43,6 +44,20 @@ type BudgetSource interface {
 	Limits() []budget.Limit
 	// ReservationMicros is this generation's fixed per-attempt hold.
 	ReservationMicros() int64
+}
+
+// UserBudgetSource is optionally implemented by the value in Deps.Budgets in
+// multi-user mode. It supplies the per-user ceilings, which are dynamic (one
+// per user) and therefore cannot be listed in Limits.
+type UserBudgetSource interface {
+	// UserLimits returns this generation's effective ceilings for userID,
+	// instantiated as Limit{Scope: budget.ScopeUser, Key: userID, Period,
+	// Micros} — exactly the user limits the generation's Gate enforces for
+	// that user (configured default and any explicit entry already resolved
+	// by the implementation). Nil or empty means the user is unlimited.
+	// Entries naming another scope or user are ignored. User usage itself is
+	// read through Snapshot(ctx, budget.ScopeUser, userID, period, at).
+	UserLimits(userID string) []budget.Limit
 }
 
 // budgetDoc is the GET /control/v1/budgets response. When spend controls are
@@ -114,8 +129,16 @@ func (s *Server) budgets(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	scope := q.Get("scope")
 	key := q.Get("key")
-	if scope != budget.ScopeClient && scope != budget.ScopeAccount {
-		writeError(w, http.StatusBadRequest, "scope must be client or account")
+	// Multi-user global readers (admin session, service) may also read one
+	// user's instances; the user must exist in the identity store.
+	_, multi := authFrom(r.Context())
+	userScope := multi && scope == budget.ScopeUser
+	if scope != budget.ScopeClient && scope != budget.ScopeAccount && !userScope {
+		msg := "scope must be client or account"
+		if multi {
+			msg = "scope must be client, account or user"
+		}
+		writeError(w, http.StatusBadRequest, msg)
 		return
 	}
 	if key == "" {
@@ -130,6 +153,10 @@ func (s *Server) budgets(w http.ResponseWriter, r *http.Request) {
 		}
 		periods = []string{p}
 	}
+	if userScope {
+		s.userBudgets(w, r, src, key, periods)
+		return
+	}
 	// The readable identities come only from this generation's configuration;
 	// a non-member never reaches the store.
 	if !s.knownIdentity(scope, key) {
@@ -137,10 +164,45 @@ func (s *Server) budgets(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.writeBudgetDoc(w, r, src, scope, key, periods, src.Limits())
+}
+
+// userBudgets renders one user's instances for a global reader. The user id
+// is checked against the identity store first, so an unknown id never reaches
+// the budget store and is never echoed.
+func (s *Server) userBudgets(w http.ResponseWriter, r *http.Request, src BudgetSource, user string, periods []string) {
+	if s.deps.Identity == nil {
+		writeError(w, http.StatusServiceUnavailable, "identity unavailable")
+		return
+	}
+	if !idParamRE.MatchString(user) {
+		writeError(w, http.StatusNotFound, "unknown user")
+		return
+	}
+	if _, err := s.deps.Identity.User(r.Context(), user); err != nil {
+		if errors.Is(err, identity.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "unknown user")
+			return
+		}
+		slog.Warn("control: identity store unavailable")
+		writeError(w, http.StatusServiceUnavailable, "identity unavailable")
+		return
+	}
+	limits, ok := effectiveLimits(src, user)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, budgetUnavailableMsg)
+		return
+	}
+	s.writeBudgetDoc(w, r, src, budget.ScopeUser, user, periods, limits)
+}
+
+// writeBudgetDoc reads and renders the (scope,key) instances for periods
+// against limits. The caller has already authorized and validated the
+// identity; this never takes it from the request.
+func (s *Server) writeBudgetDoc(w http.ResponseWriter, r *http.Request, src BudgetSource, scope, key string, periods []string, limits []budget.Limit) {
 	// One clock read governs the whole document: every period boundary and every
 	// Snapshot call below uses this same UTC instant.
 	now := s.deps.Clock.Now().UTC()
-	limits := src.Limits()
 	ctx, cancel := context.WithTimeout(r.Context(), budgetReadTimeout)
 	defer cancel()
 

@@ -28,7 +28,8 @@ const (
 	analyticsChunks = 4
 )
 
-// dimensionColumns maps core.AnalyticsDimensions to SQL columns.
+// dimensionColumns maps core.AnalyticsDimensions to SQL columns. A scoped
+// query may also use AnalyticsOwnerDimensions (see ownerColumns).
 var dimensionColumns = map[string]string{
 	"host":    "host",
 	"account": "account_id",
@@ -49,6 +50,10 @@ func (l *Ledger) Analytics(ctx context.Context, q core.AnalyticsQuery) (core.Ana
 
 // analytics is Analytics with an explicit location for day buckets.
 func (l *Ledger) analytics(ctx context.Context, q core.AnalyticsQuery, loc *time.Location) (core.AnalyticsResult, error) {
+	ownerSQL, ownerArgs, err := l.readFilter(q.Scope)
+	if err != nil {
+		return core.AnalyticsResult{}, err
+	}
 	groupCol, topN, err := validateAnalytics(q)
 	if err != nil {
 		return core.AnalyticsResult{}, err
@@ -64,15 +69,19 @@ func (l *Ledger) analytics(ctx context.Context, q core.AnalyticsQuery, loc *time
 		slot = gcd(slot, s.UnixMilli()-base)
 	}
 
-	var filterSQL string
-	var filterArgs []any
+	// The owner predicate leads the filter clause shared by the ranking and the
+	// per-slot queries, so every aggregate — ranking, top-N, __other__, series,
+	// totals and BreakdownOmitted — only ever sees the scoped rows.
+	filterSQL := ownerSQL
+	filterArgs := append([]any(nil), ownerArgs...)
 	keys := make([]string, 0, len(q.Filters))
 	for k := range q.Filters {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		filterSQL += " AND " + dimensionColumns[k] + " = ?"
+		col, _ := scopedColumn(dimensionColumns, k, q.Scope) // validated above
+		filterSQL += " AND " + col + " = ?"
 		filterArgs = append(filterArgs, q.Filters[k])
 	}
 
@@ -338,12 +347,12 @@ func scanAgg(rows *sql.Rows, u *core.UsageRow, lead ...any) error {
 
 // validateAnalytics checks q and returns the group column and effective TopN.
 func validateAnalytics(q core.AnalyticsQuery) (string, int, error) {
-	col, ok := dimensionColumns[q.Group]
+	col, ok := scopedColumn(dimensionColumns, q.Group, q.Scope)
 	if !ok {
 		return "", 0, fmt.Errorf("analytics: unknown group %q", q.Group)
 	}
 	for k := range q.Filters {
-		if _, ok := dimensionColumns[k]; !ok {
+		if _, ok := scopedColumn(dimensionColumns, k, q.Scope); !ok {
 			return "", 0, fmt.Errorf("analytics: unknown filter %q", k)
 		}
 	}

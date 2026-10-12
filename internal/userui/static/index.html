@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>LocalRouter</title>
+<link rel="stylesheet" href="/ui/assets/style.css">
+<script src="/ui/assets/app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <span class="brand">LocalRouter</span>
+  <div id="session" class="session" hidden>
+    <span id="session-name" class="session-name"></span>
+    <span id="session-role" class="badge"></span>
+    <button type="button" id="logout">Sign out</button>
+  </div>
+</header>
+<nav id="nav" class="nav" aria-label="Sections" hidden>
+  <button type="button" id="nav-profile" data-view="profile">Profile</button>
+  <button type="button" id="nav-keys" data-view="keys">API keys</button>
+  <button type="button" id="nav-usage" data-view="usage">Usage</button>
+  <span id="admin-nav" class="admin-nav" hidden>
+    <button type="button" id="nav-users" data-view="users">Users</button>
+    <button type="button" id="nav-audit" data-view="audit">Audit log</button>
+    <button type="button" id="nav-global" data-view="global">Global usage</button>
+    <button type="button" id="nav-system" data-view="system">Status</button>
+  </span>
+</nav>
+<main id="main" tabindex="-1">
+  <p id="notice" class="notice" role="status" aria-live="polite"></p>
+  <p id="error" class="error" role="alert" hidden></p>
+
+  <section id="view-loading" class="view">
+    <p class="muted">Loading…</p>
+  </section>
+
+  <section id="view-login" class="view" aria-labelledby="login-title" hidden>
+    <h1 id="login-title">Sign in</h1>
+    <p>Sign in with your organization account to manage your API keys and usage.</p>
+    <p><a id="login-link" class="button primary" href="/auth/login">Sign in</a></p>
+  </section>
+
+  <section id="view-profile" class="view" aria-labelledby="profile-title" hidden>
+    <h1 id="profile-title">Profile</h1>
+    <dl id="profile" class="kv"></dl>
+  </section>
+
+  <section id="view-keys" class="view" aria-labelledby="keys-title" hidden>
+    <h1 id="keys-title">API keys</h1>
+    <form id="key-form" class="inline-form" novalidate>
+      <label for="key-name">Name</label>
+      <input id="key-name" name="name" type="text" maxlength="64" autocomplete="off" required>
+      <label for="key-ttl">Lifetime</label>
+      <select id="key-ttl" name="ttl">
+        <option value="">Maximum allowed</option>
+        <option value="86400">1 day</option>
+        <option value="604800">7 days</option>
+        <option value="2592000">30 days</option>
+        <option value="7776000">90 days</option>
+      </select>
+      <button type="submit" id="key-create" class="primary">Create key</button>
+    </form>
+    <div id="new-key" class="secret" role="region" aria-labelledby="new-key-title" hidden>
+      <h2 id="new-key-title">New API key</h2>
+      <p>Copy this key now. It is shown only once and is not stored by this page.</p>
+      <code id="new-key-token" class="token"></code>
+      <div class="actions">
+        <button type="button" id="new-key-copy">Copy</button>
+        <button type="button" id="new-key-done">Done</button>
+      </div>
+    </div>
+    <div id="keys" class="data"></div>
+  </section>
+
+  <section id="view-usage" class="view" aria-labelledby="usage-title" hidden>
+    <h1 id="usage-title">Usage</h1>
+    <form id="usage-form" class="inline-form">
+      <label for="usage-range">Range</label>
+      <select id="usage-range" name="range">
+        <option value="24h">24 hours</option>
+        <option value="7d" selected>7 days</option>
+        <option value="30d">30 days</option>
+        <option value="90d">90 days</option>
+      </select>
+      <label for="usage-group">Group by</label>
+      <select id="usage-group" name="group">
+        <option value="model" selected>Model</option>
+        <option value="class">Class</option>
+        <option value="route">Route</option>
+        <option value="task">Task</option>
+        <option value="agent">Agent</option>
+        <option value="key">API key</option>
+      </select>
+      <button type="submit">Refresh</button>
+    </form>
+    <h2>Budget</h2>
+    <div id="usage-budget" class="data"></div>
+    <h2>Summary</h2>
+    <div id="usage-summary" class="data"></div>
+    <h2>Analytics</h2>
+    <div id="usage-analytics" class="data"></div>
+    <h2>Dimensions</h2>
+    <div id="usage-dimensions" class="data"></div>
+  </section>
+
+  <section id="view-users" class="view" aria-labelledby="users-title" hidden>
+    <h1 id="users-title">Users</h1>
+    <div id="users" class="data"></div>
+    <p><button type="button" id="users-more" hidden>Load more</button></p>
+    <div id="user-keys" hidden>
+      <h2 id="user-keys-title">Keys</h2>
+      <div id="user-keys-list" class="data"></div>
+    </div>
+  </section>
+
+  <section id="view-audit" class="view" aria-labelledby="audit-title" hidden>
+    <h1 id="audit-title">Audit log</h1>
+    <div id="audit" class="data"></div>
+    <p><button type="button" id="audit-more" hidden>Load more</button></p>
+  </section>
+
+  <section id="view-global" class="view" aria-labelledby="global-title" hidden>
+    <h1 id="global-title">Global usage</h1>
+    <form id="global-form" class="inline-form">
+      <label for="global-range">Range</label>
+      <select id="global-range" name="range">
+        <option value="24h">24 hours</option>
+        <option value="7d" selected>7 days</option>
+        <option value="30d">30 days</option>
+        <option value="90d">90 days</option>
+      </select>
+      <label for="global-group">Group by</label>
+      <select id="global-group" name="group">
+        <option value="account" selected>Account</option>
+        <option value="model">Model</option>
+        <option value="class">Class</option>
+        <option value="client">Client</option>
+        <option value="host">Host</option>
+        <option value="route">Route</option>
+        <option value="task">Task</option>
+        <option value="agent">Agent</option>
+        <option value="user">User</option>
+        <option value="key">API key</option>
+      </select>
+      <button type="submit">Refresh</button>
+    </form>
+    <h2>Summary</h2>
+    <div id="global-summary" class="data"></div>
+    <h2>Analytics</h2>
+    <div id="global-analytics" class="data"></div>
+    <h2>Dimensions</h2>
+    <div id="global-dimensions" class="data"></div>
+    <h2>Budgets</h2>
+    <form id="budget-form" class="inline-form" novalidate>
+      <label for="budget-scope">Scope</label>
+      <select id="budget-scope" name="scope">
+        <option value="client" selected>Client</option>
+        <option value="account">Account</option>
+        <option value="user">User</option>
+      </select>
+      <label for="budget-key">Name or ID</label>
+      <input id="budget-key" name="key" type="text" maxlength="256" autocomplete="off" required>
+      <button type="submit">Look up</button>
+    </form>
+    <div id="global-budgets" class="data"></div>
+  </section>
+
+  <section id="view-system" class="view" aria-labelledby="system-title" hidden>
+    <h1 id="system-title">Status</h1>
+    <p><button type="button" id="system-refresh">Refresh</button></p>
+    <h2>Status</h2>
+    <div id="system-status" class="data"></div>
+    <h2>Diagnostics</h2>
+    <div id="system-diagnostics" class="data"></div>
+  </section>
+</main>
+
+<dialog id="confirm" aria-labelledby="confirm-title" aria-describedby="confirm-text">
+  <h2 id="confirm-title">Confirm</h2>
+  <p id="confirm-text"></p>
+  <div class="actions">
+    <button type="button" id="confirm-cancel">Cancel</button>
+    <button type="button" id="confirm-ok" class="danger">Confirm</button>
+  </div>
+</dialog>
+</body>
+</html>

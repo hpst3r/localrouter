@@ -539,9 +539,12 @@ func TestClassDowngradeOnly(t *testing.T) {
 		{clientKey, "background", core.ClassBackground},
 		{bgKey, "interactive", core.ClassBackground},
 	}
-	for _, c := range cases {
+	for i, c := range cases {
 		resp := h.post("/v1/responses", c.key, respBody, map[string]string{"X-LocalRouter-Class": c.hdr})
 		resp.Body.Close()
+		// The ledger row is written after the body is relayed: wait for it
+		// so rows[i] belongs to case i.
+		h.waitRows(i + 1)
 	}
 	got := h.policy.classes()
 	for i, c := range cases {

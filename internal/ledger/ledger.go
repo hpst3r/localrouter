@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/core"
@@ -24,6 +25,9 @@ type Ledger struct {
 	pricing *Pricing
 	basis   func(accountID string) string
 	mu      sync.Mutex // serializes writes
+	// requireScope is set once by RequireScope (multi-user mode): unscoped
+	// reads are denied from then on.
+	requireScope atomic.Bool
 }
 
 var (
@@ -103,6 +107,15 @@ var migrations = []string{
 	// before.
 	`ALTER TABLE requests ADD COLUMN upstream_model TEXT;
 ALTER TABLE requests ADD COLUMN pricing_model TEXT;`,
+	// v4 -> v5: row ownership. user_id is the opaque internal id of the user
+	// whose credential made the request and key_id the user API key id. Both
+	// are nullable and never backfilled: a legacy, unowned static-client or
+	// collector row keeps NULL (honest "unowned") and is visible only to an
+	// all-users read; ownership is never guessed from the client text. The
+	// (user_id, started_at) index serves owner-scoped range reads.
+	`ALTER TABLE requests ADD COLUMN user_id TEXT;
+ALTER TABLE requests ADD COLUMN key_id TEXT;
+CREATE INDEX requests_user_started ON requests(user_id, started_at);`,
 }
 
 // Open opens (creating if needed) the ledger database at path. pricing may be
@@ -191,8 +204,9 @@ const insertSQL = `INSERT INTO requests (
 	account_id, upstream_identity, status, failover_of, input_tokens,
 	cached_input_tokens, output_tokens, reasoning_tokens, usage_known,
 	cost_usd, cost_basis, latency_ms, bytes_out, session, task, agent, error,
-	cache_creation_input_tokens, host, upstream_model, pricing_model
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	cache_creation_input_tokens, host, upstream_model, pricing_model,
+	user_id, key_id
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO NOTHING`
 
 // Record inserts one request row, computing cost from pricing. An empty
@@ -244,6 +258,9 @@ func insertArgs(r core.RequestRecord, pricing *Pricing, basis func(accountID str
 	// SQL NULL (honest "unknown"), which is what every pre-v4 legacy row has.
 	upstreamModel := nullString(r.UpstreamModel)
 	pricingModel := nullString(r.PricingModel)
+	// user_id/key_id likewise store "" as NULL: an unowned row, which only an
+	// all-users read can see. The caller sets them from the authenticated
+	// principal; they are never part of the ingest wire format.
 	usageKnown := 0
 	if r.UsageKnown {
 		usageKnown = 1
@@ -254,6 +271,7 @@ func insertArgs(r core.RequestRecord, pricing *Pricing, basis func(accountID str
 		r.Usage.CachedInputTokens, r.Usage.OutputTokens, r.Usage.ReasoningTokens, usageKnown,
 		cost, costBasis, r.LatencyMS, r.BytesOut, r.Session, r.Task, r.Agent, r.Error,
 		r.Usage.CacheCreationInputTokens, r.Host, upstreamModel, pricingModel,
+		nullString(r.UserID), nullString(r.KeyID),
 	}
 }
 
@@ -479,19 +497,30 @@ const aggCols = `COUNT(*), TOTAL(input_tokens), TOTAL(cached_input_tokens),
 	SUM(CASE WHEN usage_known = 1 AND cost_usd IS NULL THEN 1 ELSE 0 END)`
 
 // Summary aggregates requests started at or after since, grouped by one of
-// account, model, class, client, route, host, or day (local date YYYY-MM-DD).
-// Rows are ordered by key.
+// account, model, class, client, route, host, task, agent, or day (local date
+// YYYY-MM-DD). Rows are ordered by key. It reads every row regardless of owner
+// and is denied once RequireScope has been called; see SummaryScoped.
 func (l *Ledger) Summary(ctx context.Context, since time.Time, group string) ([]core.UsageRow, error) {
-	if group == "day" {
-		return l.summaryByDay(ctx, since)
+	return l.summary(ctx, since, group, nil)
+}
+
+// summary is Summary over the rows scope may see; nil is the legacy unscoped
+// read.
+func (l *Ledger) summary(ctx context.Context, since time.Time, group string, scope *core.DataScope) ([]core.UsageRow, error) {
+	ownerSQL, ownerArgs, err := l.readFilter(scope)
+	if err != nil {
+		return nil, err
 	}
-	col, ok := groupColumns[group]
+	if group == "day" {
+		return l.summaryByDay(ctx, since, ownerSQL, ownerArgs)
+	}
+	col, ok := scopedColumn(groupColumns, group, scope)
 	if !ok {
 		return nil, fmt.Errorf("ledger: unknown summary group %q", group)
 	}
 	rows, err := l.db.QueryContext(ctx, `SELECT `+col+`, `+aggCols+`
-		FROM requests WHERE started_at >= ? GROUP BY `+col+` ORDER BY `+col,
-		since.UnixMilli())
+		FROM requests WHERE started_at >= ?`+ownerSQL+` GROUP BY `+col+` ORDER BY `+col,
+		append([]any{since.UnixMilli()}, ownerArgs...)...)
 	if err != nil {
 		return nil, fmt.Errorf("ledger: summary: %w", err)
 	}
@@ -510,10 +539,10 @@ func (l *Ledger) Summary(ctx context.Context, since time.Time, group string) ([]
 	return out, nil
 }
 
-func (l *Ledger) summaryByDay(ctx context.Context, since time.Time) ([]core.UsageRow, error) {
+func (l *Ledger) summaryByDay(ctx context.Context, since time.Time, ownerSQL string, ownerArgs []any) ([]core.UsageRow, error) {
 	rows, err := l.db.QueryContext(ctx, `SELECT started_at, input_tokens, cached_input_tokens,
 		cache_creation_input_tokens, output_tokens, reasoning_tokens, cost_usd, usage_known
-		FROM requests WHERE started_at >= ?`, since.UnixMilli())
+		FROM requests WHERE started_at >= ?`+ownerSQL, append([]any{since.UnixMilli()}, ownerArgs...)...)
 	if err != nil {
 		return nil, fmt.Errorf("ledger: summary: %w", err)
 	}

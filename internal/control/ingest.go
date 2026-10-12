@@ -41,19 +41,26 @@ var (
 // Validation is all-or-nothing: any invalid record or snapshot rejects the
 // whole request with 400 before anything is written.
 func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
-	token, ok := bearer(r.Header.Get("Authorization"))
-	if !ok || s.deps.Authenticate == nil {
-		writeError(w, http.StatusUnauthorized, "client key required")
-		return
-	}
-	client, ok := s.deps.Authenticate(token)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "invalid client key")
-		return
-	}
-	if !client.Ingest {
-		writeError(w, http.StatusForbidden, "client key is not permitted to ingest")
-		return
+	// In multi-user mode the bearer middleware has already authenticated and
+	// authorized the principal (a service client with Ingest); the legacy
+	// Authenticate is never consulted there.
+	ma, multi := authFrom(r.Context())
+	client := ma.principal.Client
+	if !multi {
+		token, ok := bearer(r.Header.Get("Authorization"))
+		if !ok || s.deps.Authenticate == nil {
+			writeError(w, http.StatusUnauthorized, "client key required")
+			return
+		}
+		client, ok = s.deps.Authenticate(token)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "invalid client key")
+			return
+		}
+		if !client.Ingest {
+			writeError(w, http.StatusForbidden, "client key is not permitted to ingest")
+			return
+		}
 	}
 
 	// Unknown fields are accepted for forward compatibility; trailing data
@@ -86,6 +93,14 @@ func (s *Server) ingest(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]string{"message": err.Error(), "code": code}})
 		return
+	}
+	if multi {
+		// Ownership comes only from the authenticated principal, never from
+		// the body (the fields are json:"-" as well): overwrite both before
+		// anything is written.
+		for i := range req.Records {
+			req.Records[i].UserID, req.Records[i].KeyID = ma.principal.UserID, ma.principal.KeyID
+		}
 	}
 	if len(req.Records) > 0 && s.deps.Ledger == nil {
 		writeError(w, http.StatusServiceUnavailable, "ledger unavailable")

@@ -12,6 +12,11 @@
 // (Controller.View). A View carries one immutable concurrency-limit generation
 // while sharing the Controller's live counters and leases, so a reload can
 // adopt new limits without losing or double-counting in-flight requests.
+//
+// In multi-user mode a request is admitted for its authenticated principal
+// (AcquirePrincipal) and additionally counted against its owning user, keyed by
+// the opaque user id, so one user's limit spans all of their API keys and owned
+// static clients. Per-user counters are shared runtime state like the others.
 package connlim
 
 import (
@@ -35,12 +40,15 @@ var ErrNegativeLimit = errors.New("connlim: limits must not be negative")
 // rebuilt by a reload. mu is a pointer so the same lock guards all of them.
 type Controller struct {
 	mu *sync.Mutex
-	// global/clients are this generation's configured limits.
+	// global/clients/perUser are this generation's configured limits.
 	global  int
 	clients map[string]int
-	// activeGlobal counts every active request; active[c] counts one client.
+	perUser int
+	// activeGlobal counts every active request; active[c] counts one client
+	// and activeUser[u] one user (across all of that user's credentials).
 	activeGlobal int
 	active       map[string]int
+	activeUser   map[string]int
 	peak         int
 }
 
@@ -79,10 +87,21 @@ func (c *Controller) Reconfigure(global int, clientLimits map[string]int) error 
 // or mutate clientLimits. A negative limit returns ErrNegativeLimit and
 // mutates nothing. View never mutates the Controller's own configuration.
 func (c *Controller) View(global int, clientLimits map[string]int) (*View, error) {
+	return c.ViewWithUsers(global, clientLimits, 0)
+}
+
+// ViewWithUsers is View with a per-user limit for this generation: at most
+// perUser requests admitted through AcquirePrincipal may be active at once for
+// one user, counted across every view of the Controller. 0 means unlimited; a
+// negative value returns ErrNegativeLimit.
+func (c *Controller) ViewWithUsers(global int, clientLimits map[string]int, perUser int) (*View, error) {
 	if err := validateLimits(global, clientLimits); err != nil {
 		return nil, err
 	}
-	v := &View{c: c, global: global, clients: make(map[string]int, len(clientLimits))}
+	if perUser < 0 {
+		return nil, ErrNegativeLimit
+	}
+	v := &View{c: c, global: global, perUser: perUser, clients: make(map[string]int, len(clientLimits))}
 	for name, lim := range clientLimits {
 		if lim > 0 {
 			v.clients[name] = lim
@@ -98,7 +117,28 @@ func (c *Controller) View(global int, clientLimits map[string]int) (*View, error
 func (c *Controller) Acquire(client string) (release func(), ok bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.reserveLocked(c.global, c.clients, client)
+	return c.reserveLocked(c.global, c.clients, 0, admission{client: client, countClient: true})
+}
+
+// AcquirePrincipal reserves a slot for an authenticated principal under the
+// Controller's own limits, which carry no per-user limit; the user is still
+// counted so views see it. See View.AcquirePrincipal for the rules.
+func (c *Controller) AcquirePrincipal(p core.Principal) (release func(), ok bool) {
+	a, valid := admissionFor(p)
+	if !valid {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reserveLocked(c.global, c.clients, c.perUser, a)
+}
+
+// UserActive reports how many requests of userID are active across every
+// view. It is for diagnostics and tests; it never enumerates users.
+func (c *Controller) UserActive(userID string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.activeUser[userID]
 }
 
 // Stats reports current capacity and usage for authenticated diagnostics. It
@@ -121,20 +161,84 @@ func (c *Controller) storeLocked(global int, clientLimits map[string]int) {
 	}
 }
 
+// admission names the counters one request occupies: the client counter
+// (static clients and legacy callers only) and the user counter (when the
+// request has an owning user).
+type admission struct {
+	client      string
+	countClient bool
+	user        string
+}
+
+// admissionFor maps a principal onto its counters, reporting false for a
+// principal that may not run inference or is malformed: sessions, unknown
+// kinds, a static client without a name, or a user key without a well-formed
+// owner and key id. A user key is counted per user, never in the per-client
+// map, so its key id can never match (or show up as) a configured client.
+func admissionFor(p core.Principal) (admission, bool) {
+	switch p.Kind {
+	case core.PrincipalStaticClient:
+		if p.Client.Name == "" || (p.UserID != "" && !validOpaqueID(p.UserID)) {
+			return admission{}, false
+		}
+		return admission{client: p.Client.Name, countClient: true, user: p.UserID}, true
+	case core.PrincipalUserKey:
+		if p.Role != core.RoleUser || !validOpaqueID(p.UserID) || !validOpaqueID(p.KeyID) {
+			return admission{}, false
+		}
+		return admission{user: p.UserID}, true
+	}
+	return admission{}, false
+}
+
+// maxOpaqueID bounds an opaque user or key id.
+const maxOpaqueID = 128
+
+// validOpaqueID reports whether id is a well-formed opaque identifier: 1 to
+// 128 bytes of ASCII letters, digits, '_' and '-'. Identity user and key ids
+// ("u_…", "k_…") satisfy it; it is a shape check only and authenticates
+// nothing.
+func validOpaqueID(id string) bool {
+	if id == "" || len(id) > maxOpaqueID {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		b := id[i]
+		if !('a' <= b && b <= 'z' || 'A' <= b && b <= 'Z' || '0' <= b && b <= '9' || b == '_' || b == '-') {
+			return false
+		}
+	}
+	return true
+}
+
 // reserveLocked admits one request under the given generation's limits and
-// increments the shared counters. c.mu must be held.
-func (c *Controller) reserveLocked(global int, clients map[string]int, client string) (release func(), ok bool) {
+// increments the shared counters: the global, client and user checks and
+// increments happen together under c.mu, so they are atomic. c.mu must be held.
+func (c *Controller) reserveLocked(global int, clients map[string]int, perUser int, a admission) (release func(), ok bool) {
 	if global > 0 && c.activeGlobal >= global {
 		return nil, false
 	}
-	if lim, limited := clients[client]; limited && c.active[client] >= lim {
+	if a.countClient {
+		if lim, limited := clients[a.client]; limited && c.active[a.client] >= lim {
+			return nil, false
+		}
+	}
+	if a.user != "" && perUser > 0 && c.activeUser[a.user] >= perUser {
 		return nil, false
 	}
-	if c.active == nil {
-		c.active = map[string]int{}
-	}
 	c.activeGlobal++
-	c.active[client]++
+	if a.countClient {
+		if c.active == nil {
+			c.active = map[string]int{}
+		}
+		c.active[a.client]++
+	}
+	if a.user != "" {
+		if c.activeUser == nil {
+			c.activeUser = map[string]int{}
+		}
+		c.activeUser[a.user]++
+	}
 	if c.activeGlobal > c.peak {
 		c.peak = c.activeGlobal
 	}
@@ -144,13 +248,23 @@ func (c *Controller) reserveLocked(global int, clients map[string]int, client st
 			c.mu.Lock()
 			defer c.mu.Unlock()
 			c.activeGlobal--
-			if n := c.active[client] - 1; n <= 0 {
-				delete(c.active, client)
-			} else {
-				c.active[client] = n
+			if a.countClient {
+				decrement(c.active, a.client)
+			}
+			if a.user != "" {
+				decrement(c.activeUser, a.user)
 			}
 		})
 	}, true
+}
+
+// decrement lowers m[k] by one, deleting the entry at zero.
+func decrement(m map[string]int, k string) {
+	if n := m[k] - 1; n <= 0 {
+		delete(m, k)
+	} else {
+		m[k] = n
+	}
 }
 
 // statsLocked renders a diagnostics snapshot for the given generation's
@@ -190,6 +304,7 @@ type View struct {
 	c       *Controller
 	global  int
 	clients map[string]int
+	perUser int
 }
 
 // Acquire reserves a slot for client under this view's limits. Its contract
@@ -199,8 +314,29 @@ func (v *View) Acquire(client string) (release func(), ok bool) {
 	c := v.c
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.reserveLocked(v.global, v.clients, client)
+	return c.reserveLocked(v.global, v.clients, 0, admission{client: client, countClient: true})
 }
+
+// AcquirePrincipal reserves a slot for an authenticated principal under this
+// view's limits: the global limit, the per-client limit for a static client
+// (by Client.Name), and this view's per-user limit for a principal with an
+// owning user, counted across all of that user's credentials and every view.
+// All checks and increments are one atomic step. It reports false when any
+// limit is saturated, and also for a principal that may not run inference
+// (see admissionFor). The release contract matches Acquire.
+func (v *View) AcquirePrincipal(p core.Principal) (release func(), ok bool) {
+	a, valid := admissionFor(p)
+	if !valid {
+		return nil, false
+	}
+	c := v.c
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reserveLocked(v.global, v.clients, v.perUser, a)
+}
+
+// UserLimit reports this view's per-user limit (0 = unlimited).
+func (v *View) UserLimit() int { return v.perUser }
 
 // Stats reports this view's configured limits against the shared live usage.
 func (v *View) Stats() core.InflightStats {

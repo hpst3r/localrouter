@@ -20,6 +20,8 @@
 //		Policy:       policy,       // core.Policy (Acquire)
 //		Ledger:       ledger,       // core.Ledger (Record)
 //		Authenticate: authFn,       // func(bearer string) (core.Client, bool)
+//		// Multi-user mode instead (identity enabled):
+//		// MultiUser: true, AuthenticatePrincipal: bearerFn, // core.BearerAuthenticator
 //		Clock:        core.SystemClock{},
 //		Logger:       logger,
 //	}, proxy.Options{MaxFailovers: 2}) // timeouts default to 180s headers / 300s stream idle
@@ -28,4 +30,14 @@
 // Handler serves POST /v1/responses, POST /v1/chat/completions and
 // GET /v1/models. Secrets (client keys, upstream credentials) and request or
 // response bodies are never logged or recorded.
+//
+// In multi-user mode only the Authorization bearer header authenticates (never
+// a cookie); the principal's opaque UserID and KeyID are the only source of a
+// row's owner, a user key's client identity is its KeyID, per-user concurrency
+// is counted through PrincipalLimiter, and policy denials do not disclose the
+// policy's reason. Because upstream accounts are shared, every principal gets
+// only the Content-Type and Content-Encoding of a relayed response, and an
+// upstream status >= 400 is answered with that status, a validated
+// Retry-After and the generic upstream_error envelope instead of the
+// upstream's body and headers.
 package proxy

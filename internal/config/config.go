@@ -37,7 +37,11 @@ type Config struct {
 	Limits      LimitsConfig  `yaml:"limits"`
 	// Budgets is the optional spend-control block. A nil value disables spend
 	// controls entirely, leaving behavior unchanged.
-	Budgets    *BudgetConfig    `yaml:"budgets"`
+	Budgets *BudgetConfig `yaml:"budgets"`
+	// Identity is the optional multi-user block (OIDC browser login and
+	// user-owned API keys). A nil value keeps the legacy single-user mode.
+	// The whole block is restart-only.
+	Identity   *IdentityConfig  `yaml:"identity"`
 	Timeouts   TimeoutsConfig   `yaml:"timeouts"`
 	Clients    []ClientConfig   `yaml:"clients"`
 	Accounts   []AccountConfig  `yaml:"accounts"`
@@ -98,6 +102,9 @@ type LimitsConfig struct {
 	// MaxConcurrentPerClient caps a single authenticated client. Clients not
 	// listed here are limited only by the global cap. 0 = unlimited.
 	MaxConcurrentPerClient map[string]int `yaml:"max_concurrent_per_client"`
+	// MaxConcurrentPerUser caps each identity user across all of that user's
+	// keys. It requires the identity block. 0 = unlimited.
+	MaxConcurrentPerUser int `yaml:"max_concurrent_per_user"`
 }
 
 // BudgetConfig is the optional spend-control block (yaml: budgets). A nil
@@ -121,6 +128,9 @@ type BudgetConfig struct {
 	// account: it cannot serve inference and so cannot spend, but it may still
 	// carry a ceiling.
 	Accounts map[string]BudgetLimits `yaml:"accounts"`
+	// Users is the global default ceiling applied to every identity user,
+	// charged across all of that user's keys. It requires the identity block.
+	Users *BudgetLimits `yaml:"users"`
 }
 
 // BudgetLimits is one client's or account's optional day and month ceilings. A
@@ -205,8 +215,11 @@ func (b *BudgetConfig) ReservationMicros() (int64, error) {
 // nonnegative USD decimal, so a negative, malformed, or overflowing value is
 // rejected rather than silently dropping spend controls. An omitted period
 // amount is unlimited; an explicit "0" is a real zero budget.
-func (b *BudgetConfig) validate(knownClients, knownAccounts map[string]bool) []error {
+func (b *BudgetConfig) validate(knownClients, knownAccounts map[string]bool, multiUser bool) []error {
 	var errs []error
+	if b.Users != nil && !multiUser {
+		errs = append(errs, errors.New("budgets.users requires the identity block"))
+	}
 	micros, err := budget.ParseUSD(b.ReserveUSD)
 	switch {
 	case err != nil:
@@ -223,8 +236,18 @@ func (b *BudgetConfig) validate(knownClients, knownAccounts map[string]bool) []e
 	for _, lim := range b.Accounts {
 		ceilings += lim.present()
 	}
-	if ceilings == 0 {
+	if b.Users != nil && multiUser {
+		ceilings += b.Users.present()
+	}
+	switch {
+	case ceilings > 0:
+	case multiUser:
+		errs = append(errs, errors.New("budgets: at least one client, account or user daily_usd/monthly_usd ceiling is required when budgets are enabled"))
+	default:
 		errs = append(errs, errors.New("budgets: at least one client or account daily_usd/monthly_usd ceiling is required when budgets are enabled"))
+	}
+	if b.Users != nil {
+		errs = append(errs, b.Users.validate("budgets.users")...)
 	}
 	for name, lim := range b.Clients {
 		if name == "" || !knownClients[name] {
@@ -304,6 +327,12 @@ type ClientConfig struct {
 	Host string `yaml:"host"`
 	// Ingest lets this client's key push agent data to /control/v1/ingest.
 	Ingest bool `yaml:"ingest"`
+	// Role is required in multi-user mode (identity block present) and
+	// rejected otherwise: "service" (may ingest, never an owner) or "user"
+	// (a static key owned by Owner, never ingest). There is no static admin.
+	Role string `yaml:"role"`
+	// Owner is the opaque identity user ID a role "user" client acts as.
+	Owner string `yaml:"owner"`
 }
 
 // KeyPaths returns every configured key file for the client, in order, as a
@@ -462,6 +491,9 @@ func (c *Config) applyDefaults(baseDir string) {
 	if c.TLSCertFile != "" {
 		c.TLSCertFile = expand(c.TLSCertFile, baseDir)
 	}
+	if c.Identity != nil {
+		c.Identity.applyDefaults(baseDir)
+	}
 	if c.HostName == "" {
 		c.HostName = defaultHostName()
 	}
@@ -602,6 +634,12 @@ func (c *Config) Validate() error {
 	if c.Limits.MaxConcurrent < 0 {
 		errs = append(errs, errors.New("limits.max_concurrent must not be negative (0 = unlimited)"))
 	}
+	if c.Limits.MaxConcurrentPerUser < 0 {
+		errs = append(errs, errors.New("limits.max_concurrent_per_user must not be negative (0 = unlimited)"))
+	}
+	if c.Limits.MaxConcurrentPerUser != 0 && c.Identity == nil {
+		errs = append(errs, errors.New("limits.max_concurrent_per_user requires the identity block"))
+	}
 	for name, lim := range c.Limits.MaxConcurrentPerClient {
 		if lim < 0 {
 			errs = append(errs, fmt.Errorf("limits.max_concurrent_per_client[%s] must not be negative (0 = unlimited)", name))
@@ -620,7 +658,9 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("timeouts.%s must not be negative", to.name))
 		}
 	}
-	if len(c.Clients) == 0 {
+	// In multi-user mode keys are issued dynamically, so static clients are
+	// optional there.
+	if len(c.Clients) == 0 && c.Identity == nil {
 		errs = append(errs, errors.New("at least one client is required"))
 	}
 	seenC := map[string]bool{}
@@ -656,6 +696,7 @@ func (c *Config) Validate() error {
 		if strings.ContainsAny(cl.Host, " /\\") {
 			errs = append(errs, fmt.Errorf("client %s: host %q invalid", cl.Name, cl.Host))
 		}
+		errs = append(errs, cl.validateRole(c.Identity != nil)...)
 	}
 	for name := range c.Limits.MaxConcurrentPerClient {
 		if !seenC[name] {
@@ -738,7 +779,10 @@ func (c *Config) Validate() error {
 		}
 	}
 	if c.Budgets != nil {
-		errs = append(errs, c.Budgets.validate(seenC, accts)...)
+		errs = append(errs, c.Budgets.validate(seenC, accts, c.Identity != nil)...)
+	}
+	if c.Identity != nil {
+		errs = append(errs, c.Identity.validate(c)...)
 	}
 	return errors.Join(errs...)
 }
@@ -929,6 +973,9 @@ func (c *Config) CheckFiles(configPath string) error {
 	}
 	if c.TLSKeyFile != "" {
 		add(core.CheckPrivateFile("tls_key_file", c.TLSKeyFile))
+	}
+	if c.Identity != nil {
+		errs = append(errs, c.checkIdentityFiles()...)
 	}
 	return errors.Join(errs...)
 }

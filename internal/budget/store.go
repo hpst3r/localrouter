@@ -1,6 +1,6 @@
 // Package budget implements the spend-control storage primitive on SQLite
 // (modernc.org/sqlite): durable, atomic, integer-micro-USD reservations against
-// client and account budgets, plus their settlement.
+// client, account and user budgets, plus their settlement.
 //
 // Scope. This file owns a separate budget database, not the request ledger.
 // A caller constructs it with Open at an explicit path. The app holds exclusive
@@ -10,8 +10,9 @@
 // an int64. No comparison or accumulation in this file uses float64; sums are
 // checked for int64 overflow and an overflow is an error, never a wrap.
 //
-// Model. A budget is a (scope, key, period) ceiling. scope is "client" or
-// "account"; key is a client name or account id; period is "day" or "month" in
+// Model. A budget is a (scope, key, period) ceiling. scope is "client",
+// "account" or "user"; key is a client name, account id or opaque internal user
+// id (never an email or display name); period is "day" or "month" in
 // UTC. A period instance is a concrete [start, end) UTC window identified by
 // (period, start_utc) and chosen once, at admission, from the attempt
 // timestamp. It is never re-derived at read time, so a late settlement always
@@ -22,15 +23,18 @@
 // holds all FOUR instances reachable from the attempt — the client budget and
 // the account budget, each for the UTC day and the UTC month containing the
 // attempt timestamp — whether or not a limit happens to be configured for
-// them. Only the supplied limits whose scope/key name the attempt's client or
-// account restrict admission; a limit whose key names something else restricts
-// nothing. Tracking the full set is what makes a limit configured later honest:
-// it is evaluated against the real history of the period, not merely the subset
-// it used to gate.
+// them. A reservation that names a user holds SIX: the user budget for the
+// same day and month as well, so every key one user owns draws on a single
+// user instance and N keys can never buy N user budgets. Only the supplied
+// limits whose scope/key name the attempt's client, account or user restrict
+// admission; a limit whose key names something else restricts nothing.
+// Tracking the full set is what makes a limit configured later honest: it is
+// evaluated against the real history of the period, not merely the subset it
+// used to gate.
 //
 // Reserve tests every applicable limit inside ONE write transaction and either
-// admits (writing the reservation plus the reserved amount on all four tracked
-// instances) or denies, writing nothing. A limit that is not supplied for a
+// admits (writing the reservation plus the reserved amount on every tracked
+// instance) or denies, writing nothing. A limit that is not supplied for a
 // (scope, key, period) is unlimited; a supplied limit of zero micros is a budget
 // of zero and denies every reservation; a negative limit is invalid. A
 // reservation's own micros must be strictly positive. Because each budget
@@ -80,6 +84,9 @@ import (
 const (
 	ScopeClient  = "client"
 	ScopeAccount = "account"
+	// ScopeUser is a per-user budget keyed by the opaque internal user id. It
+	// is tracked only for reservations that name a User.
+	ScopeUser = "user"
 
 	PeriodDay   = "day"
 	PeriodMonth = "month"
@@ -137,8 +144,13 @@ type Reservation struct {
 	ID      string
 	Client  string
 	Account string
-	At      time.Time
-	Micros  int64
+	// User is the opaque internal id of the user that owns the attempt's
+	// credential, or "" for an attempt without a user (every legacy static
+	// client). A non-empty User additionally holds the user's day and month
+	// instances, so all of one user's keys draw on the same user budget.
+	User   string
+	At     time.Time
+	Micros int64
 }
 
 // Settlement closes a reservation with the micro-USD actually charged and the
@@ -196,9 +208,10 @@ type Store struct {
 //
 // budget_reservations holds one row per attempt, keyed by the attempt id.
 // budget_reservation_periods pins, for each tracked (scope, key, period)
-// instance — always the client and account budgets for the day and month — how
-// much that reservation holds there, so settlement decrements exactly the right
-// rows regardless of when it runs.
+// instance — always the client and account budgets for the day and month, and
+// the user budgets too when the reservation names a user — how much that
+// reservation holds there, so settlement decrements exactly the right rows
+// regardless of when it runs.
 var migrations = []string{
 	`CREATE TABLE budget_periods (
 		scope TEXT NOT NULL,
@@ -233,6 +246,12 @@ var migrations = []string{
 		reserved_micros INTEGER NOT NULL,
 		PRIMARY KEY (reservation_id, scope, key, period)
 	);`,
+	// v1 -> v2: per-user budgets. user_id is the opaque owner id pinned at
+	// admission ('' for a reservation without a user, which every pre-v2 row
+	// is). It takes part in idempotency only; settlement still books through
+	// the pinned budget_reservation_periods rows, so a v1 reservation settles
+	// after the upgrade exactly as it would have before.
+	`ALTER TABLE budget_reservations ADD COLUMN user_id TEXT NOT NULL DEFAULT '';`,
 }
 
 // Open opens (creating if needed) the budget database at path. The path is
@@ -357,18 +376,19 @@ func (s *Store) Close() error {
 // Reserve atomically admits one attempt against every applicable budget.
 //
 // Every admitted attempt holds the four instances named by r.Client and
-// r.Account for the UTC day and month containing r.At. The supplied limits whose
-// scope/key name r.Client ("client") or r.Account ("account") restrict
+// r.Account for the UTC day and month containing r.At, plus the two named by
+// r.User when it is non-empty. The supplied limits whose scope/key name
+// r.Client ("client"), r.Account ("account") or r.User ("user") restrict
 // admission: for each, spent + reserved + r.Micros must not exceed Micros. All
-// of them are checked, and the hold is written on all four tracked instances,
+// of them are checked, and the hold is written on every tracked instance,
 // inside a single write transaction; if any limit has no room, or the
 // arithmetic overflows int64, nothing is written and the call returns
 // ErrExceeded (or the arithmetic error), so callers fail closed. A limit that
 // names a different key restricts nothing but is still tracked against.
 //
-// Reserve is idempotent on r.ID: replaying an identical reservation returns nil
-// without reserving again; replaying the same ID with a different payload
-// returns ErrConflict. The reservation records the exact instances it touched,
+// Reserve is idempotent on r.ID: replaying an identical reservation (r.User
+// included) returns nil without reserving again; replaying the same ID with a
+// different payload returns ErrConflict. The reservation records the exact instances it touched,
 // so a later settlement cannot be moved to a different period. A non-positive
 // r.Micros, an empty id/client/account or a zero r.At is ErrInvalid.
 func (s *Store) Reserve(ctx context.Context, r Reservation, limits []Limit) error {
@@ -411,19 +431,22 @@ func (s *Store) Reserve(ctx context.Context, r Reservation, limits []Limit) erro
 	defer tx.Rollback()
 
 	// Idempotency: an identical retry is a no-op, a conflicting one an error.
+	// The user is part of the payload: the same id replayed for another user
+	// (or with a user added or dropped) conflicts. Pre-v2 rows carry user ''.
 	var (
-		existClient, existAccount string
-		existAt, existMicros      int64
+		existClient, existAccount, existUser string
+		existAt, existMicros                 int64
 	)
 	err = tx.QueryRowContext(ctx,
-		`SELECT client, account, at_unix, micros FROM budget_reservations WHERE id = ?`, r.ID).
-		Scan(&existClient, &existAccount, &existAt, &existMicros)
+		`SELECT client, account, user_id, at_unix, micros FROM budget_reservations WHERE id = ?`, r.ID).
+		Scan(&existClient, &existAccount, &existUser, &existAt, &existMicros)
 	switch {
 	case err == sql.ErrNoRows:
 		// First admission for this attempt id; proceed.
 	case err != nil:
 		return fmt.Errorf("budget: reserve: %w", err)
-	case existClient == r.Client && existAccount == r.Account && existAt == atUnix && existMicros == r.Micros:
+	case existClient == r.Client && existAccount == r.Account && existUser == r.User &&
+		existAt == atUnix && existMicros == r.Micros:
 		return nil // identical retry: the reservation already exists
 	default:
 		return fmt.Errorf("%w: attempt %q already reserved with a different payload", ErrConflict, r.ID)
@@ -490,8 +513,8 @@ func (s *Store) Reserve(ctx context.Context, r Reservation, limits []Limit) erro
 		})
 	}
 
-	// Every restriction passed: record this attempt's hold on all four
-	// instances (all-or-nothing; any failure above rolls the whole tx back).
+	// Every restriction passed: record this attempt's hold on every tracked
+	// instance (all-or-nothing; any failure above rolls the whole tx back).
 	for _, inst := range instances {
 		newReserved, ok := addMicros(inst.reserved, r.Micros)
 		if !ok {
@@ -510,9 +533,9 @@ func (s *Store) Reserve(ctx context.Context, r Reservation, limits []Limit) erro
 	}
 
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO budget_reservations (id, client, account, at_unix, micros, state)
-		 VALUES (?,?,?,?,?,?)`,
-		r.ID, r.Client, r.Account, atUnix, r.Micros, stateOpen); err != nil {
+		`INSERT INTO budget_reservations (id, client, account, user_id, at_unix, micros, state)
+		 VALUES (?,?,?,?,?,?,?)`,
+		r.ID, r.Client, r.Account, r.User, atUnix, r.Micros, stateOpen); err != nil {
 		return fmt.Errorf("budget: reserve: %w", err)
 	}
 	for _, inst := range instances {
@@ -876,18 +899,23 @@ type periodLink struct {
 	start              int64
 }
 
-// trackedPeriods returns the four instances every admitted reservation holds:
-// the client and account budgets for both the UTC day and the UTC month
-// containing r.At. They are tracked on every attempt, whether or not a limit is
-// configured for them, so a limit configured later is evaluated against the
-// true history of the period instead of only what it happened to gate.
+// trackedPeriods returns the instances every admitted reservation holds: the
+// client and account budgets for both the UTC day and the UTC month containing
+// r.At, plus the user budget for the same day and month when r.User is set (six
+// instances instead of four). They are tracked on every attempt, whether or not
+// a limit is configured for them, so a limit configured later is evaluated
+// against the true history of the period instead of only what it happened to
+// gate.
 func trackedPeriods(r Reservation) ([]periodLink, error) {
-	out := make([]periodLink, 0, 4)
-	for _, scope := range [...]string{ScopeClient, ScopeAccount} {
-		key := r.Client
-		if scope == ScopeAccount {
-			key = r.Account
-		}
+	type scopeKey struct{ scope, key string }
+	scopes := make([]scopeKey, 0, 3)
+	scopes = append(scopes, scopeKey{ScopeClient, r.Client}, scopeKey{ScopeAccount, r.Account})
+	if r.User != "" {
+		scopes = append(scopes, scopeKey{ScopeUser, r.User})
+	}
+	out := make([]periodLink, 0, 2*len(scopes))
+	for _, sk := range scopes {
+		scope, key := sk.scope, sk.key
 		for _, period := range [...]string{PeriodDay, PeriodMonth} {
 			start, err := periodStart(period, r.At)
 			if err != nil {
@@ -900,8 +928,8 @@ func trackedPeriods(r Reservation) ([]periodLink, error) {
 }
 
 // check is one supplied, applicable limit resolved to the period instance it
-// gates. It restricts admission only; the reservation is still tracked on all
-// four instances regardless.
+// gates. It restricts admission only; the reservation is still tracked on
+// every instance regardless.
 type check struct {
 	scope, key, period string
 	start              int64
@@ -938,6 +966,12 @@ func applicableChecks(r Reservation, limits []Limit) ([]check, error) {
 			if l.Key != r.Account {
 				continue
 			}
+		case ScopeUser:
+			// A reservation without a user never matches: Limit.Key is
+			// non-empty, so it can only name a different user.
+			if l.Key != r.User {
+				continue
+			}
 		}
 		key := [3]string{l.Scope, l.Key, l.Period}
 		if seen[key] {
@@ -955,10 +989,10 @@ func applicableChecks(r Reservation, limits []Limit) ([]check, error) {
 
 func validateScope(scope string) error {
 	switch scope {
-	case ScopeClient, ScopeAccount:
+	case ScopeClient, ScopeAccount, ScopeUser:
 		return nil
 	}
-	return fmt.Errorf("%w: invalid scope %q (want %q or %q)", ErrInvalid, scope, ScopeClient, ScopeAccount)
+	return fmt.Errorf("%w: invalid scope %q (want %q, %q or %q)", ErrInvalid, scope, ScopeClient, ScopeAccount, ScopeUser)
 }
 
 func validatePeriod(period string) error {

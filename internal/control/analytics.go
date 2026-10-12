@@ -64,10 +64,12 @@ func (s *Server) analyticsLedger(w http.ResponseWriter) (core.AnalyticsLedger, b
 
 func (s *Server) analytics(w http.ResponseWriter, r *http.Request) {
 	params := r.URL.Query()
-	q, err := s.parseAnalyticsQuery(params, defaultAnalyticsRange)
+	scope, dims := s.analyticsScope(r)
+	q, err := s.parseAnalyticsQuery(params, defaultAnalyticsRange, dims)
 	if err == nil {
-		err = parseAnalyticsShape(params, &q)
+		err = parseAnalyticsShape(params, &q, dims)
 	}
+	q.Scope = scope
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -86,7 +88,9 @@ func (s *Server) analytics(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) analyticsDimensions(w http.ResponseWriter, r *http.Request) {
 	params := r.URL.Query()
-	q, err := s.parseAnalyticsQuery(params, defaultDimsRange)
+	scope, dims := s.analyticsScope(r)
+	q, err := s.parseAnalyticsQuery(params, defaultDimsRange, dims)
+	q.Scope = scope
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -104,9 +108,9 @@ func (s *Server) analyticsDimensions(w http.ResponseWriter, r *http.Request) {
 	q.Bucket, q.TopN = "day", dimensionsTop
 	doc := dimensionsDoc{
 		SchemaVersion: SchemaVersion, From: q.From.UTC(), To: q.To.UTC(),
-		Dimensions: make(map[string][]dimensionValue, len(core.AnalyticsDimensions)),
+		Dimensions: make(map[string][]dimensionValue, len(dims)),
 	}
-	for _, dim := range core.AnalyticsDimensions {
+	for _, dim := range dims {
 		q.Group = dim
 		res, err := al.Analytics(r.Context(), q)
 		if err != nil {
@@ -137,9 +141,20 @@ func (s *Server) analyticsFailed(w http.ResponseWriter, err error, group string)
 	writeError(w, http.StatusInternalServerError, "analytics failed")
 }
 
+// analyticsScope returns the data scope of an analytics read and the
+// dimensions it may group and filter by: the legacy set for a legacy request
+// (nil scope), plus the owner dimensions its scope permits otherwise.
+func (s *Server) analyticsScope(r *http.Request) (*core.DataScope, []string) {
+	scope := scopeFrom(r.Context())
+	if scope == nil {
+		return nil, core.AnalyticsDimensions
+	}
+	return scope, scopedGroups(core.AnalyticsDimensions, *scope)
+}
+
 // parseAnalyticsQuery parses the time range (range, from, to) and filters
-// shared by both analytics endpoints.
-func (s *Server) parseAnalyticsQuery(params url.Values, defRange string) (core.AnalyticsQuery, error) {
+// shared by both analytics endpoints. dims are the accepted filter names.
+func (s *Server) parseAnalyticsQuery(params url.Values, defRange string, dims []string) (core.AnalyticsQuery, error) {
 	var q core.AnalyticsQuery
 	for k, v := range params {
 		if len(v) > 1 && (k == "range" || k == "from" || k == "to" || k == "bucket" || k == "group" || k == "top" || strings.HasPrefix(k, filterPrefix)) {
@@ -183,16 +198,17 @@ func (s *Server) parseAnalyticsQuery(params url.Values, defRange string) (core.A
 		if !ok {
 			continue
 		}
-		if !slices.Contains(core.AnalyticsDimensions, dim) {
-			return q, fmt.Errorf("%s: unknown dimension (want one of %s)", k, strings.Join(core.AnalyticsDimensions, ", "))
+		if !slices.Contains(dims, dim) {
+			return q, fmt.Errorf("%s: unknown dimension (want one of %s)", k, strings.Join(dims, ", "))
 		}
 		q.Filters[dim] = v[0]
 	}
 	return q, nil
 }
 
-// parseAnalyticsShape parses bucket, group and top for GET /analytics.
-func parseAnalyticsShape(params url.Values, q *core.AnalyticsQuery) error {
+// parseAnalyticsShape parses bucket, group and top for GET /analytics. dims
+// are the accepted group names.
+func parseAnalyticsShape(params url.Values, q *core.AnalyticsQuery, dims []string) error {
 	span := q.To.Sub(q.From)
 	q.Bucket = params.Get("bucket")
 	switch q.Bucket {
@@ -214,8 +230,8 @@ func parseAnalyticsShape(params url.Values, q *core.AnalyticsQuery) error {
 	if q.Group == "" {
 		q.Group = defaultAnalyticsGroup
 	}
-	if !slices.Contains(core.AnalyticsDimensions, q.Group) {
-		return fmt.Errorf("group: must be one of %s", strings.Join(core.AnalyticsDimensions, ", "))
+	if !slices.Contains(dims, q.Group) {
+		return fmt.Errorf("group: must be one of %s", strings.Join(dims, ", "))
 	}
 
 	q.TopN = defaultAnalyticsTop

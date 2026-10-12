@@ -294,6 +294,12 @@ type RequestRecord struct {
 	ReportedCostUSD *float64 `json:"reported_cost_usd,omitempty"`
 	// CostUSD/CostBasis are resolved by the ledger: valid OpenRouter reported
 	// costs take precedence; otherwise known token usage uses local pricing.
+
+	// UserID / KeyID attribute the row to its owner (opaque ids, "" = unowned).
+	// They are excluded from the ingest wire format: ingest sets them from the
+	// authenticated principal, never from the body.
+	UserID string `json:"-"`
+	KeyID  string `json:"-"`
 }
 
 // UsageRow is one aggregate row.
@@ -360,6 +366,10 @@ type AnalyticsQuery struct {
 	// TopN series are returned individually; the rest are summed into a
 	// series with Key AnalyticsOtherKey. 0 = 8.
 	TopN int
+	// Scope restricts the rows read to one owner or all users. nil is the
+	// legacy/admin unscoped read; a ledger in RequireScope mode denies nil.
+	// Never parsed from a request body.
+	Scope *DataScope `json:"-"`
 }
 
 // AnalyticsOtherKey names the aggregate of groups outside the top N.

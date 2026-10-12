@@ -35,6 +35,8 @@ Usage:
   localrouter admit   [--class background] (--account ID | --model NAME) [--url URL] [--json]
                       exit 0 = allow, 1 = deny, 2 = error
   localrouter agent   [-config ~/.config/localrouter/agent.yaml] [--once]
+  localrouter users   list|disable|enable|delete|keys|revoke [-config PATH] ...
+                      local identity administration (multi-user mode)
 
 Default config: ~/.config/localrouter/config.yaml
 `
@@ -62,6 +64,8 @@ func main() {
 		err = cmdAdmit(os.Args[2:])
 	case "agent":
 		err = cmdAgent(os.Args[2:])
+	case "users":
+		err = cmdUsers(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return

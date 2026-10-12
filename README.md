@@ -1,8 +1,9 @@
 # LocalRouter
 
 OpenAI-compatible LLM gateway, loopback by default and optionally shared between
-"trusted" machines over HTTPS. Supports per-client bearer keys, but not
-multi-user authentication or tenant isolation. One binary that:
+"trusted" machines over HTTPS. Supports per-client bearer keys and an optional
+[OIDC multi-user mode](docs/OIDC-MULTIUSER.md) (Linux and macOS; not yet
+accepted against a real IdP), but not tenant isolation. One binary that:
 
 - authenticates local clients with per-client keys,
 - selects an upstream subscription account per request,
@@ -111,6 +112,9 @@ without unprivileged user namespaces, need a drop-in; see
 [systemd sandbox](docs/NETWORK.md#systemd-sandbox). To upgrade,
 rebuild, re-run `install`, then `systemctl --user restart localrouter`. With
 lingering enabled (`loginctl enable-linger`), it runs without a login session.
+Schema upgrades are one-way: this version migrates `localrouter.db` to schema 5
+and `budgets.db` to schema 2, and older binaries then refuse to start. Back up
+`data_dir` first ([backup and restore](docs/NETWORK.md#backup-and-restore)).
 
 ### Verifying release downloads
 
