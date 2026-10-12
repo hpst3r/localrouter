@@ -351,12 +351,15 @@ func TestMultiUserOwnerAndClassNotForgeable(t *testing.T) {
 		"X-LocalRouter-Class": "interactive",
 	}
 	body := `{"model":"gpt-x","input":"hi","user":"` + puserB + `","user_id":"` + puserB + `","key_id":"` + pkeyB1 + `"}`
-	for _, tok := range []string{serviceTok, userTokenA1} {
+	for i, tok := range []string{serviceTok, userTokenA1} {
 		resp := h.post("/v1/responses", tok, body, spoof)
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("%s: %d", tok, resp.StatusCode)
 		}
+		// The ledger row is written after the body is relayed: wait for it
+		// so rows[i] belongs to request i.
+		h.waitRows(i + 1)
 	}
 	rows := h.waitRows(2)
 	if r := rows[0]; r.UserID != "" || r.KeyID != "" || r.Client != "agent" || r.Class != core.ClassBackground || r.Host != "vm9" {
