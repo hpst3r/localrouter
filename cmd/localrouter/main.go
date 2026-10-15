@@ -32,6 +32,8 @@ Usage:
   localrouter pricing reprice [-config PATH]
   localrouter check   [-config PATH]
   localrouter ledger relabel-host [--from ""] --to NAME [-config PATH]
+  localrouter hermeslog backfill-self --model M [--model M ...] --account ID
+                      --before RFC3339 [--apply] [-config PATH]
   localrouter admit   [--class background] (--account ID | --model NAME) [--url URL] [--json]
                       exit 0 = allow, 1 = deny, 2 = error
   localrouter agent   [-config ~/.config/localrouter/agent.yaml] [--once]
@@ -57,6 +59,8 @@ func main() {
 		err = cmdPricing(os.Args[2:])
 	case "ledger":
 		err = cmdLedger(os.Args[2:])
+	case "hermeslog":
+		err = cmdHermeslog(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
 	case "admit":

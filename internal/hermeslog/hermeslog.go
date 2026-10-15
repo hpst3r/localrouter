@@ -30,6 +30,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -176,7 +177,22 @@ SELECT u.session_id, u.model, u.billing_provider, u.billing_base_url, u.billing_
        COALESCE(s.source, '')
 FROM session_model_usage u LEFT JOIN sessions s ON s.id = u.session_id`
 
-func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats) error {
+// usageRow is one session_model_usage row joined with its session.
+type usageRow struct {
+	sess, model, prov, baseURL, mode, task, parent, repo, cwd, source string
+	cur                                                               counters
+	lastSeen                                                          float64
+}
+
+// key identifies the row's counters across scans.
+func (u usageRow) key(profile string) string {
+	return strings.Join([]string{profile, u.sess, u.model, u.prov, u.baseURL, u.mode, u.task}, "\x1f")
+}
+
+// readUsage calls fn for every usage row in the Hermes database at path,
+// which is opened read-only. A database without session_model_usage (older
+// Hermes schema) has no rows.
+func readUsage(ctx context.Context, path string, fn func(usageRow)) error {
 	// Read-only; never create or modify anything under the Hermes home.
 	dsn := "file:" + (&url.URL{Path: path}).EscapedPath() + "?mode=ro&_pragma=busy_timeout(5000)&_pragma=query_only(1)"
 	db, err := sql.Open("sqlite", dsn)
@@ -197,6 +213,19 @@ func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats)
 		return err
 	}
 	defer rows.Close()
+	for rows.Next() {
+		var u usageRow
+		if err := rows.Scan(&u.sess, &u.model, &u.prov, &u.baseURL, &u.mode, &u.task,
+			&u.cur.Calls, &u.cur.Input, &u.cur.Output, &u.cur.CacheRead, &u.cur.CacheWrite, &u.cur.Reasoning,
+			&u.lastSeen, &u.parent, &u.repo, &u.cwd, &u.source); err != nil {
+			return err
+		}
+		fn(u)
+	}
+	return rows.Err()
+}
+
+func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats) error {
 	type pending struct {
 		key string
 		cur counters
@@ -204,47 +233,38 @@ func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats)
 	}
 	var todo []pending
 	skipped := 0
-	for rows.Next() {
-		var (
-			sess, model, prov, baseURL, mode, task, parent, repo, cwd, source string
-			cur                                                               counters
-			lastSeen                                                          float64
-		)
-		if err := rows.Scan(&sess, &model, &prov, &baseURL, &mode, &task,
-			&cur.Calls, &cur.Input, &cur.Output, &cur.CacheRead, &cur.CacheWrite, &cur.Reasoning,
-			&lastSeen, &parent, &repo, &cwd, &source); err != nil {
-			return err
-		}
+	err := readUsage(ctx, path, func(u usageRow) {
+		cur := u.cur
 		st.Rows++
-		if c.isSelf(baseURL) {
+		if c.isSelf(u.baseURL) {
 			st.SkippedSelf++
-			continue
+			return
 		}
-		key := strings.Join([]string{profile, sess, model, prov, baseURL, mode, task}, "\x1f")
+		key := u.key(profile)
 		prev, had := c.seen[key]
 		if prev.less(cur) || !prev.inRange() {
 			// Counters went backwards (session rewritten/reset), or the last
 			// values seen were implausible: rebase without recording.
 			c.seen[key] = cur
-			continue
+			return
 		}
 		d := cur.sub(prev)
 		if d.zero() {
-			continue
+			return
 		}
-		rec := c.record(key, profile, sess, model, prov, task, parent, repo, cwd, lastSeen, cur, d)
-		if why := c.implausible(cur, rec, lastSeen); why != "" {
+		rec := c.record(key, profile, u.sess, u.model, u.prov, u.task, u.parent, u.repo, u.cwd, u.lastSeen, cur, d)
+		if why := c.implausible(cur, rec, u.lastSeen); why != "" {
 			// Rebase so the row is not re-reported every scan; only later
 			// increases from plausible counters are recorded.
 			c.seen[key] = cur
 			st.SkippedInvalid++
 			skipped++
 			c.opts.Logger.Debug("hermeslog: skipping implausible row", "profile", profile, "reason", why, "known", had)
-			continue
+			return
 		}
 		todo = append(todo, pending{key: key, cur: cur, rec: rec})
-	}
-	if err := rows.Err(); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	if skipped > 0 {
@@ -372,6 +392,23 @@ func (c *Collector) account(prov, model string) string {
 		prov = "anthropic"
 	}
 	return c.opts.Accounts[prov]
+}
+
+// SelfHosts lists host:port spellings of a router listening on listen as
+// clients might write them in a base URL, for Options.SelfHosts. It matches
+// the serve path's wiring in internal/app.
+func SelfHosts(listen string) []string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return nil
+	}
+	out := []string{net.JoinHostPort(host, port)}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() || host == "" || host == "0.0.0.0" || host == "::" {
+		for _, h := range []string{"127.0.0.1", "localhost", "::1"} {
+			out = append(out, net.JoinHostPort(h, port))
+		}
+	}
+	return out
 }
 
 func (c *Collector) isSelf(baseURL string) bool {
