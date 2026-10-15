@@ -141,6 +141,11 @@ func deref(p *int64) int64 {
 type usageCapture struct {
 	sse bool
 
+	// sniffing is set while the mode of a response without a Content-Type is
+	// undecided; pending holds its bytes so far (at most maxSniffBytes).
+	sniffing bool
+	pending  []byte
+
 	// SSE state.
 	line     []byte // partial line carried between writes
 	skipLine bool   // current line exceeded the cap; drop until newline
@@ -194,12 +199,71 @@ func mayEndResponse(event string, data []byte) bool {
 		bytes.Contains(data, []byte("response.failed"))
 }
 
+// maxSniffBytes bounds the bytes buffered while sniffing a response without a
+// Content-Type; a body still undecided past it is treated as JSON.
+const maxSniffBytes = 64 << 10
+
+// sseFieldPrefixes are the line starts that mark an untyped body as SSE.
+var sseFieldPrefixes = [][]byte{[]byte("event:"), []byte("data:"), []byte("id:"), []byte("retry:"), []byte(":")}
+
+// newUsageCapture returns a capture for a response with the given
+// Content-Type: text/event-stream is SSE and any other value is JSON. An
+// empty Content-Type (the Codex backend sends none on its streams) is decided
+// from the body; see sniffSSE.
 func newUsageCapture(contentType string) *usageCapture {
-	return &usageCapture{sse: strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "text/event-stream")}
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	return &usageCapture{sse: strings.HasPrefix(ct, "text/event-stream"), sniffing: ct == ""}
+}
+
+// sniffSSE decides the mode of an untyped body from its first non-whitespace
+// bytes: an SSE field or comment start means SSE, anything else (including
+// "{") JSON. decided is false while b could still become either.
+func sniffSSE(b []byte) (sse, decided bool) {
+	rest := bytes.TrimLeft(b, " \t\r\n")
+	if len(rest) == 0 {
+		return false, false
+	}
+	if rest[0] == '{' {
+		return false, true
+	}
+	partial := false
+	for _, pre := range sseFieldPrefixes {
+		if bytes.HasPrefix(rest, pre) {
+			return true, true
+		}
+		if len(rest) < len(pre) && bytes.HasPrefix(pre, rest) {
+			partial = true
+		}
+	}
+	return false, !partial
+}
+
+// decide ends sniffing in the given mode and replays the buffered bytes.
+func (c *usageCapture) decide(sse bool) {
+	c.sniffing, c.sse = false, sse
+	pending := c.pending
+	c.pending = nil
+	_, _ = c.Write(pending)
+}
+
+// settle ends any undecided sniff at end of body, as JSON unless the bytes
+// already identify SSE.
+func (c *usageCapture) settle() {
+	if c.sniffing {
+		sse, _ := sniffSSE(c.pending)
+		c.decide(sse)
+	}
 }
 
 // Write feeds response bytes. It never fails.
 func (c *usageCapture) Write(p []byte) (int, error) {
+	if c.sniffing {
+		c.pending = append(c.pending, p...)
+		if sse, ok := sniffSSE(c.pending); ok || len(c.pending) > maxSniffBytes {
+			c.decide(sse)
+		}
+		return len(p), nil
+	}
 	if !c.sse {
 		if !c.jsonOver {
 			if c.body.Len()+len(p) > maxJSONBytes {
@@ -349,6 +413,7 @@ func (c *usageCapture) flush() {
 // event; for JSON bodies it is the top-level usage object. Usage says nothing
 // about whether the stream finished; see Completed.
 func (c *usageCapture) Result() (core.Usage, bool) {
+	c.settle()
 	if c.sse {
 		c.flush()
 		if c.bad {

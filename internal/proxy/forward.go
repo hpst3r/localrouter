@@ -27,7 +27,7 @@ const (
 )
 
 // forwardedHeaders are the only client request headers sent upstream.
-var forwardedHeaders = []string{"Content-Type", "Accept", "OpenAI-Beta", "session_id", "conversation_id", "x-request-id"}
+var forwardedHeaders = []string{"Content-Type", "Accept", "OpenAI-Beta", "session_id", "conversation_id", "x-request-id", "X-Codex-Turn-State"}
 
 // hopHeaders are stripped from upstream responses.
 var hopHeaders = []string{
@@ -487,8 +487,9 @@ func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cr
 	if err != nil {
 		return nil, err
 	}
+	var sessionID string // Codex only; see sessionIDFromCacheKey
 	if account.Provider == core.ProviderCodex {
-		body = codexBody(body)
+		body, sessionID = codexBody(body)
 	}
 	up, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
@@ -503,6 +504,11 @@ func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cr
 	}
 	if up.Header.Get("Content-Type") == "" {
 		up.Header.Set("Content-Type", "application/json")
+	}
+	// A client-supplied session_id always wins. The key is set directly so it
+	// goes out with the literal lowercase name the Codex backend uses.
+	if sessionID != "" && !hasHeaderFold(req.header, "session_id") {
+		up.Header["session_id"] = []string{sessionID}
 	}
 	for k, v := range cred.Headers {
 		up.Header[k] = append([]string(nil), v...)
@@ -779,6 +785,17 @@ func relayFailure(w http.ResponseWriter, f *failure) {
 	copyHeaders(w.Header(), f.header)
 	w.WriteHeader(f.status)
 	_, _ = w.Write(f.body)
+}
+
+// hasHeaderFold reports whether h has a key equal to name ignoring case,
+// canonical or not.
+func hasHeaderFold(h http.Header, name string) bool {
+	for k := range h {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func copyHeaders(dst, src http.Header) {
