@@ -364,6 +364,58 @@ For a request naming model `m`:
   `error_class` only) per error-class change, and one `recovered` line when it
   succeeds again.
 
+### Amendment 1 (post-review decisions)
+
+These supersede the sections above where they differ. Acceptance tests D13-D20 are added.
+
+1. **Class-empty narrowing is a miss.** If the matched discovering route's candidate list for the
+   request's class is empty after narrowing (only accounts in the other class list `m`), the
+   proxy answers 404 `model_not_found`, exactly like an unknown model. No policy decision is
+   made and no lease is taken. `check_admission` reports the same "no route" outcome for that
+   class. (D13)
+2. **Ambiguous discovered ids are refused, not shadowed.** This replaces Resolution rule 5. If two
+   or more discovering routes would serve `m` (each has a candidate listing it and passes its
+   `discover_match`), no route serves it: the proxy answers 404 `model_not_found` with the
+   message `localrouter: model is claimed by more than one discovering route`, and the id is
+   omitted from `/v1/models`. Diagnostics lists it per route under `ambiguous` (route names
+   only). The operator resolves it with `discover_match` or by listing it statically (static
+   still wins). Rationale: rule 5 let a cloud route silently take over a local-only route's model
+   when the cloud upstream started listing the same id. The per-route `shadowed` field is
+   removed (static-vs-discovered collisions need no report, because static always wins by
+   design). (D14)
+3. **No refresh for ids no route could admit.** The on-demand refresh (Resolution rule 3) runs
+   only if at least one discovering route's `discover_match` admits `m` (or that route has no
+   `discover_match`). Otherwise the 404 is immediate. (D15)
+4. **Refresh waiters wake per account.** A waiting request re-checks resolution each time any
+   account's poll finishes, and returns as soon as `m` resolves, instead of waiting for every
+   account in the refresh. The 3 s bound and the cancellation rules are unchanged. (D16, the
+   review PoC `TestReviewRefreshWaitsForSlowestAccount`)
+5. **Failed polls retry with backoff.** After a failed poll, the account's next scheduled poll is
+   30 s later, doubling on each consecutive failure, capped at the account's interval. A success
+   resets to the normal interval. (D17)
+6. **Bounded response headers.** The discovery transport sets `MaxResponseHeaderBytes` to 64 KiB;
+   an overflow is error class `transport`. (review PoC `TestReviewHugeResponseHeadersAccepted`)
+7. **Stricter ids.** An id is kept only if every rune satisfies `unicode.IsGraphic` and is not a
+   space (this rejects Cf format characters such as U+200B, U+202E, U+FEFF and U+2060, in
+   addition to the existing rules). (review PoC `TestReviewInvisibleFormatCharsInIDs`)
+8. **Null and blank config values.** A key that is present with a YAML null value
+   (`discover_interval: ~`, `discover_match:` with nothing after it) counts as present: it is
+   rejected on a non-discovering route (rule 4), and on a discovering route a null or empty
+   `discover_match` is a config error, as is a null `discover_interval`. A `discover_match`
+   pattern that is empty after whitespace trimming is a config error. (review PoC
+   `TestReviewDiscoverNullKeysAccepted`, D18)
+9. **No idle discovery goroutine.** With no discovering route, `App.Start` starts no discovery
+   goroutine. The loop starts when `SetTargets` first receives a target and stops when targets
+   become empty or on Close. The goroutine count of a flags-off App after Start equals the
+   pre-change count. (D19)
+10. **Documented semantics.** `discover_match` uses `path.Match`, so `*` does not cross `/`: write
+    `unsloth/*` or `*/*`, not `*`. State this in the SPEC and `config.example.yaml`.
+    Diagnostics `model_count` is the account's full listing size before any `discover_match`
+    filtering. Listing JSON is parsed with `encoding/json` semantics (case-insensitive keys,
+    last duplicate wins); this is accepted because an id is only a lookup key. (D20: the docs
+    example has a test that `unsloth/*` matches `unsloth/Qwen3.5-9B-GGUF:Q4_K_M` and `*` does
+    not.)
+
 ## Workload classes
 
 `interactive` and `background`. Each client key maps to one class.
