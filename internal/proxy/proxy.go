@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -63,6 +64,25 @@ type Deps struct {
 	// follows a successful Reserve. A Reserve error is terminal: the attempt is
 	// not sent, does not fail over, and is not settled.
 	Budget Budget
+	// Discovery resolves models no route lists statically (route-level model
+	// discovery). Nil means no route discovers: routing and /v1/models are
+	// exactly the static-only behaviour. Static models are always looked up
+	// first and never reach it.
+	Discovery Discovery
+}
+
+// Discovery resolves discovered model ids for one generation. It is satisfied
+// by *internal/discovery.Resolver; the proxy depends on the behaviour only.
+type Discovery interface {
+	// Resolve returns the discovering route serving model, its candidate lists
+	// already narrowed to the accounts that list model.
+	Resolve(model string) (core.Route, bool)
+	// Models lists every currently resolvable discovered id.
+	Models() []string
+	// Refresh runs the shared on-demand refresh, returning when it finishes,
+	// after a bounded wait, or when ctx is done (which never cancels the shared
+	// refresh itself).
+	Refresh(ctx context.Context)
 }
 
 // Budget gates one upstream attempt against the budget store. It is satisfied by
@@ -225,10 +245,33 @@ func (p *Proxy) serveModels(w http.ResponseWriter, r *http.Request) {
 		Object string  `json:"object"`
 		Data   []model `json:"data"`
 	}{Object: "list", Data: []model{}}
-	for _, m := range p.models {
+	ids := p.models
+	if p.deps.Discovery != nil {
+		ids = mergeSorted(p.models, p.deps.Discovery.Models())
+	}
+	for _, m := range ids {
 		out.Data = append(out.Data, model{ID: m, Object: "model", OwnedBy: "localrouter"})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// resolveDiscovered resolves a model no route lists statically through the
+// discovering routes. On a miss it triggers the shared on-demand refresh
+// (single-flight and rate-limited by the implementation, with a bounded wait
+// that the request's own cancellation also ends) and retries exactly once.
+func (p *Proxy) resolveDiscovered(ctx context.Context, model string) (core.Route, bool) {
+	if route, ok := p.deps.Discovery.Resolve(model); ok {
+		return route, true
+	}
+	p.deps.Discovery.Refresh(ctx)
+	return p.deps.Discovery.Resolve(model)
+}
+
+// mergeSorted returns the sorted, deduplicated union of a and b.
+func mergeSorted(a, b []string) []string {
+	out := append(append(make([]string, 0, len(a)+len(b)), a...), b...)
+	sort.Strings(out)
+	return slices.Compact(out)
 }
 
 // request is one parsed downstream inference request.
@@ -294,6 +337,9 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 		return
 	}
 	route, ok := p.routes[head.Model]
+	if !ok && p.deps.Discovery != nil {
+		route, ok = p.resolveDiscovered(r.Context(), head.Model)
+	}
 	if !ok {
 		writeError(w, http.StatusNotFound, "localrouter: unknown model", "model_not_found")
 		return

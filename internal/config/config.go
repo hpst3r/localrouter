@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -357,7 +358,21 @@ type RouteConfig struct {
 	// unknown keys are rejected. Absent/empty preserves the legacy
 	// unconstrained route.
 	Upstreams map[string]UpstreamSpec `yaml:"upstreams"`
+	// DiscoverModels opts the route into model discovery from its candidates'
+	// GET {base_url}/models listings. DiscoverInterval (default 5m, within
+	// [30s, 24h]) and DiscoverMatch (path.Match globs; absent = all ids) are
+	// valid only on a discovering route; nil means the key was absent.
+	DiscoverModels   bool      `yaml:"discover_models"`
+	DiscoverInterval *Duration `yaml:"discover_interval"`
+	DiscoverMatch    []string  `yaml:"discover_match"`
 }
+
+// Model-discovery interval bounds and default.
+const (
+	DefaultDiscoverInterval = 5 * time.Minute
+	MinDiscoverInterval     = 30 * time.Second
+	MaxDiscoverInterval     = 24 * time.Hour
+)
 
 // UpstreamSpec is one candidate account's capability descriptor inside
 // routes[].upstreams. It is a config mirror of core.UpstreamSpec.
@@ -709,7 +724,7 @@ func (c *Config) Validate() error {
 	}
 	models := map[string]string{}
 	for _, r := range c.Routes {
-		if r.Name == "" || len(r.Models) == 0 {
+		if r.Name == "" || len(r.Models) == 0 && !r.DiscoverModels {
 			errs = append(errs, fmt.Errorf("route %q: name and models required", r.Name))
 		}
 		for _, m := range r.Models {
@@ -729,6 +744,7 @@ func (c *Config) Validate() error {
 			}
 		}
 		errs = append(errs, validateUpstreams(r, provider)...)
+		errs = append(errs, validateDiscovery(r, provider)...)
 	}
 	if c.ClaudeLogs.Enabled {
 		if c.ClaudeLogs.Account == "" {
@@ -830,6 +846,59 @@ func validateUpstreams(r RouteConfig, provider map[string]string) []error {
 	return errs
 }
 
+// validateDiscovery enforces the model-discovery rules for one route: a
+// discovering route may only use openai_compat/ollama candidates and never
+// rewrites the model (discovered ids are forwarded unchanged), and the interval
+// and match keys are accepted only on a discovering route. A route without
+// discover_models and without either key yields no error, so legacy configs
+// validate exactly as before.
+func validateDiscovery(r RouteConfig, provider map[string]string) []error {
+	var errs []error
+	if !r.DiscoverModels {
+		if r.DiscoverInterval != nil {
+			errs = append(errs, fmt.Errorf("route %s: discover_interval requires discover_models: true", r.Name))
+		}
+		if r.DiscoverMatch != nil {
+			errs = append(errs, fmt.Errorf("route %s: discover_match requires discover_models: true", r.Name))
+		}
+		return errs
+	}
+	seen := map[string]bool{}
+	for _, id := range append(append([]string{}, r.Interactive...), r.Background...) {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if p, ok := provider[id]; ok && p != core.ProviderOpenAICompat && p != core.ProviderOllama {
+			errs = append(errs, fmt.Errorf("route %s: discover_models requires openai_compat or ollama candidates; account %q is %s", r.Name, id, p))
+		}
+	}
+	if r.UpstreamModel != "" {
+		errs = append(errs, fmt.Errorf("route %s: discover_models forwards discovered ids unchanged; upstream_model must be empty", r.Name))
+	}
+	for id, spec := range r.Upstreams {
+		if strings.TrimSpace(spec.UpstreamModel) != "" {
+			errs = append(errs, fmt.Errorf("route %s: discover_models forwards discovered ids unchanged; upstreams[%s].upstream_model must be empty", r.Name, id))
+		}
+	}
+	if r.DiscoverInterval != nil {
+		if d := r.DiscoverInterval.D(); d < MinDiscoverInterval || d > MaxDiscoverInterval {
+			errs = append(errs, fmt.Errorf("route %s: discover_interval must be within [30s, 24h]", r.Name))
+		}
+	}
+	if r.DiscoverMatch != nil && len(r.DiscoverMatch) == 0 {
+		errs = append(errs, fmt.Errorf("route %s: discover_match must list at least one pattern when present", r.Name))
+	}
+	for _, pat := range r.DiscoverMatch {
+		if pat == "" {
+			errs = append(errs, fmt.Errorf("route %s: discover_match patterns must be non-empty", r.Name))
+		} else if _, err := path.Match(pat, ""); errors.Is(err, path.ErrBadPattern) {
+			errs = append(errs, fmt.Errorf("route %s: discover_match pattern %q is invalid", r.Name, pat))
+		}
+	}
+	return errs
+}
+
 // CoreAccounts converts account config into core.Account values.
 func (c *Config) CoreAccounts() []core.Account {
 	out := make([]core.Account, 0, len(c.Accounts))
@@ -869,14 +938,25 @@ func (c *Config) CoreRoutes() []core.Route {
 				}
 			}
 		}
-		out = append(out, core.Route{
+		cr := core.Route{
 			Name:          r.Name,
 			Models:        append([]string(nil), r.Models...),
 			UpstreamModel: r.UpstreamModel,
 			Interactive:   append([]string(nil), r.Interactive...),
 			Background:    append([]string(nil), bg...),
 			Upstreams:     ups,
-		})
+		}
+		if r.DiscoverModels {
+			cr.DiscoverModels = true
+			cr.DiscoverInterval = DefaultDiscoverInterval
+			if r.DiscoverInterval != nil {
+				cr.DiscoverInterval = r.DiscoverInterval.D()
+			}
+			if len(r.DiscoverMatch) > 0 {
+				cr.DiscoverMatch = append([]string(nil), r.DiscoverMatch...)
+			}
+		}
+		out = append(out, cr)
 	}
 	return out
 }

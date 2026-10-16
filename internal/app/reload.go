@@ -25,6 +25,9 @@ var ErrRestartRequired = errors.New("configuration change requires restart")
 
 type runtimeGeneration struct {
 	handler http.Handler
+	// routes is the generation's routing table; discovery is re-targeted to
+	// it when the generation is published.
+	routes  []core.Route
 	pricing *ledger.PricingView
 	status  core.ReloadStatus
 }
@@ -195,6 +198,11 @@ func (a *App) reloadConfigLocked(c *config.Config) (core.ReloadStatus, error) {
 	}
 	a.current.Store(g)
 	a.srvMu.Unlock()
+	accts := map[string]core.Account{}
+	for _, acct := range c.CoreAccounts() {
+		accts[acct.ID] = acct
+	}
+	a.Discovery.SetTargets(accts, g.routes)
 	return a.generationStatus(g), nil
 }
 
@@ -247,11 +255,21 @@ func (a *App) makeGeneration(c *config.Config, number uint64) (*runtimeGeneratio
 		return clients[name], true
 	}
 	routes := c.CoreRoutes()
-	px := proxy.New(proxy.Deps{Accounts: acctMap, Routes: routes, Creds: a.Auth, Quota: a.Quota, Policy: pol, Ledger: priceView, Budget: gate, Authenticate: authenticate, Clock: a.reloadClock, Logger: a.Logger, Limiter: lim}, proxy.Options{MaxFailovers: c.Policy.MaxFailovers})
-	g := &runtimeGeneration{pricing: priceView, status: core.ReloadStatus{Generation: number, OK: true, At: a.reloadClock.Now()}}
+	pdeps := proxy.Deps{Accounts: acctMap, Routes: routes, Creds: a.Auth, Quota: a.Quota, Policy: pol, Ledger: priceView, Budget: gate, Authenticate: authenticate, Clock: a.reloadClock, Logger: a.Logger, Limiter: lim}
+	// A nil resolver (no discovering route) leaves Discovery unset, so the
+	// generation keeps the static-only path byte for byte.
+	resolver := a.Discovery.Resolver(routes)
+	if resolver != nil {
+		pdeps.Discovery = resolver
+	}
+	px := proxy.New(pdeps, proxy.Options{MaxFailovers: c.Policy.MaxFailovers})
+	g := &runtimeGeneration{routes: routes, pricing: priceView, status: core.ReloadStatus{Generation: number, OK: true, At: a.reloadClock.Now()}}
 	deps := control.Deps{Accounts: accounts, Quota: a.Quota, Policy: pol, Ledger: priceView, Routes: routes, Authenticate: authenticate, Clock: a.reloadClock, Storage: a.Ledger, Inflight: viewInflight{lim}, Ready: a.Serving, ReloadStatus: func() core.ReloadStatus { return a.generationStatus(g) }, Budgets: a.budgetSource(c.Budgets)}
 	for _, cl := range c.Clients {
 		deps.Clients = append(deps.Clients, control.ClientInfo{Name: cl.Name, Class: cl.Class, Host: clients[cl.Name].Host, Ingest: cl.Ingest})
+	}
+	if resolver != nil {
+		deps.Discovery = resolver
 	}
 	deps.Ingester = a.Quota
 	deps.IsSnapshotStale = func(err error) bool { return errors.Is(err, quota.ErrSnapshotStale) }

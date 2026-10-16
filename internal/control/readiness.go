@@ -88,6 +88,9 @@ type diagnosticsDoc struct {
 	// fabricating a generation.
 	Reload   *core.ReloadStatus `json:"reload,omitempty"`
 	Accounts []diagAccount      `json:"accounts"`
+	// Discovery is the model-discovery block, present only when a route
+	// discovers (Deps.Discovery non-nil).
+	Discovery any `json:"discovery,omitempty"`
 }
 
 type storageHealth struct {
@@ -133,6 +136,9 @@ func (s *Server) diagnostics(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, a := range s.deps.Accounts {
 		doc.Accounts = append(doc.Accounts, s.diagAccount(a, now))
+	}
+	if s.deps.Discovery != nil {
+		doc.Discovery = s.deps.Discovery.Diagnostics()
 	}
 	writeJSON(w, http.StatusOK, doc)
 }

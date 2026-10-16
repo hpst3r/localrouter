@@ -74,8 +74,25 @@ type Deps struct {
 	// the generation. Like ReloadStatus it is consulted per request, so a
 	// reload publishes a fresh source without restarting the server.
 	Budgets BudgetSource
+	// Discovery resolves discovered model ids for findRoute (check_admission)
+	// with the proxy's rules, minus the on-demand refresh, and supplies the
+	// diagnostics "discovery" block. Nil when no route discovers: findRoute
+	// and the diagnostics document are then exactly the static-only ones.
+	Discovery Discovery
 	// Clock defaults to core.SystemClock.
 	Clock core.Clock
+}
+
+// Discovery is the control server's view of route-level model discovery. It
+// is satisfied by *internal/discovery.Resolver.
+type Discovery interface {
+	// Resolve returns the discovering route serving model, with its candidate
+	// lists narrowed to the accounts that list it. Static models never resolve
+	// here; findRoute checks them first.
+	Resolve(model string) (core.Route, bool)
+	// Diagnostics returns the JSON-encodable "discovery" block. It must carry
+	// no URLs, keys or upstream bodies.
+	Diagnostics() any
 }
 
 // Options tune the control server.
@@ -727,6 +744,9 @@ func (s *Server) findRoute(model string) (core.Route, bool) {
 		if slices.Contains(rt.Models, model) {
 			return rt, true
 		}
+	}
+	if s.deps.Discovery != nil {
+		return s.deps.Discovery.Resolve(model)
 	}
 	return core.Route{}, false
 }

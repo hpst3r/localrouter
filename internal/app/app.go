@@ -21,6 +21,7 @@ import (
 	"github.com/hpst3r/localrouter/internal/config"
 	"github.com/hpst3r/localrouter/internal/connlim"
 	"github.com/hpst3r/localrouter/internal/core"
+	"github.com/hpst3r/localrouter/internal/discovery"
 	"github.com/hpst3r/localrouter/internal/hermeslog"
 	"github.com/hpst3r/localrouter/internal/httpguard"
 	"github.com/hpst3r/localrouter/internal/ledger"
@@ -58,6 +59,10 @@ type App struct {
 	ClaudeLog *claudelog.Collector
 	// HermesLog is nil unless hermes_logs.enabled.
 	HermesLog *hermeslog.Collector
+	// Discovery holds the discovered model listings, shared by every
+	// generation and re-targeted on each accepted reload. Always non-nil; it
+	// polls nothing while no route discovers.
+	Discovery *discovery.Manager
 
 	// Limiter is the shared inference concurrency controller. It bounds active
 	// requests at the proxy and is reported to diagnostics. Non-nil even when
@@ -233,6 +238,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 			Shutdown: cfg.Timeouts.Shutdown.D(),
 		},
 		TLSCertFile: cfg.TLSCertFile, TLSKeyFile: cfg.TLSKeyFile, Logger: logger,
+		Discovery: discovery.New(creds, discovery.Options{Clock: clock, Logger: logger}),
 	}
 	a.serving.Store(true)
 	a.reloadBase = cfg
@@ -252,6 +258,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		return nil, err
 	}
 	a.current.Store(generation)
+	a.Discovery.SetTargets(acctMap, generation.routes)
 	a.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		g := a.current.Load()
 		g.handler.ServeHTTP(w, r)
@@ -301,9 +308,11 @@ func selfHosts(listen string) []string {
 	return out
 }
 
-// Start begins background quota polling until ctx is cancelled.
+// Start begins background quota polling and model discovery until ctx is
+// cancelled. Neither blocks on a first fetch.
 func (a *App) Start(ctx context.Context) {
 	a.Quota.Start(ctx)
+	a.Discovery.Start(ctx)
 	if a.ClaudeLog != nil {
 		a.ClaudeLog.Start(ctx)
 	}
@@ -398,6 +407,9 @@ func (a *App) Close() error {
 	a.stopped = true
 	a.srvMu.Unlock()
 	a.closeBudget()
+	if a.Discovery != nil {
+		a.Discovery.Close()
+	}
 	if a.Ledger == nil {
 		return nil
 	}

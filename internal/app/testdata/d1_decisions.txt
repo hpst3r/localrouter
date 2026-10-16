@@ -1,0 +1,24 @@
+admit interactive gpt-5.6-sol -> {"decision":"allow","account_id":"codex-primary","reason":"admitted codex-primary"}
+admit background gpt-5.6-sol -> {"decision":"deny","account_id":"","reason":"codex-primary: quota snapshot stale or missing; reserved account denies background"}
+chat gpt-5.6-sol -> 400 {"error":{"message":"codex accounts only serve /v1/responses","type":"invalid_request_error"}}
+  hits []
+admit interactive deepseek-v4.1-flash -> {"decision":"allow","account_id":"ollama-cloud","reason":"admitted ollama-cloud"}
+admit background deepseek-v4.1-flash -> {"decision":"deny","account_id":"","reason":"ollama-cloud: quota snapshot stale or missing; reserved account denies background"}
+chat deepseek-v4.1-flash -> 200
+  hits ["/ollama/v1/chat/completions deepseek-v4.1-flash"]
+admit interactive kimi-k3 -> {"decision":"allow","account_id":"ollama-cloud","reason":"admitted ollama-cloud"}
+admit background kimi-k3 -> {"decision":"deny","account_id":"","reason":"ollama-cloud: quota snapshot stale or missing; reserved account denies background"}
+chat kimi-k3 -> 200
+  hits ["/ollama/v1/chat/completions kimi-k3"]
+admit interactive alias-model -> {"decision":"allow","account_id":"compat-a","reason":"admitted compat-a"}
+admit background alias-model -> {"decision":"allow","account_id":"compat-a","reason":"admitted compat-a"}
+chat alias-model -> 200
+  hits ["/a/v1/chat/completions backend-alias"]
+admit interactive unknown-model -> {"error":{"message":"no route for model \"unknown-model\""}}
+admit background unknown-model -> {"error":{"message":"no route for model \"unknown-model\""}}
+chat unknown-model -> 404 {"error":{"message":"localrouter: unknown model","type":"model_not_found"}}
+  hits []
+admit interactive unsloth/qwen3 -> {"error":{"message":"no route for model \"unsloth/qwen3\""}}
+admit background unsloth/qwen3 -> {"error":{"message":"no route for model \"unsloth/qwen3\""}}
+chat unsloth/qwen3 -> 404 {"error":{"message":"localrouter: unknown model","type":"model_not_found"}}
+  hits []

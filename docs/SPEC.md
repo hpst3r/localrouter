@@ -320,6 +320,50 @@ For a request naming model `m`:
 - D12 Diagnostics: the `discovery` block appears only with a discovering route
   and never contains URLs, keys or upstream bodies.
 
+### Implementation notes (discovery)
+
+- Fields: `core.Route` gains `DiscoverModels bool`, `DiscoverInterval
+  time.Duration` (5m default applied by `config.CoreRoutes`) and
+  `DiscoverMatch []string` (nil = all ids). `config.RouteConfig` carries
+  `discover_interval` as `*Duration` and `discover_match` as a slice so
+  presence on a non-discovering route is detectable. An explicit empty
+  `discover_match: []` is rejected (it would otherwise read as "all ids").
+- Package `internal/discovery`: `New(creds, Options) *Manager` is App-level and
+  shared by every generation; `SetTargets(accounts, routes)` re-targets it after
+  each published generation (startup and every accepted reload); `Start(ctx)`
+  runs on `App.Start`; `Close` runs on `App.Close` and at the end of
+  `App.Shutdown`. `(*Manager).Resolver(routes)` returns the per-generation
+  `*Resolver`, or nil when no route discovers; the app then leaves
+  `proxy.Deps.Discovery` and `control.Deps.Discovery` unset, which is what keeps
+  the flags-off surfaces byte-identical (D1 goldens in `internal/proxy/testdata`
+  and `internal/app/testdata`).
+- `proxy.Discovery` (`Resolve`, `Models`, `Refresh`) and `control.Discovery`
+  (`Resolve`, `Diagnostics() any`) are consumer-defined interfaces satisfied by
+  `*discovery.Resolver`. Static models are looked up first in both packages and
+  never reach the resolver.
+- Polling: the background loop checks for due accounts every second (real
+  time) and schedules by the injectable `core.Clock`; a re-intervaled account's
+  next poll is `last_attempt + new interval`. Polls are single-flight per
+  account. The on-demand refresh is single-flight per manager, spaced by at
+  least 30 s from the previous refresh start, polls every current target with
+  the manager's own context (a request's cancellation only ends its own wait,
+  at most 3 s), and is a no-op after `Close`.
+- The `/models` request copies `core.Credential.Headers` verbatim, exactly as
+  the proxy does for inference. A credential error is class `credential`; no
+  `Invalidate` is issued on a 401 (it is class `status`).
+- `dropped` counts ids rejected by validation plus distinct ids over the
+  1,000 cap, from the last successful poll. `last_success_at` /
+  `last_attempt_at` are UTC, or `null` before the first one.
+- A route whose candidates list `m` only on one class's list still matches; the
+  other class then sees an empty candidate list and is denied by policy, never
+  served from outside the route.
+- Shadowing (rule 5) is reported in diagnostics only: a route's `shadowed`
+  lists ids its candidates list that a static entry or an earlier discovering
+  route serves. It is computed per diagnostics request, not logged.
+- A failed poll logs one `model discovery poll failed` line (account and
+  `error_class` only) per error-class change, and one `recovered` line when it
+  succeeds again.
+
 ## Workload classes
 
 `interactive` and `background`. Each client key maps to one class.

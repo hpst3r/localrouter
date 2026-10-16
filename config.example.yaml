@@ -66,6 +66,15 @@ routes:
     models: [deepseek-v4.1-flash, kimi-k3]
     interactive: [ollama-cloud]
     background:  [ollama-cloud]
+  # Model discovery (optional): serve whatever ids the candidates' GET
+  # {base_url}/models lists, instead of listing models by hand. Candidates must
+  # be openai_compat or ollama accounts, and upstream_model must stay empty.
+  # - name: llama-lab
+  #   discover_models: true
+  #   discover_interval: 5m          # default 5m; within [30s, 24h]
+  #   discover_match: ["unsloth/*"]  # optional path.Match globs; absent = all ids
+  #   interactive: [llama-lab]
+  #   background:  [llama-lab]
 
 claude_logs:                  # ingest Claude Code token usage from local transcripts
   enabled: true
