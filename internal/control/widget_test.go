@@ -42,7 +42,8 @@ func TestWidgetSelfContained(t *testing.T) {
 		t.Errorf("want exactly one inline <script>, got %d", n)
 	}
 	// Key behaviour carried over from the previous widget.
-	for _, want := range []string{"localrouter.controlKey", "/control/v1/status", "/control/v1/analytics", "demo"} {
+	for _, want := range []string{"localrouter.controlKey", "/control/v1/status", "/control/v1/analytics",
+		"/control/v1/analytics/performance", "demo"} {
 		if !strings.Contains(html, want) {
 			t.Errorf("widget missing %q", want)
 		}
