@@ -69,6 +69,9 @@ routes:
   # Model discovery (optional): serve whatever ids the candidates' GET
   # {base_url}/models lists, instead of listing models by hand. Candidates must
   # be openai_compat or ollama accounts, and upstream_model must stay empty.
+  # discover_match globs use Go path.Match, so "*" does not cross "/": write
+  # "unsloth/*" or "*/*", not "*". An id two discovering routes would both
+  # serve is refused (404) until discover_match or a static entry settles it.
   # - name: llama-lab
   #   discover_models: true
   #   discover_interval: 5m          # default 5m; within [30s, 24h]

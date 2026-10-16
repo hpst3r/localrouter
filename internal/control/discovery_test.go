@@ -12,13 +12,17 @@ import (
 
 type fakeDiscovery struct {
 	routes   map[string]core.Route
+	amb      map[string]bool
 	resolves []string
 }
 
-func (d *fakeDiscovery) Resolve(m string) (core.Route, bool) {
+func (d *fakeDiscovery) Resolve(m string) (core.Route, bool, bool) {
 	d.resolves = append(d.resolves, m)
+	if d.amb[m] {
+		return core.Route{}, false, true
+	}
 	r, ok := d.routes[m]
-	return r, ok
+	return r, ok, false
 }
 func (d *fakeDiscovery) Diagnostics() any {
 	return map[string]any{"accounts": []any{}, "routes": []any{map[string]any{"route": "lab", "models": []string{"disc/m"}}}}
@@ -59,6 +63,34 @@ func TestAdmitResolvesDiscoveredModel(t *testing.T) {
 	}
 	if !slices.Equal(d.resolves, []string{"disc/m", "disc/m", "nope"}) {
 		t.Fatalf("resolves %v: static model must not reach discovery", d.resolves)
+	}
+}
+
+// D13 (Amendment 1 item 1): check_admission reports "no route" for a class
+// whose narrowed candidate list is empty, without a policy dry run; D14: an
+// ambiguous id is refused the same way.
+func TestAdmitDiscoveredClassEmptyAndAmbiguous(t *testing.T) {
+	f := newFixture(false)
+	f.srv.deps.Discovery = &fakeDiscovery{
+		routes: map[string]core.Route{
+			"disc/m": {Name: "lab", DiscoverModels: true, Interactive: []string{"lab-b"}},
+		},
+		amb: map[string]bool{"dup/m": true},
+	}
+	before := len(f.policy.dryRuns)
+	rec := post(f.h, "/control/v1/admit", `{"class":"background","model":"disc/m"}`)
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), `no route for model \"disc/m\"`) {
+		t.Fatalf("class-empty: %d %s, want 404 no route", rec.Code, rec.Body)
+	}
+	rec = post(f.h, "/control/v1/admit", `{"class":"interactive","model":"dup/m"}`)
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "more than one discovering route") {
+		t.Fatalf("ambiguous: %d %s, want 404", rec.Code, rec.Body)
+	}
+	if n := len(f.policy.dryRuns) - before; n != 0 {
+		t.Fatalf("%d policy dry runs for unresolvable models", n)
+	}
+	if rec := post(f.h, "/control/v1/admit", `{"class":"interactive","model":"disc/m"}`); rec.Code != http.StatusOK {
+		t.Fatalf("interactive: %d %s", rec.Code, rec.Body)
 	}
 }
 

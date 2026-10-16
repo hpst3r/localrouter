@@ -52,6 +52,8 @@ func (m *Manager) fetch(ctx context.Context, account core.Account) (listing, str
 	for k, v := range cred.Headers {
 		req.Header[k] = append([]string(nil), v...)
 	}
+	// An error here includes response headers over the transport's
+	// MaxResponseHeaderBytes (64 KiB by default).
 	resp, err := m.opts.HTTPClient.Do(req)
 	if err != nil {
 		return listing{}, ErrClassTransport
@@ -116,9 +118,11 @@ func parseListing(body []byte, maxIDs int) (listing, error) {
 }
 
 // validID decodes a JSON string id and accepts it only if it is 1-256 bytes
-// of valid UTF-8 with no whitespace or control characters. The raw bytes are
-// checked too, because encoding/json silently replaces invalid UTF-8 (and
-// unpaired surrogate escapes) with U+FFFD, which is therefore also rejected.
+// of valid UTF-8 whose every rune is graphic (unicode.IsGraphic) and not a
+// space, which rules out control and format (Cf: zero-width, bidi, BOM)
+// characters. The raw bytes are checked too, because encoding/json silently
+// replaces invalid UTF-8 (and unpaired surrogate escapes) with U+FFFD, which
+// is therefore also rejected.
 func validID(raw json.RawMessage) (string, bool) {
 	if len(raw) == 0 || raw[0] != '"' || !utf8.Valid(raw) {
 		return "", false
@@ -128,7 +132,7 @@ func validID(raw json.RawMessage) (string, bool) {
 		return "", false
 	}
 	for _, r := range s {
-		if r == utf8.RuneError || unicode.IsSpace(r) || unicode.IsControl(r) {
+		if r == utf8.RuneError || !unicode.IsGraphic(r) || unicode.IsSpace(r) {
 			return "", false
 		}
 	}

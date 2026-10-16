@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path"
 	"slices"
 	"strings"
 	"testing"
@@ -100,5 +102,78 @@ routes: [{name: r, discover_models: true, discover_modelz: true, interactive: [o
 				t.Fatalf("err = %v, want it to contain %q", err, c.want)
 			}
 		})
+	}
+}
+
+// D18 (Amendment 1 item 8): null and blank values count as present.
+func TestDiscoveryNullAndBlankValues(t *testing.T) {
+	cases := []struct{ name, routes, want string }{
+		{"bare interval on non-discovering route", `
+routes:
+  - name: r
+    models: [m]
+    discover_interval:
+    interactive: [ol]`, "discover_interval requires discover_models"},
+		{"bare match on non-discovering route", `
+routes:
+  - name: r
+    models: [m]
+    discover_match:
+    interactive: [ol]`, "discover_match requires discover_models"},
+		{"null interval on discovering route", `
+routes: [{name: r, discover_models: true, discover_interval: ~, interactive: [ol]}]`, "discover_interval must be a duration"},
+		{"bare match on discovering route", `
+routes:
+  - name: r
+    discover_models: true
+    discover_match:
+    interactive: [ol]`, "at least one pattern"},
+		{"whitespace-only pattern", `
+routes: [{name: r, discover_models: true, discover_match: ["unsloth/*", "  "], interactive: [ol]}]`, "patterns must be non-empty"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := loadDisc(t, c.routes)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err = %v, want it to contain %q", err, c.want)
+			}
+		})
+	}
+	// A null key on one route does not leak onto another.
+	if _, err := loadDisc(t, `
+routes:
+  - {name: a, discover_models: true, discover_match: ["x/*"], interactive: [ol]}
+  - {name: b, models: [m], interactive: [oc]}`); err != nil {
+		t.Fatalf("valid config rejected: %v", err)
+	}
+}
+
+// D20 (Amendment 1 item 10): the documented discover_match example uses
+// path.Match semantics, so "unsloth/*" matches a llama.cpp id and "*" does not
+// cross "/".
+func TestDiscoveryMatchDocsExample(t *testing.T) {
+	const id = "unsloth/Qwen3.5-9B-GGUF:Q4_K_M"
+	for _, file := range []string{"../../config.example.yaml", "../../docs/SPEC.md"} {
+		b, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(b), `discover_match: ["unsloth/*"]`) {
+			t.Fatalf("%s lost the discover_match: [\"unsloth/*\"] example", file)
+		}
+	}
+	if ok, err := path.Match("unsloth/*", id); err != nil || !ok {
+		t.Fatalf("unsloth/* does not match %s", id)
+	}
+	if ok, _ := path.Match("*", id); ok {
+		t.Fatalf("* matches %s; the docs say it does not cross /", id)
+	}
+	if ok, _ := path.Match("*/*", id); !ok {
+		t.Fatalf("*/* does not match %s", id)
+	}
+	c, err := loadDisc(t, `
+routes: [{name: r, discover_models: true, discover_match: ["unsloth/*"], interactive: [ol]}]`)
+	if err != nil || !slices.Equal(c.CoreRoutes()[0].DiscoverMatch, []string{"unsloth/*"}) {
+		t.Fatalf("docs example config: %v", err)
 	}
 }

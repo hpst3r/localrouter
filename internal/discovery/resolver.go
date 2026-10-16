@@ -36,14 +36,16 @@ func (m *Manager) Resolver(routes []core.Route) *Resolver {
 	return r
 }
 
-// Resolve returns the first discovering route (config order) whose
+// Resolve returns the discovering route that serves model: the only one whose
 // discover_match admits model and of whose candidates at least one currently
 // lists it, with Interactive and Background narrowed to the listing accounts
-// (order preserved). A statically listed model never resolves here: static
-// routes win and are looked up by the caller first.
-func (r *Resolver) Resolve(model string) (core.Route, bool) {
+// (order preserved; either may be empty). If two or more discovering routes
+// claim model, no route serves it and ambiguous is true. A statically listed
+// model never resolves here: static routes win and are looked up by the
+// caller first.
+func (r *Resolver) Resolve(model string) (route core.Route, ok, ambiguous bool) {
 	if r == nil || r.static[model] {
-		return core.Route{}, false
+		return core.Route{}, false, false
 	}
 	r.m.mu.RLock()
 	defer r.m.mu.RUnlock()
@@ -55,10 +57,13 @@ func (r *Resolver) Resolve(model string) (core.Route, bool) {
 		if len(in) == 0 && len(bg) == 0 {
 			continue
 		}
-		rt.Interactive, rt.Background = in, bg
-		return rt, true
+		if ok {
+			return core.Route{}, false, true
+		}
+		route, ok = rt, true
+		route.Interactive, route.Background = in, bg
 	}
-	return core.Route{}, false
+	return route, ok, false
 }
 
 // narrow keeps the ids whose listing contains model. Caller holds m.mu.
@@ -74,39 +79,64 @@ func (r *Resolver) narrow(ids []string, model string) []string {
 	return out
 }
 
-// Models lists every currently resolvable discovered id (after discover_match,
-// excluding static models), deduplicated and sorted.
-func (r *Resolver) Models() []string {
-	if r == nil {
-		return nil
-	}
-	seen := map[string]bool{}
-	var out []string
-	r.m.mu.RLock()
-	for _, rt := range r.routes {
+// claims maps every non-static discovered id to the indexes (into r.routes,
+// ascending) of the discovering routes whose discover_match admits it and
+// whose candidates list it. Caller holds m.mu.
+func (r *Resolver) claims() map[string][]int {
+	out := map[string][]int{}
+	for i, rt := range r.routes {
 		for _, id := range candidates(rt) {
 			e := r.m.targets[id]
 			if e == nil {
 				continue
 			}
 			for _, s := range e.sorted {
-				if !seen[s] && !r.static[s] && matches(rt.DiscoverMatch, s) {
-					seen[s] = true
-					out = append(out, s)
+				if r.static[s] || !matches(rt.DiscoverMatch, s) {
+					continue
+				}
+				if c := out[s]; len(c) == 0 || c[len(c)-1] != i {
+					out[s] = append(c, i)
 				}
 			}
 		}
 	}
+	return out
+}
+
+// Models lists every currently resolvable discovered id (after discover_match,
+// excluding static models and ids claimed by more than one discovering
+// route), deduplicated and sorted.
+func (r *Resolver) Models() []string {
+	if r == nil {
+		return nil
+	}
+	r.m.mu.RLock()
+	claims := r.claims()
 	r.m.mu.RUnlock()
+	var out []string
+	for s, routes := range claims {
+		if len(routes) == 1 {
+			out = append(out, s)
+		}
+	}
 	slices.Sort(out)
 	return out
 }
 
-// Refresh triggers the manager's on-demand refresh (see Manager.Refresh).
-func (r *Resolver) Refresh(ctx context.Context) {
-	if r != nil {
-		r.m.Refresh(ctx)
+// Refresh triggers the manager's on-demand refresh (see Manager.Refresh) for
+// a request naming model, and returns as soon as model resolves. It does
+// nothing when no discovering route's discover_match admits model, since no
+// listing could make it resolve.
+func (r *Resolver) Refresh(ctx context.Context, model string) {
+	if r == nil || r.static[model] || !slices.ContainsFunc(r.routes, func(rt core.Route) bool {
+		return matches(rt.DiscoverMatch, model)
+	}) {
+		return
 	}
+	r.m.Refresh(ctx, func() bool {
+		_, ok, _ := r.Resolve(model)
+		return ok
+	})
 }
 
 // Diagnostics is the diagnostics "discovery" block. It never carries URLs,
@@ -117,7 +147,8 @@ type Diagnostics struct {
 }
 
 // AccountDiagnostics describes one polled account. Times are UTC and null
-// until the first attempt/success; ErrorClass is the last attempt's failure
+// until the first attempt/success; ModelCount is the full listing size before
+// any discover_match filtering; ErrorClass is the last attempt's failure
 // class, omitted when it succeeded.
 type AccountDiagnostics struct {
 	Account       string     `json:"account"`
@@ -130,12 +161,12 @@ type AccountDiagnostics struct {
 }
 
 // RouteDiagnostics lists the discovered ids a route serves and, under
-// Shadowed, the ids its candidates list that a static entry or an earlier
-// discovering route serves instead.
+// Ambiguous, the ids it claims together with at least one other discovering
+// route, which no route serves.
 type RouteDiagnostics struct {
-	Route    string   `json:"route"`
-	Models   []string `json:"models"`
-	Shadowed []string `json:"shadowed,omitempty"`
+	Route     string   `json:"route"`
+	Models    []string `json:"models"`
+	Ambiguous []string `json:"ambiguous,omitempty"`
 }
 
 // Snapshot builds the diagnostics block for this generation.
@@ -144,44 +175,34 @@ func (r *Resolver) Snapshot() Diagnostics {
 	if r == nil {
 		return d
 	}
-	byAccount := map[string][]string{}
-	var order []string
-	claimed := map[string]bool{}
-	for s := range r.static {
-		claimed[s] = true
-	}
 	r.m.mu.RLock()
 	defer r.m.mu.RUnlock()
 	for _, rt := range r.routes {
-		rd := RouteDiagnostics{Route: rt.Name, Models: []string{}}
-		listed := map[string]bool{}
+		d.Routes = append(d.Routes, RouteDiagnostics{Route: rt.Name, Models: []string{}})
+	}
+	for s, routes := range r.claims() {
+		for _, i := range routes {
+			rd := &d.Routes[i]
+			if len(routes) == 1 {
+				rd.Models = append(rd.Models, s)
+			} else {
+				rd.Ambiguous = append(rd.Ambiguous, s)
+			}
+		}
+	}
+	for i := range d.Routes {
+		slices.Sort(d.Routes[i].Models)
+		slices.Sort(d.Routes[i].Ambiguous)
+	}
+	byAccount := map[string][]string{}
+	var order []string
+	for _, rt := range r.routes {
 		for _, id := range candidates(rt) {
 			if _, ok := byAccount[id]; !ok {
 				order = append(order, id)
 			}
 			byAccount[id] = append(byAccount[id], rt.Name)
-			if e := r.m.targets[id]; e != nil {
-				for _, s := range e.sorted {
-					if matches(rt.DiscoverMatch, s) {
-						listed[s] = true
-					}
-				}
-			}
 		}
-		ids := make([]string, 0, len(listed))
-		for s := range listed {
-			ids = append(ids, s)
-		}
-		slices.Sort(ids)
-		for _, s := range ids {
-			if claimed[s] {
-				rd.Shadowed = append(rd.Shadowed, s)
-				continue
-			}
-			claimed[s] = true
-			rd.Models = append(rd.Models, s)
-		}
-		d.Routes = append(d.Routes, rd)
 	}
 	slices.Sort(order)
 	for _, id := range order {
@@ -207,7 +228,8 @@ func utcPtr(t time.Time) *time.Time {
 }
 
 // matches reports whether id passes the globs (none = all). Patterns were
-// validated at config load, so a match error is treated as no match.
+// validated at config load, so a match error is treated as no match. Globs use
+// path.Match, so "*" does not cross "/": "unsloth/*" or "*/*", not "*".
 func matches(globs []string, id string) bool {
 	if len(globs) == 0 {
 		return true

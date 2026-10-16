@@ -356,13 +356,44 @@ For a request naming model `m`:
   `last_attempt_at` are UTC, or `null` before the first one.
 - A route whose candidates list `m` only on one class's list still matches; the
   other class then sees an empty candidate list and is denied by policy, never
-  served from outside the route.
+  served from outside the route. (Superseded by Amendment 1 item 1: that
+  class now gets 404 `model_not_found` without a policy decision.)
 - Shadowing (rule 5) is reported in diagnostics only: a route's `shadowed`
   lists ids its candidates list that a static entry or an earlier discovering
   route serves. It is computed per diagnostics request, not logged.
+  (Superseded by Amendment 1 item 2; see below.)
 - A failed poll logs one `model discovery poll failed` line (account and
   `error_class` only) per error-class change, and one `recovered` line when it
   succeeds again.
+
+Implementation notes for Amendment 1:
+
+- `Resolve(model)` returns `(route, ok, ambiguous)` in `proxy.Discovery`,
+  `control.Discovery` and `*discovery.Resolver`. Route selection is
+  class-agnostic (a route claims `m` if any candidate lists it); the proxy and
+  `findRoute` then apply item 1 to the request's class. `check_admission`
+  answers 404 `no route for model "m"` for a class-empty route and 404
+  `model "m" is claimed by more than one discovering route` for an ambiguous
+  id, without a policy dry run.
+- The on-demand refresh runs only on a true miss (no route claims `m`); an
+  ambiguous or class-empty id is answered without one. `Refresh(ctx, model)`
+  returns at once unless some discovering route's `discover_match` admits
+  `model` (item 3), and otherwise returns as soon as `Resolve(model)` reports
+  `ok`, re-checked each time any account's poll finishes (item 4).
+- Diagnostics: each route's `models` lists the ids it alone serves and
+  `ambiguous` (omitted when empty) the ids it claims together with another
+  discovering route; static ids appear in neither. `model_count` is the
+  account's full listing size before `discover_match`.
+- Backoff (item 5) applies to every failed poll, background or on-demand; a
+  re-interval keeps the current backoff (`last_attempt + min(backoff,
+  interval)`).
+- `discover_match` uses `path.Match`: `*` does not cross `/`, so write
+  `unsloth/*` or `*/*`, not `*`.
+- Null keys (item 8) are detected by `config.Load` with a second YAML node
+  pass, because yaml.v3 decodes null to nil without calling unmarshalers.
+- With no target the manager runs no goroutine (item 9); `Start` only records
+  the context, and `SetTargets` starts or (via the loop's exit check) stops
+  the loop.
 
 ### Amendment 1 (post-review decisions)
 

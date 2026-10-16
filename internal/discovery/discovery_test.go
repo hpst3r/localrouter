@@ -379,14 +379,14 @@ func TestRefreshSingleFlightSpacingAndWait(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); r.m.Refresh(context.Background()) }()
+		go func() { defer wg.Done(); r.m.Refresh(context.Background(), nil) }()
 	}
 	wg.Wait()
 	if n := r.ups["a"].calls.Load(); n != 1 {
 		t.Fatalf("100 concurrent refreshes made %d calls, want 1", n)
 	}
 	r.clock.Add(29 * time.Second)
-	r.m.Refresh(context.Background())
+	r.m.Refresh(context.Background(), nil)
 	if n := r.ups["a"].calls.Load(); n != 1 {
 		t.Fatalf("refresh inside the 30s window made a call (%d)", n)
 	}
@@ -399,12 +399,12 @@ func TestRefreshSingleFlightSpacingAndWait(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	start := time.Now()
-	r.m.Refresh(ctx)
+	r.m.Refresh(ctx, nil)
 	if el := time.Since(start); el > 50*time.Millisecond {
 		t.Fatalf("cancelled caller waited %v", el)
 	}
 	start = time.Now()
-	r.m.Refresh(context.Background()) // joins the in-flight refresh
+	r.m.Refresh(context.Background(), nil) // joins the in-flight refresh
 	if el := time.Since(start); el < 90*time.Millisecond || el > time.Second {
 		t.Fatalf("joined wait %v, want ~RefreshWait", el)
 	}
@@ -421,15 +421,18 @@ func TestRefreshSingleFlightSpacingAndWait(t *testing.T) {
 	}
 }
 
+// Amendment 1 item 2 rewrote this test: an id two discovering routes claim
+// (x/both) is ambiguous and served by neither, instead of by the earlier
+// route with the later one reporting it as shadowed.
 func TestResolverNarrowsMatchesAndStaticWins(t *testing.T) {
 	r := newRig(t, Options{}, "a", "b", "c")
 	routes := []core.Route{
 		{Name: "static", Models: []string{"shared/static"}, Interactive: []string{"c"}, Background: []string{"c"}},
 		{Name: "first", Interactive: []string{"a", "b"}, Background: []string{"b"}, DiscoverModels: true, DiscoverInterval: time.Minute, DiscoverMatch: []string{"x/*"}},
-		{Name: "second", Interactive: []string{"b", "a"}, Background: []string{"a"}, DiscoverModels: true, DiscoverInterval: time.Minute},
+		{Name: "second", Interactive: []string{"b", "a"}, Background: []string{"a"}, DiscoverModels: true, DiscoverInterval: time.Minute, DiscoverMatch: []string{"y/*", "x/both", "shared/*"}},
 	}
-	r.ups["a"].set(listingBody("x/a", "x/both", "y/a", "shared/static"))
-	r.ups["b"].set(listingBody("x/both", "y/b"))
+	r.ups["a"].set(listingBody("x/a", "x/ab", "x/both", "y/a", "shared/static"))
+	r.ups["b"].set(listingBody("x/ab", "x/both", "y/b"))
 	r.ups["c"].set(listingBody("c-only"))
 	r.target(routes...)
 	r.pollDue()
@@ -439,34 +442,37 @@ func TestResolverNarrowsMatchesAndStaticWins(t *testing.T) {
 	}
 	check := func(model, route string, in, bg []string) {
 		t.Helper()
-		rt, ok := res.Resolve(model)
-		if route == "" {
-			if ok {
-				t.Fatalf("%s resolved to %s, want none", model, rt.Name)
+		rt, ok, amb := res.Resolve(model)
+		if route == "" || route == "ambiguous" {
+			if ok || amb != (route == "ambiguous") {
+				t.Fatalf("%s -> %v %v %s, want %q", model, ok, amb, rt.Name, route)
 			}
 			return
 		}
-		if !ok || rt.Name != route || !slices.Equal(rt.Interactive, in) || !slices.Equal(rt.Background, bg) {
+		if !ok || amb || rt.Name != route || !slices.Equal(rt.Interactive, in) || !slices.Equal(rt.Background, bg) {
 			t.Fatalf("%s -> %v %+v, want %s %v %v", model, ok, rt, route, in, bg)
 		}
 	}
 	check("x/a", "first", []string{"a"}, nil)
-	check("x/both", "first", []string{"a", "b"}, []string{"b"})
+	check("x/ab", "first", []string{"a", "b"}, []string{"b"})
+	check("x/both", "ambiguous", nil, nil)
 	check("y/a", "second", []string{"a"}, []string{"a"}) // x/* filters it out of "first"
 	check("y/b", "second", []string{"b"}, nil)
 	check("shared/static", "", nil, nil) // static wins (D6): the caller's map serves it
 	check("c-only", "", nil, nil)        // c is not a discovering candidate
 	check("nope", "", nil, nil)
-	if got, want := res.Models(), []string{"x/a", "x/both", "y/a", "y/b"}; !slices.Equal(got, want) {
+	if got, want := res.Models(), []string{"x/a", "x/ab", "y/a", "y/b"}; !slices.Equal(got, want) {
 		t.Fatalf("Models = %v, want %v", got, want)
 	}
 	d := res.Snapshot()
-	if len(d.Routes) != 2 || !slices.Equal(d.Routes[0].Models, []string{"x/a", "x/both"}) ||
+	if len(d.Routes) != 2 || !slices.Equal(d.Routes[0].Models, []string{"x/a", "x/ab"}) ||
+		!slices.Equal(d.Routes[0].Ambiguous, []string{"x/both"}) ||
 		!slices.Equal(d.Routes[1].Models, []string{"y/a", "y/b"}) ||
-		!slices.Equal(d.Routes[1].Shadowed, []string{"shared/static", "x/a", "x/both"}) {
+		!slices.Equal(d.Routes[1].Ambiguous, []string{"x/both"}) {
 		t.Fatalf("route diagnostics %+v", d.Routes)
 	}
-	if len(d.Accounts) != 2 || d.Accounts[0].Account != "a" || d.Accounts[0].ModelCount != 4 ||
+	// model_count is the full listing, before any discover_match filtering.
+	if len(d.Accounts) != 2 || d.Accounts[0].Account != "a" || d.Accounts[0].ModelCount != 5 ||
 		!slices.Equal(d.Accounts[0].Routes, []string{"first", "second"}) || d.Accounts[0].LastSuccessAt == nil {
 		t.Fatalf("account diagnostics %+v", d.Accounts)
 	}
@@ -498,6 +504,7 @@ func TestConcurrentResolveDuringPollAndRetarget(t *testing.T) {
 				default:
 				}
 				res.Resolve("m2")
+				res.Refresh(context.Background(), "m2")
 				res.Models()
 				res.Snapshot()
 			}
@@ -511,7 +518,7 @@ func TestConcurrentResolveDuringPollAndRetarget(t *testing.T) {
 			r.target(full...)
 		}
 		r.pollDue()
-		r.m.Refresh(context.Background())
+		r.m.Refresh(context.Background(), nil)
 	}
 	close(stop)
 	wg.Wait()
@@ -534,7 +541,7 @@ func TestStartCloseNoLeakAndRefreshAfterClose(t *testing.T) {
 	r.m.Close() // idempotent
 	before := r.ups["a"].calls.Load()
 	r.clock.Add(time.Hour)
-	r.m.Refresh(context.Background())
+	r.m.Refresh(context.Background(), nil)
 	r.m.Start(context.Background())
 	if r.ups["a"].calls.Load() != before {
 		t.Fatal("manager polled after Close")
@@ -545,6 +552,95 @@ func TestStartCloseNoLeakAndRefreshAfterClose(t *testing.T) {
 		if time.Now().After(deadline) {
 			buf := make([]byte, 1<<16)
 			t.Fatalf("goroutine leak: %d > %d\n%s", runtime.NumGoroutine(), base, buf[:runtime.Stack(buf, true)])
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// D17 (Amendment 1 item 5): after a failed poll the next one is 30s later,
+// doubling per consecutive failure and capped at the interval; a success
+// resets to the interval.
+func TestFailedPollBackoff(t *testing.T) {
+	r := newRig(t, Options{}, "a")
+	u := r.ups["a"]
+	r.target(discRoute("r", 5*time.Minute, "a"))
+	u.set(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "down", 503) })
+	r.pollDue() // failure 1
+	calls := int64(1)
+	for _, wait := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 5 * time.Minute, 5 * time.Minute} {
+		r.clock.Add(wait - time.Second)
+		r.pollDue()
+		if got := u.calls.Load(); got != calls {
+			t.Fatalf("polled before the %v retry delay after %d failures", wait, calls)
+		}
+		r.clock.Add(time.Second)
+		r.pollDue()
+		calls++
+		if got := u.calls.Load(); got != calls {
+			t.Fatalf("no retry %v after %d failures (calls %d)", wait, calls-1, got)
+		}
+	}
+	u.set(listingBody("ok"))
+	r.clock.Add(5 * time.Minute)
+	r.pollDue() // success resets the schedule to the interval
+	calls++
+	r.clock.Add(5*time.Minute - time.Second)
+	r.pollDue()
+	if got := u.calls.Load(); got != calls {
+		t.Fatalf("polled before the interval after a success (calls %d, want %d)", got, calls)
+	}
+	r.clock.Add(time.Second)
+	r.pollDue()
+	if got := u.calls.Load(); got != calls+1 {
+		t.Fatalf("not polled at the interval after a success (calls %d)", got)
+	}
+}
+
+// D15 (Amendment 1 item 3): a model no discovering route's discover_match
+// admits returns at once without an on-demand refresh; an admitted one
+// refreshes.
+func TestRefreshSkippedForUnadmittedModel(t *testing.T) {
+	r := newRig(t, Options{}, "a")
+	rt := discRoute("r", time.Hour, "a")
+	rt.DiscoverMatch = []string{"unsloth/*"}
+	r.target(rt)
+	res := r.m.Resolver([]core.Route{rt})
+	res.Refresh(context.Background(), "other/model")
+	if n := r.ups["a"].calls.Load(); n != 0 {
+		t.Fatalf("refresh for an id no route admits made %d /models calls", n)
+	}
+	res.Refresh(context.Background(), "unsloth/model")
+	if n := r.ups["a"].calls.Load(); n != 1 {
+		t.Fatalf("refresh for an admitted id made %d /models calls, want 1", n)
+	}
+}
+
+// D19 at the manager level (Amendment 1 item 9): no goroutine runs without
+// targets; the first target starts the loop and an empty set ends it.
+func TestLoopRunsOnlyWithTargets(t *testing.T) {
+	r := newRig(t, Options{Tick: 5 * time.Millisecond}, "a")
+	r.m.Start(context.Background())
+	running := func() bool { r.m.mu.RLock(); defer r.m.mu.RUnlock(); return r.m.running }
+	if running() {
+		t.Fatal("loop running without targets")
+	}
+	r.target(discRoute("r", time.Minute, "a"))
+	if !running() {
+		t.Fatal("first target did not start the loop")
+	}
+	r.target()
+	deadline := time.Now().Add(2 * time.Second)
+	for running() {
+		if time.Now().After(deadline) {
+			t.Fatal("loop kept running with no targets")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	r.ups["a"].set(listingBody("m1"))
+	r.target(discRoute("r", time.Minute, "a"))
+	for r.listing("a") == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("restarted loop never polled")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}

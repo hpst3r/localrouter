@@ -11,15 +11,18 @@
 //     current generation: an account is polled while a discovering route lists
 //     it, at the smallest discover_interval among those routes; an account no
 //     longer referenced stops being polled and its listing is dropped.
-//   - (*Manager).Start(ctx) starts background polling (non-blocking: the first
-//     poll runs on the background goroutine) and (*Manager).Close stops it and
-//     waits for every goroutine the manager started.
+//   - (*Manager).Start(ctx) enables background polling (non-blocking: the
+//     first poll runs on the background goroutine, which exists only while
+//     there is a target) and (*Manager).Close stops it and waits for every
+//     goroutine the manager started.
 //   - (*Manager).Resolver(routes) returns the per-generation *Resolver, or nil
 //     when no route discovers (so callers keep the legacy path untouched).
-//   - (*Resolver).Resolve(model) narrows the first matching discovering route
-//     to the candidates that list model; Models lists every resolvable
-//     discovered id; Refresh runs the single-flight, rate-limited on-demand
-//     refresh; Snapshot/Diagnostics build the diagnostics "discovery" block.
+//   - (*Resolver).Resolve(model) returns the one discovering route that
+//     claims model, narrowed to the candidates that list it, or reports the
+//     id ambiguous when several routes claim it; Models lists every
+//     resolvable discovered id; Refresh(ctx, model) runs the single-flight,
+//     rate-limited on-demand refresh and returns as soon as model resolves;
+//     Snapshot/Diagnostics build the diagnostics "discovery" block.
 //
 // The package imports only core. A failed poll keeps the last good listing and
 // records only a fixed error class; URLs, bodies and credentials are never

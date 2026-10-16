@@ -3,7 +3,6 @@ package discovery
 import (
 	"context"
 	"net/http"
-	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -12,20 +11,12 @@ import (
 	"github.com/hpst3r/localrouter/internal/core"
 )
 
-func reviewBug(t *testing.T, msg string) {
-	t.Helper()
-	if os.Getenv("LOCALROUTER_REVIEW") == "" {
-		t.Skip("BUG: " + msg)
-	}
-}
-
-// One hung discovering account makes every on-demand refresh wait the full
+// D16 (Amendment 1 item 4). One hung discovering account makes every on-demand refresh wait the full
 // RefreshWait, even when the healthy account that lists the new model answered
 // in milliseconds: the waiters are released only when pollAll finishes every
 // account, although each account's listing is published as soon as its own
 // poll ends.
 func TestReviewRefreshWaitsForSlowestAccount(t *testing.T) {
-	reviewBug(t, "a new model on a healthy account takes the full 3s refresh wait while any other discovering account hangs")
 	r := newRig(t, Options{}, "fast", "hung")
 	rt := discRoute("r", time.Hour, "fast", "hung")
 	r.target(rt)
@@ -35,9 +26,9 @@ func TestReviewRefreshWaitsForSlowestAccount(t *testing.T) {
 	r.ups["hung"].set(func(w http.ResponseWriter, req *http.Request) { <-req.Context().Done() })
 
 	start := time.Now()
-	res.Refresh(context.Background())
+	res.Refresh(context.Background(), "fresh/model")
 	el := time.Since(start)
-	if _, ok := res.Resolve("fresh/model"); !ok {
+	if _, ok, _ := res.Resolve("fresh/model"); !ok {
 		t.Fatal("fresh model did not resolve after refresh")
 	}
 	if el > time.Second {
@@ -49,7 +40,6 @@ func TestReviewRefreshWaitsForSlowestAccount(t *testing.T) {
 // net/http's 10 MiB default, so a hostile /models endpoint can make every poll
 // buffer ~10x the body cap and the poll still succeeds.
 func TestReviewHugeResponseHeadersAccepted(t *testing.T) {
-	reviewBug(t, "a /models response with ~4 MiB of headers is accepted; only the body is bounded")
 	r := newRig(t, Options{}, "a")
 	r.target(discRoute("r", time.Hour, "a"))
 	pad := strings.Repeat("x", 64<<10)
@@ -70,7 +60,6 @@ func TestReviewHugeResponseHeadersAccepted(t *testing.T) {
 // /v1/models and diagnostics, letting an upstream list look-alike ids such as
 // "qwen3\u200b:8b" next to "qwen3:8b" or reverse-rendered names.
 func TestReviewInvisibleFormatCharsInIDs(t *testing.T) {
-	reviewBug(t, "ids containing bidi/zero-width format characters (Cf) are accepted")
 	for _, id := range []string{"qwen3\u200b:8b", "gpt\u202eoss", "\ufeffllama", "a\u2060b"} {
 		body := []byte(`{"data":[{"id":"` + id + `"}]}`)
 		l, err := parseListing(body, 10)

@@ -19,21 +19,25 @@ type fakeDiscovery struct {
 	mu       sync.Mutex
 	routes   map[string]core.Route
 	pending  map[string]core.Route
+	amb      map[string]bool
 	models   []string
 	resolves []string
 	refresh  int
 	block    bool // Refresh blocks until ctx is done
 }
 
-func (d *fakeDiscovery) Resolve(m string) (core.Route, bool) {
+func (d *fakeDiscovery) Resolve(m string) (core.Route, bool, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.resolves = append(d.resolves, m)
+	if d.amb[m] {
+		return core.Route{}, false, true
+	}
 	r, ok := d.routes[m]
-	return r, ok
+	return r, ok, false
 }
 func (d *fakeDiscovery) Models() []string { d.mu.Lock(); defer d.mu.Unlock(); return d.models }
-func (d *fakeDiscovery) Refresh(ctx context.Context) {
+func (d *fakeDiscovery) Refresh(ctx context.Context, _ string) {
 	d.mu.Lock()
 	d.refresh++
 	for k, v := range d.pending {
@@ -117,15 +121,42 @@ func TestDiscoveryNarrowedCandidatesReachPolicy(t *testing.T) {
 	if a, m := last(); a != "lab2" || m != "disc/m" {
 		t.Fatalf("served by %s model %s", a, m)
 	}
-	// Background has no listing account on this route: policy sees no
-	// candidate, never one from outside the route.
-	resp = h.post(pathChat, bgKey, `{"model":"disc/m","messages":[]}`, nil)
-	resp.Body.Close()
-	if c := pol.take(); len(c) != 1 || len(c[0]) != 0 {
-		t.Fatalf("background candidates %v, want one empty list", c)
-	}
 	if d.refresh != 0 {
 		t.Fatal("refresh on a hit")
+	}
+}
+
+// D13 (Amendment 1 item 1): a discovered model that only the other class's
+// accounts list is a 404 model_not_found for this class, with no policy
+// decision (and so no lease) and never a candidate from outside the route.
+func TestDiscoveryClassEmptyNarrowingIsMiss(t *testing.T) {
+	d := &fakeDiscovery{routes: map[string]core.Route{
+		"disc/m": {Name: "lab", DiscoverModels: true, Interactive: []string{"lab2"}, Background: nil},
+	}}
+	h, pol, _ := discHarness(t, d)
+	resp := h.post(pathChat, bgKey, `{"model":"disc/m","messages":[]}`, nil)
+	b := decodeErr(t, resp)
+	if resp.StatusCode != http.StatusNotFound || b.Error.Type != "model_not_found" || b.Error.Message != "localrouter: unknown model" {
+		t.Fatalf("background: %d %+v, want 404 model_not_found", resp.StatusCode, b)
+	}
+	if c := pol.take(); len(c) != 0 {
+		t.Fatalf("policy consulted for a class-empty discovered model: %v", c)
+	}
+}
+
+// D14 (Amendment 1 item 2) at the proxy: an id claimed by more than one
+// discovering route is a 404 with the ambiguity message, without a refresh.
+func TestDiscoveryAmbiguousIsRefused(t *testing.T) {
+	d := &fakeDiscovery{routes: map[string]core.Route{}, amb: map[string]bool{"dup/m": true}}
+	h, pol, _ := discHarness(t, d)
+	resp := h.post(pathChat, clientKey, `{"model":"dup/m","messages":[]}`, nil)
+	b := decodeErr(t, resp)
+	if resp.StatusCode != http.StatusNotFound || b.Error.Type != "model_not_found" ||
+		b.Error.Message != "localrouter: model is claimed by more than one discovering route" {
+		t.Fatalf("ambiguous: %d %+v", resp.StatusCode, b)
+	}
+	if c := pol.take(); len(c) != 0 || d.refresh != 0 {
+		t.Fatalf("ambiguous id reached policy %v or refresh %d", c, d.refresh)
 	}
 }
 

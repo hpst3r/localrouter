@@ -19,12 +19,19 @@ const (
 	DefaultMaxBodyBytes   = 1 << 20
 	DefaultMaxIDs         = 1000
 	DefaultTick           = time.Second
+	// DefaultMaxHeaderBytes bounds the response headers of one /models poll.
+	DefaultMaxHeaderBytes = 64 << 10
+	// RetryBase is the delay before retrying a failed poll. It doubles on
+	// each consecutive failure, capped at the account's interval.
+	RetryBase = 30 * time.Second
 )
 
 // Options tune a Manager. Zero values select the defaults above.
 type Options struct {
 	// HTTPClient performs GET /models. Nil uses a client that never follows
-	// redirects (a redirect is then a non-2xx "status" failure).
+	// redirects (a redirect is then a non-2xx "status" failure) and reads at
+	// most DefaultMaxHeaderBytes of response headers (an overflow is a
+	// "transport" failure).
 	HTTPClient *http.Client
 	// Clock drives poll scheduling and refresh spacing; default
 	// core.SystemClock.
@@ -55,12 +62,16 @@ type Manager struct {
 	ctx    context.Context // cancelled by Close
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
-	once   sync.Once
 	wake   chan struct{}
 
-	mu      sync.RWMutex
-	closed  bool
-	targets map[string]*entry // by account id
+	mu       sync.RWMutex
+	closed   bool
+	startCtx context.Context // set by Start; nil before
+	running  bool            // the background loop goroutine exists
+	targets  map[string]*entry
+	// polled is closed and replaced each time any poll finishes, so refresh
+	// waiters can re-check resolution per account.
+	polled chan struct{}
 
 	refreshMu   sync.Mutex
 	refreshing  chan struct{} // non-nil while an on-demand refresh runs
@@ -81,7 +92,22 @@ type entry struct {
 	lastAttempt time.Time
 	dropped     int
 	errClass    string
+	failures    int    // consecutive failed polls
 	loggedClass string // last error class logged ("" = healthy)
+}
+
+// delay is the time from the last attempt to the next scheduled poll: the
+// interval, or after consecutive failures RetryBase doubled per extra
+// failure, capped at the interval.
+func (e *entry) delay() time.Duration {
+	if e.failures == 0 {
+		return e.interval
+	}
+	d := RetryBase
+	for i := 1; i < e.failures && d < e.interval; i++ {
+		d *= 2
+	}
+	return min(d, e.interval)
 }
 
 // New builds a Manager. creds supplies the same bearer the proxy sends.
@@ -89,6 +115,7 @@ func New(creds core.CredentialSource, opts Options) *Manager {
 	if opts.HTTPClient == nil {
 		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.DialContext = (&net.Dialer{Timeout: DefaultTimeout, KeepAlive: 30 * time.Second}).DialContext
+		tr.MaxResponseHeaderBytes = DefaultMaxHeaderBytes
 		opts.HTTPClient = &http.Client{
 			Transport:     tr,
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -113,7 +140,7 @@ func New(creds core.CredentialSource, opts Options) *Manager {
 		opts.Tick = DefaultTick
 	}
 	m := &Manager{creds: creds, opts: opts, clock: opts.Clock, log: opts.Logger,
-		wake: make(chan struct{}, 1), targets: map[string]*entry{}}
+		wake: make(chan struct{}, 1), targets: map[string]*entry{}, polled: make(chan struct{})}
 	if m.clock == nil {
 		m.clock = core.SystemClock{}
 	}
@@ -129,7 +156,9 @@ func New(creds core.CredentialSource, opts Options) *Manager {
 // as a candidate, at the smallest DiscoverInterval among those routes.
 // Listings of accounts still referenced are kept; an account no longer
 // referenced stops being polled and its listing is dropped. Newly referenced
-// accounts are polled on the next loop pass.
+// accounts are polled on the next loop pass. After Start, the background loop
+// exists only while there is a target: the first target starts it and an
+// empty target set ends it.
 func (m *Manager) SetTargets(accounts map[string]core.Account, routes []core.Route) {
 	want := map[string]time.Duration{}
 	for _, rt := range routes {
@@ -164,10 +193,11 @@ func (m *Manager) SetTargets(accounts map[string]core.Account, routes []core.Rou
 		if e.interval != iv {
 			e.interval = iv
 			if !e.lastAttempt.IsZero() {
-				e.nextDue = e.lastAttempt.Add(iv)
+				e.nextDue = e.lastAttempt.Add(e.delay())
 			}
 		}
 	}
+	m.startLoopLocked()
 	m.mu.Unlock()
 	select {
 	case m.wake <- struct{}{}:
@@ -175,16 +205,31 @@ func (m *Manager) SetTargets(accounts map[string]core.Account, routes []core.Rou
 	}
 }
 
-// Start begins background polling until ctx is cancelled or Close is called.
-// It does not block: the first poll runs on the background goroutine. Calls
-// after the first, or after Close, do nothing.
+// Start enables background polling until ctx is cancelled or Close is called.
+// It does not block: the first poll runs on the background goroutine, which
+// exists only while there is a target, so a configuration without a
+// discovering route starts no goroutine. Calls after the first, or after
+// Close, do nothing.
 func (m *Manager) Start(ctx context.Context) {
-	m.once.Do(func() {
-		if !m.track() {
-			return
-		}
-		go m.loop(ctx)
-	})
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.startCtx != nil || m.closed {
+		return
+	}
+	m.startCtx = ctx
+	m.startLoopLocked()
+}
+
+// startLoopLocked starts the background loop if Start was called, the manager
+// is open, there is a target and the loop is not already running. Caller
+// holds m.mu.
+func (m *Manager) startLoopLocked() {
+	if m.startCtx == nil || m.startCtx.Err() != nil || m.closed || m.running || len(m.targets) == 0 {
+		return
+	}
+	m.running = true
+	m.wg.Add(1)
+	go m.loop(m.startCtx)
 }
 
 // track registers one manager goroutine unless the manager is closed.
@@ -207,10 +252,18 @@ func (m *Manager) loop(ctx context.Context) {
 	t := time.NewTicker(m.opts.Tick)
 	defer t.Stop()
 	for {
+		// The exit check and SetTargets' restart both run under m.mu, so a
+		// target added while the loop exits always finds running false.
+		m.mu.Lock()
+		if len(m.targets) == 0 || pollCtx.Err() != nil {
+			m.running = false
+			m.mu.Unlock()
+			return
+		}
+		m.mu.Unlock()
 		m.PollDue(pollCtx)
 		select {
 		case <-pollCtx.Done():
-			return
 		case <-t.C:
 		case <-m.wake:
 		}
@@ -295,6 +348,8 @@ func (m *Manager) poll(ctx context.Context, id string) {
 
 	m.mu.Lock()
 	e.inflight = nil
+	close(m.polled)
+	m.polled = make(chan struct{})
 	// Discard the result if the account was dropped (or re-added as a new
 	// entry) by a reload meanwhile, or the manager is closing.
 	if m.targets[id] != e || m.closed || ctx.Err() != nil && class != "" {
@@ -302,7 +357,6 @@ func (m *Manager) poll(ctx context.Context, id string) {
 		return
 	}
 	e.lastAttempt = now
-	e.nextDue = now.Add(e.interval)
 	e.errClass = class
 	if class == "" {
 		ids := make(map[string]struct{}, len(l.ids))
@@ -310,7 +364,11 @@ func (m *Manager) poll(ctx context.Context, id string) {
 			ids[s] = struct{}{}
 		}
 		e.ids, e.sorted, e.dropped, e.lastSuccess = ids, l.ids, l.dropped, now
+		e.failures = 0
+	} else {
+		e.failures++
 	}
+	e.nextDue = now.Add(e.delay())
 	logIt := class != e.loggedClass
 	prev := e.loggedClass
 	e.loggedClass = class
@@ -325,10 +383,13 @@ func (m *Manager) poll(ctx context.Context, id string) {
 }
 
 // Refresh runs an on-demand refresh of every target, single-flight and at most
-// once per RefreshSpacing (by the manager clock). It waits for the refresh at
-// most RefreshWait, or until ctx is done; ctx never cancels the shared refresh
-// itself, which other callers may be waiting on.
-func (m *Manager) Refresh(ctx context.Context) {
+// once per RefreshSpacing (by the manager clock). The caller waits until the
+// refresh finishes, until done reports true (re-checked each time any
+// account's poll finishes; nil never does), at most RefreshWait, or until ctx
+// is done; ctx never cancels the shared refresh itself, which other callers
+// may be waiting on. Inside the spacing window, or after Close, it returns at
+// once.
+func (m *Manager) Refresh(ctx context.Context, done func() bool) {
 	m.refreshMu.Lock()
 	ch := m.refreshing
 	if ch == nil {
@@ -351,10 +412,24 @@ func (m *Manager) Refresh(ctx context.Context) {
 	m.refreshMu.Unlock()
 	t := time.NewTimer(m.opts.RefreshWait)
 	defer t.Stop()
-	select {
-	case <-ch:
-	case <-ctx.Done():
-	case <-t.C:
+	for {
+		// Take the poll signal before checking done, so a poll finishing in
+		// between is never missed.
+		m.mu.RLock()
+		polled := m.polled
+		m.mu.RUnlock()
+		if done != nil && done() {
+			return
+		}
+		select {
+		case <-ch:
+			return
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			return
+		case <-polled:
+		}
 	}
 }
 

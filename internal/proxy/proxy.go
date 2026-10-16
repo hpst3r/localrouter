@@ -75,14 +75,18 @@ type Deps struct {
 // by *internal/discovery.Resolver; the proxy depends on the behaviour only.
 type Discovery interface {
 	// Resolve returns the discovering route serving model, its candidate lists
-	// already narrowed to the accounts that list model.
-	Resolve(model string) (core.Route, bool)
+	// already narrowed to the accounts that list model (either list may be
+	// empty). ambiguous reports that more than one discovering route claims
+	// model, in which case none serves it.
+	Resolve(model string) (route core.Route, ok, ambiguous bool)
 	// Models lists every currently resolvable discovered id.
 	Models() []string
-	// Refresh runs the shared on-demand refresh, returning when it finishes,
-	// after a bounded wait, or when ctx is done (which never cancels the shared
-	// refresh itself).
-	Refresh(ctx context.Context)
+	// Refresh runs the shared on-demand refresh for a request naming model,
+	// returning as soon as model resolves, when the refresh finishes, after a
+	// bounded wait, or when ctx is done (which never cancels the shared
+	// refresh itself). It returns at once when no discovering route could
+	// admit model.
+	Refresh(ctx context.Context, model string)
 }
 
 // Budget gates one upstream attempt against the budget store. It is satisfied by
@@ -256,14 +260,15 @@ func (p *Proxy) serveModels(w http.ResponseWriter, r *http.Request) {
 }
 
 // resolveDiscovered resolves a model no route lists statically through the
-// discovering routes. On a miss it triggers the shared on-demand refresh
-// (single-flight and rate-limited by the implementation, with a bounded wait
-// that the request's own cancellation also ends) and retries exactly once.
-func (p *Proxy) resolveDiscovered(ctx context.Context, model string) (core.Route, bool) {
-	if route, ok := p.deps.Discovery.Resolve(model); ok {
-		return route, true
+// discovering routes. On a miss (no route claims model) it triggers the
+// shared on-demand refresh (single-flight and rate-limited by the
+// implementation, with a bounded wait that the request's own cancellation also
+// ends) and retries exactly once. An ambiguous id is not refreshed.
+func (p *Proxy) resolveDiscovered(ctx context.Context, model string) (route core.Route, ok, ambiguous bool) {
+	if route, ok, ambiguous = p.deps.Discovery.Resolve(model); ok || ambiguous {
+		return route, ok, ambiguous
 	}
-	p.deps.Discovery.Refresh(ctx)
+	p.deps.Discovery.Refresh(ctx, model)
 	return p.deps.Discovery.Resolve(model)
 }
 
@@ -337,16 +342,25 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 		return
 	}
 	route, ok := p.routes[head.Model]
+	discovered := false
 	if !ok && p.deps.Discovery != nil {
-		route, ok = p.resolveDiscovered(r.Context(), head.Model)
-	}
-	if !ok {
-		writeError(w, http.StatusNotFound, "localrouter: unknown model", "model_not_found")
-		return
+		var ambiguous bool
+		route, ok, ambiguous = p.resolveDiscovered(r.Context(), head.Model)
+		if ambiguous {
+			writeError(w, http.StatusNotFound, "localrouter: model is claimed by more than one discovering route", "model_not_found")
+			return
+		}
+		discovered = ok
 	}
 	candidates := route.Interactive
 	if class == core.ClassBackground {
 		candidates = route.Background
+	}
+	// A discovered model that only the other class's accounts list is a miss
+	// for this class: no policy decision, no lease.
+	if !ok || discovered && len(candidates) == 0 {
+		writeError(w, http.StatusNotFound, "localrouter: unknown model", "model_not_found")
+		return
 	}
 	if endpoint == "/chat/completions" {
 		// Codex accounts only serve /responses; drop them before admission.
