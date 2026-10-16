@@ -35,6 +35,7 @@ Usage:
   localrouter admit   [--class background] (--account ID | --model NAME) [--url URL] [--json]
                       exit 0 = allow, 1 = deny, 2 = error
   localrouter agent   [-config ~/.config/localrouter/agent.yaml] [--once]
+  localrouter mcp     [--url URL] [--key-file FILE] [--timeout 10s] [--max-result-chars 24000]
 
 Default config: ~/.config/localrouter/config.yaml
 `
@@ -62,6 +63,8 @@ func main() {
 		err = cmdAdmit(os.Args[2:])
 	case "agent":
 		err = cmdAgent(os.Args[2:])
+	case "mcp":
+		err = cmdMCP(os.Args[2:])
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		return

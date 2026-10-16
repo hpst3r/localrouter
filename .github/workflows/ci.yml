@@ -51,6 +51,10 @@ jobs:
         timeout-minutes: 3
         run: python3 -m unittest discover -s scripts -p 'test_provider_smoke.py' -v
 
+      - name: MCP smoke harness tests (offline)
+        timeout-minutes: 3
+        run: python3 -m unittest discover -s scripts -p 'test_mcp_smoke.py' -v
+
       - name: go build
         timeout-minutes: 10
         env:
