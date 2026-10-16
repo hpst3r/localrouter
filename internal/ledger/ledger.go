@@ -103,6 +103,12 @@ var migrations = []string{
 	// before.
 	`ALTER TABLE requests ADD COLUMN upstream_model TEXT;
 ALTER TABLE requests ADD COLUMN pricing_model TEXT;`,
+	// v4 -> v5: performance timing (SPEC "Performance metrics"). ttft_ms is
+	// nullable (unknown for legacy, imported and non-streamed rows); the
+	// flags default to 0. Existing rows are never backfilled.
+	`ALTER TABLE requests ADD COLUMN ttft_ms INTEGER;
+ALTER TABLE requests ADD COLUMN streamed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE requests ADD COLUMN first_token_reasoning INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // Open opens (creating if needed) the ledger database at path. pricing may be
@@ -191,8 +197,9 @@ const insertSQL = `INSERT INTO requests (
 	account_id, upstream_identity, status, failover_of, input_tokens,
 	cached_input_tokens, output_tokens, reasoning_tokens, usage_known,
 	cost_usd, cost_basis, latency_ms, bytes_out, session, task, agent, error,
-	cache_creation_input_tokens, host, upstream_model, pricing_model
-) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	cache_creation_input_tokens, host, upstream_model, pricing_model,
+	ttft_ms, streamed, first_token_reasoning
+) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO NOTHING`
 
 // Record inserts one request row, computing cost from pricing. An empty
@@ -248,13 +255,26 @@ func insertArgs(r core.RequestRecord, pricing *Pricing, basis func(accountID str
 	if r.UsageKnown {
 		usageKnown = 1
 	}
+	var ttft sql.NullInt64
+	if r.TTFTMS != nil {
+		ttft = sql.NullInt64{Int64: *r.TTFTMS, Valid: true}
+	}
 	return []any{
 		r.ID, r.StartedAt.UnixMilli(), finished, r.Client, string(r.Class), r.Route, r.Model, r.Provider,
 		r.AccountID, r.UpstreamIdentity, r.Status, failoverOf, r.Usage.InputTokens,
 		r.Usage.CachedInputTokens, r.Usage.OutputTokens, r.Usage.ReasoningTokens, usageKnown,
 		cost, costBasis, r.LatencyMS, r.BytesOut, r.Session, r.Task, r.Agent, r.Error,
 		r.Usage.CacheCreationInputTokens, r.Host, upstreamModel, pricingModel,
+		ttft, boolInt(r.Streamed), boolInt(r.FirstTokenReasoning),
 	}
+}
+
+// boolInt maps a bool to SQLite's 0/1.
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // nullString maps "" to SQL NULL and any other value to a non-NULL string.
