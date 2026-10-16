@@ -1,7 +1,9 @@
 package control
 
 import (
+	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/core"
@@ -27,7 +29,13 @@ func (s *Server) analyticsPerformance(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := pl.Performance(r.Context(), q)
 	if err != nil {
-		s.analyticsFailed(w, err, q.Group)
+		// As analyticsFailed, with performance wording (SPEC Amendment 1, A5).
+		if msg := err.Error(); strings.HasPrefix(msg, analyticsErrPrefix) {
+			writeError(w, http.StatusBadRequest, msg)
+			return
+		}
+		slog.Warn("control: performance analytics failed", "group", q.Group, "err", err)
+		writeError(w, http.StatusInternalServerError, "performance analytics failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, normalizePerf(res))

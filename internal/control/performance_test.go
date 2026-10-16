@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -121,10 +122,18 @@ func TestPerformanceLedgerErrors(t *testing.T) {
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "too many requests") {
 		t.Errorf("row cap: %d %s", rec.Code, rec.Body)
 	}
+	logs := &syncLogBuffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
 	pl.perr = errors.New("ledger: disk I/O error at /secret/path")
 	rec = f.do(t, "GET", perfPath, "", "")
-	if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "secret") {
+	if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "secret") ||
+		!strings.Contains(rec.Body.String(), `"performance analytics failed"`) {
 		t.Errorf("internal error: %d %s", rec.Code, rec.Body)
+	}
+	if got := logs.String(); !strings.Contains(got, `msg="control: performance analytics failed"`) || !strings.Contains(got, "group=host") {
+		t.Errorf("log = %q", got)
 	}
 }
 
