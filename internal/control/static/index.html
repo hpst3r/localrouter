@@ -177,6 +177,19 @@ td.share { width: 150px; }
 .sbar .sval { width: 40px; text-align: right; color: var(--ink2); }
 .empty-row td { text-align: center; color: var(--muted); padding: 18px; }
 
+/* ---- Performance ---- */
+.pcontrols { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.kpi .k-sub { display: block; font-size: 11.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pmsg { font-size: 12px; margin: -4px 0 12px; padding: 7px 10px; border-radius: 7px; background: var(--raise); border: 1px solid var(--border); color: var(--ink2); }
+.chart .pline { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart .pmark { stroke: var(--surface); stroke-width: 1.5; }
+.chart .guide { stroke: var(--axis); stroke-width: 1; shape-rendering: crispEdges; }
+.chart .pline, .chart .pdot, .chart .pmark, .chart .guide { pointer-events: none; }
+.ptable { margin-top: 14px; }
+.ptable td.na { color: var(--muted); }
+.defs { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 4px 16px; margin: 12px 2px 0; font-size: 11.5px; color: var(--muted); }
+.defs b { color: var(--ink2); font-weight: 600; }
+
 /* ---- Machines strip ---- */
 .machines { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
 .mcard { text-align: left; width: 100%; padding: 12px 14px; transition: border-color .12s, transform .12s; }
@@ -250,6 +263,29 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   <p class="muted tablenote hidden" id="breakdownmore"></p>
 </section>
 
+<h2>Performance <span class="h2note" id="perfnote"></span></h2>
+<section class="card">
+  <div class="pcontrols">
+    <div class="seg" id="pmseg" role="group" aria-label="Performance metric"></div>
+    <div class="seg" id="psseg" role="group" aria-label="Statistic"></div>
+  </div>
+  <div class="kpis" id="pkpis"></div>
+  <p class="pmsg hidden" id="pmsg"></p>
+  <div class="legend" id="plegend"></div>
+  <div class="chart" id="pchart">
+    <svg id="psvg" role="img" aria-label="Performance chart"></svg>
+    <div class="tip" id="ptip" aria-hidden="true"></div>
+  </div>
+  <div class="tablewrap ptable"><table id="perftable"><caption class="hidden">Performance breakdown</caption><thead></thead><tbody></tbody></table></div>
+  <p class="muted tablenote hidden" id="perfmore"></p>
+  <div class="defs">
+    <span><b>TTFT</b> — time to first token: from sending the request until the first output (text, tool call or reasoning) streams back.</span>
+    <span><b>Decode speed</b> — tokens per second after the first token, for streamed requests.</span>
+    <span><b>E2E speed</b> — output tokens divided by the whole request time, including waiting for the first token.</span>
+    <span><b>Latency</b> — total time of a successful proxied request, start to finish.</span>
+  </div>
+</section>
+
 <h2>Machines <span class="h2note">24h sparkline of tokens</span></h2>
 <div class="machines" id="machines"></div>
 
@@ -281,15 +317,27 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   const NEXT_GROUP = { host: ["model", "task", "agent"], model: ["host", "task", "agent"],
     account: ["model", "host"], task: ["model", "agent", "host"] };
   const NEXT_DEFAULT = ["model", "host", "task"];
+  // Performance metrics: PerfRow field, unit, and whether higher is better
+  // (then the statistic picker selects the slow tail: p50/p10/p01).
+  const PERF_METRICS = [["ttft", "TTFT"], ["decode", "Decode speed"], ["latency", "Latency"], ["e2e", "E2E speed"]];
+  const PM = { ttft: { field: "ttft_ms", ms: true }, decode: { field: "decode_tps", fast: true },
+    latency: { field: "latency_ms", ms: true }, e2e: { field: "e2e_tps", fast: true } };
+  const PERF_STATS = ["p50", "p90", "p99"];
+  const SLOW_TAIL = { p50: "p50", p90: "p10", p99: "p01" };
 
   // View state; mirrored in location.hash so reload/back work.
   let S = readHash();
   // Last fetched documents.
-  const data = { status: null, main: null, hosts: null, spark: null, clients: null };
+  const data = { status: null, main: null, hosts: null, spark: null, clients: null, perf: null };
+  let perfView = "";               // group + filters that data.perf was fetched for
   let hidden = new Set();          // series keys toggled off in the legend
-  let colors = new Map();          // key -> palette slot for the current result
+  let perfHidden = new Set();      // same for the performance chart
+  let colors = new Map();          // key -> palette slot for the current usage result
+  let perfColors = new Map();      // same for the performance result (see assignPerfColors)
   let sort = { col: "metric", dir: -1 };
+  let perfSort = { col: "requests", dir: -1 };
   let hovering = false, pendingChart = false, seq = 0, lastWidth = 0;
+  let perfHovering = false, pendingPerf = false, perfWidth = 0;
 
   const $ = (id) => document.getElementById(id);
 
@@ -309,7 +357,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     return e;
   }
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
-  function swatch(key) { const s = el("span", "swatch"); s.style.background = colorOf(key); return s; }
+  function swatch(key, map) { const s = el("span", "swatch"); s.style.background = colorOf(key, map); return s; }
 
   // ======================================================================
   // Formatting
@@ -336,6 +384,19 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   }
   const pct = (f) => Math.round((Number(f) || 0) * 100) + "%";
   function shareText(f) { return !f ? "0%" : f < 0.01 ? "<1%" : Math.round(f * 100) + "%"; }
+  // Durations in ms ("850 ms", "1.2 s", "2.5 min") and rates ("42 tok/s").
+  function fmtMs(v) {
+    if (Math.round(v) < 1000) return Math.round(v) + " ms";   // round first: 999.6 is "1 s", not "1000 ms"
+    if (v < 100000) return (v / 1000).toFixed(v < 10000 ? 2 : 1).replace(/\.?0+$/, "") + " s";
+    if (v < 120000) return Math.round(v / 1000) + " s";
+    return +(v / 60000).toFixed(1) + " min";
+  }
+  const fmtTps = (v) => (v < 10 ? +v.toFixed(1) : Math.round(v)) + " tok/s";
+  function fmtPerf(pm, v) { return v === null || v === undefined ? "—" : PM[pm].ms ? fmtMs(v) : fmtTps(v); }
+  function fmtPerfAxis(pm, v) {
+    if (!PM[pm].ms) return +v.toFixed(2) + " tok/s";
+    return v < 1000 ? v + " ms" : v < 120000 ? +(v / 1000).toFixed(2) + " s" : +(v / 60000).toFixed(2) + " min";
+  }
   function duration(sec) {
     sec = Math.max(0, Math.floor(sec));
     const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
@@ -381,14 +442,37 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     colors = new Map();
     const used = new Set();
     series.forEach((s) => {
-      if (s.key === OTHER) return;
+      if (s.key === OTHER || colors.has(s.key)) return;
       let slot = hash(s.key) % PALETTE_SIZE;
       for (let i = 0; i < PALETTE_SIZE && used.has(slot); i++) slot = (slot + 1) % PALETTE_SIZE;
       used.add(slot); colors.set(s.key, slot);
     });
   }
+  // Performance mapping: keys also in the usage view keep their usage color;
+  // perf-only keys take slots the usage view left free, then slots unused in
+  // the perf chart. Two perf lines share a color only past PALETTE_SIZE keys.
+  function assignPerfColors(series) {
+    perfColors = new Map();
+    const usage = new Set(colors.values()), mine = new Set();
+    const keys = series.map((s) => s.key).filter((k, i, a) => k !== OTHER && a.indexOf(k) === i);
+    keys.forEach((k) => { if (colors.has(k)) { perfColors.set(k, colors.get(k)); mine.add(colors.get(k)); } });
+    keys.forEach((k) => {
+      if (perfColors.has(k)) return;
+      const start = hash(k) % PALETTE_SIZE, probe = (taken) => {
+        for (let i = 0; i < PALETTE_SIZE; i++) { const s = (start + i) % PALETTE_SIZE; if (!taken(s)) return s; }
+        return -1;
+      };
+      let slot = probe((s) => usage.has(s) || mine.has(s));
+      if (slot < 0) slot = probe((s) => mine.has(s));
+      if (slot < 0) slot = start;
+      mine.add(slot); perfColors.set(k, slot);
+    });
+  }
   // Keys outside the top-N series are folded into "Other" in the chart, so they share its grey.
-  function colorOf(key) { return colors.has(key) ? "var(--s" + colors.get(key) + ")" : "var(--other)"; }
+  function colorOf(key, map) {
+    map = map || colors;
+    return map.has(key) ? "var(--s" + map.get(key) + ")" : "var(--other)";
+  }
 
   // ======================================================================
   // URL hash state
@@ -396,10 +480,14 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   function readHash() {
     const p = new URLSearchParams(location.hash.replace(/^#/, ""));
     const st = { range: p.get("range") || "", from: p.get("from") || "", to: p.get("to") || "", bucket: p.get("bucket") || "",
-      zr: p.get("zr") || "", group: p.get("group") || "model", metric: p.get("metric") || "tokens", filters: {}, demo: p.get("demo") === "1" };
+      zr: p.get("zr") || "", group: p.get("group") || "model", metric: p.get("metric") || "tokens", filters: {}, demo: p.get("demo") === "1",
+      pm: p.get("pm") || "ttft", ps: p.get("ps") || "p50" };
     if (!st.from && RANGES.indexOf(st.range) < 0) st.range = "7d";
     if (DIMS.indexOf(st.group) < 0) st.group = "model";
     if (!METRICS.some((m) => m[0] === st.metric)) st.metric = "tokens";
+    // Explicit lists, never object lookups: "toString" or "__proto__" must not pass.
+    if (!PERF_METRICS.some((m) => m[0] === st.pm)) st.pm = "ttft";
+    if (PERF_STATS.indexOf(st.ps) < 0) st.ps = "p50";
     p.forEach((v, k) => { if (k.startsWith("f.") && DIMS.indexOf(k.slice(2)) >= 0) st.filters[k.slice(2)] = v; });
     return st;
   }
@@ -410,6 +498,8 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     if (st.bucket) p.set("bucket", st.bucket);
     p.set("group", st.group);
     if (st.metric !== "tokens") p.set("metric", st.metric);
+    if (st.pm !== "ttft") p.set("pm", st.pm);
+    if (st.ps !== "p50") p.set("ps", st.ps);
     Object.keys(st.filters).forEach((k) => p.set("f." + k, st.filters[k]));
     return "#" + p.toString();
   }
@@ -418,19 +508,27 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     const next = Object.assign({}, S, patch);
     const h = hashOf(next);
     if (h === location.hash) return;
-    if (next.group !== S.group || JSON.stringify(next.filters) !== JSON.stringify(S.filters)) hidden = new Set();
+    if (next.group !== S.group || JSON.stringify(next.filters) !== JSON.stringify(S.filters)) { hidden = new Set(); perfHidden = new Set(); }
     // A navigation is an explicit user action: the next chart render must not
     // be deferred just because the pointer is still over the chart (it is,
     // after clicking a bar), or the view would keep showing the old series.
-    hovering = false;
+    hovering = false; perfHovering = false;
     location.hash = h;
   }
   window.addEventListener("hashchange", () => {
     // Every navigation (click drill-down, breadcrumb, back/forward) must
     // redraw even if the pointer is still over the chart.
-    hovering = false;
+    hovering = false; perfHovering = false;
     const prev = S; S = readHash();
-    if (prev.metric !== S.metric && hashOf(Object.assign({}, prev, { metric: S.metric })) === location.hash) { renderControls(); renderView(); return; }
+    // Metric / perf metric / statistic only change how fetched data is drawn: re-render, don't refetch.
+    const viewOnly = { metric: S.metric, pm: S.pm, ps: S.ps };
+    const perfChanged = prev.pm !== S.pm || prev.ps !== S.ps;
+    if ((prev.metric !== S.metric || perfChanged) && hashOf(Object.assign({}, prev, viewOnly)) === location.hash) {
+      renderControls();
+      if (prev.metric !== S.metric) renderView();
+      if (perfChanged) renderPerf();
+      return;
+    }
     renderControls(); refresh();
   });
 
@@ -460,9 +558,11 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   }
   function analyticsPath(p) { return "/control/v1/analytics?" + p.toString(); }
 
-  // Five fetches per refresh: status, main view, machines (range totals), machines (24h), clients (24h).
+  // Six fetches per refresh: status, main view, machines (range totals), machines (24h), clients (24h),
+  // and the performance view (same time range, group, filters and top as the main view).
   function refresh() {
     const my = ++seq;
+    const view = JSON.stringify([S.group, Object.keys(S.filters).sort().map((k) => [k, S.filters[k]])]);
     const main = timeParams(new URLSearchParams());
     main.set("group", S.group); main.set("top", "8");
     Object.keys(S.filters).forEach((k) => main.set("filter." + k, S.filters[k]));
@@ -472,7 +572,8 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     // Machines: range totals + 24h host sparkline. Clients: 24h client series
     // (totals for the card are the 24h sums; a client query for other ranges
     // would exceed the fetch budget).
-    Promise.all([api("/control/v1/status"), api(analyticsPath(main)), api(analyticsPath(hosts)), api(analyticsPath(spark)), api(analyticsPath(cl))].map(settle))
+    Promise.all([api("/control/v1/status"), api(analyticsPath(main)), api(analyticsPath(hosts)), api(analyticsPath(spark)), api(analyticsPath(cl)),
+      api("/control/v1/analytics/performance?" + main.toString())].map(settle))
       .then((res) => {
         if (my !== seq) return;   // a newer refresh superseded this one
         const unauthorized = res.some((r) => !r.ok && r.e && r.e.unauthorized);
@@ -484,6 +585,9 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
         if (res[2].ok) data.hosts = res[2].v;
         if (res[3].ok) data.spark = res[3].v;
         if (res[4].ok) data.clients = res[4].v;
+        // On failure keep the last perf doc only if it shows the current group and filters.
+        if (res[5].ok) { data.perf = res[5].v; perfView = view; }
+        else if (unauthorized || perfView !== view) { data.perf = null; perfView = ""; }
         renderAll();
         $("updated").textContent = res[0].ok ? "updated " + new Date().toLocaleTimeString()
           : unauthorized ? "key required" : "update failed " + new Date().toLocaleTimeString();
@@ -520,6 +624,11 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     sel.value = S.group;
     $("zoom").classList.toggle("hidden", !S.from);
     if (S.from) $("zoomtext").textContent = new Date(S.from).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" }) + " · hourly";
+    segButtons($("pmseg"), PERF_METRICS, S.pm, (v) => go({ pm: v }));
+    // The statistic labels differ for speeds (slow tail): rebuild when the kind flips.
+    const ps = $("psseg"), kind = PM[S.pm].fast ? "fast" : "time";
+    if (ps.dataset.kind !== kind) { clear(ps); ps.dataset.kind = kind; }
+    segButtons(ps, PERF_STATS.map((s) => [s, statLabel(S.pm, s)]), S.ps, (v) => go({ ps: v }));
   }
 
   // ======================================================================
@@ -672,6 +781,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     renderControls();
     renderAccounts();
     renderView();
+    renderPerf();
     renderMachines();
     renderClients();
   }
@@ -730,22 +840,25 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   }
 
   function renderLegend() {
-    const root = $("legend");
+    legendChips($("legend"), (data.main && data.main.series) || [], hidden, colors,
+      (s) => fmtMetric(S.metric, metricOf(s.total, S.metric)), () => { renderLegend(); renderChart(); });
+  }
+  // Legend chips: the main button toggles key in off (then calls redraw), the arrow drills down.
+  function legendChips(root, series, off, cmap, valueText, redraw) {
     clear(root);
-    const series = (data.main && data.main.series) || [];
     if (series.length < 2) return;   // a single series is named by the header
     series.forEach((s) => {
-      const chip = el("span", "lchip" + (hidden.has(s.key) ? " off" : ""));
+      const chip = el("span", "lchip" + (off.has(s.key) ? " off" : ""));
       const main = el("button", "l-main");
       main.type = "button";
-      main.setAttribute("aria-pressed", String(!hidden.has(s.key)));
+      main.setAttribute("aria-pressed", String(!off.has(s.key)));
       main.title = "Show/hide " + keyLabel(s.key);
-      main.appendChild(swatch(s.key));
+      main.appendChild(swatch(s.key, cmap));
       main.appendChild(el("span", null, keyLabel(s.key)));
-      main.appendChild(el("span", "l-val num", fmtMetric(S.metric, metricOf(s.total, S.metric))));
+      main.appendChild(el("span", "l-val num", valueText(s)));
       main.addEventListener("click", () => {
-        if (hidden.has(s.key)) hidden.delete(s.key); else hidden.add(s.key);
-        renderLegend(); renderChart();
+        if (off.has(s.key)) off.delete(s.key); else off.add(s.key);
+        redraw();
       });
       chip.appendChild(main);
       if (s.key !== OTHER) {
@@ -784,6 +897,25 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     const f = raw / exp;
     return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10) * exp;
   }
+  // Draws the Y grid with nice ticks from 0 to >= maxV (step from max(maxV, floorV)/4,
+  // at least minStep) and returns the plot geometry.
+  function yAxis(root, W, H, maxV, floorV, minStep, fmt) {
+    const step = Math.max(minStep, niceStep(Math.max(maxV, floorV) / 4));
+    const yMax = Math.max(step, Math.ceil(maxV / step - 1e-9) * step);
+    const ticks = []; for (let k = 0; k * step <= yMax + step / 2; k++) ticks.push(+(k * step).toPrecision(12));
+    const labW = Math.max.apply(null, ticks.map((v) => fmt(v).length)) * 6.6 + 10;
+    const M = { l: Math.max(34, labW), r: 6, t: 8, b: 24 };
+    const pw = W - M.l - M.r, ph = H - M.t - M.b;
+    const y = (v) => M.t + ph - (v / yMax) * ph;
+    const gGrid = svg("g", {});
+    ticks.forEach((v) => {
+      const yy = Math.round(y(v)) + 0.5;
+      gGrid.appendChild(svg("line", { x1: M.l, x2: W - M.r, y1: yy, y2: yy, class: v === 0 ? "baseline" : "gridline" }));
+      gGrid.appendChild(svg("text", { x: M.l - 8, y: yy + 3.5, "text-anchor": "end", class: "axis" }, fmt(v)));
+    });
+    root.appendChild(gGrid);
+    return { M: M, pw: pw, ph: ph, y: y };
+  }
   function roundedTop(x, y, w, h, r) {
     r = Math.max(0, Math.min(r, w / 2, h));
     return "M" + x + "," + (y + h) + "V" + (y + r) + "Q" + x + "," + y + " " + (x + r) + "," + y +
@@ -815,23 +947,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     series.forEach((s) => s.points.forEach((p, i) => { totals[i] += metricOf(p, m); }));
     const maxV = Math.max.apply(null, totals);
 
-    // Y scale with nice ticks.
-    let step = niceStep(Math.max(maxV, m === "cost" ? 0.01 : 1) / 4);
-    if (m !== "cost") step = Math.max(1, step);
-    const yMax = Math.max(step, Math.ceil(maxV / step - 1e-9) * step);
-    const ticks = []; for (let k = 0; k * step <= yMax + step / 2; k++) ticks.push(+(k * step).toPrecision(12));
-    const labW = Math.max.apply(null, ticks.map((v) => fmtAxis(m, v).length)) * 6.6 + 10;
-    const M = { l: Math.max(34, labW), r: 6, t: 8, b: 24 };
-    const pw = W - M.l - M.r, ph = H - M.t - M.b;
-    const y = (v) => M.t + ph - (v / yMax) * ph;
-
-    const gGrid = svg("g", {});
-    ticks.forEach((v) => {
-      const yy = Math.round(y(v)) + 0.5;
-      gGrid.appendChild(svg("line", { x1: M.l, x2: W - M.r, y1: yy, y2: yy, class: v === 0 ? "baseline" : "gridline" }));
-      gGrid.appendChild(svg("text", { x: M.l - 8, y: yy + 3.5, "text-anchor": "end", class: "axis" }, fmtAxis(m, v)));
-    });
-    root.appendChild(gGrid);
+    const { M, pw, ph, y } = yAxis(root, W, H, maxV, m === "cost" ? 0.01 : 1, m === "cost" ? 0 : 1, (v) => fmtAxis(m, v));
 
     // Columns: background hit rect (hover target), stacked segments, x-axis strip.
     const band = pw / n;
@@ -910,13 +1026,16 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     if (anyPartial) tip.appendChild(el("div", "tip-hint", "* partial: includes unpriced requests"));
     if (key && key !== OTHER) tip.appendChild(el("div", "tip-hint", "Click to drill into " + keyLabel(key)));
     else if (doc.bucket === "day") tip.appendChild(el("div", "tip-hint", "Click the date to zoom into hours"));
-    // Position beside the pointer, flipped/clamped inside the chart.
+    placeTip(tip, host, cx, cy);
+    highlight(i, key);
+  }
+  // Show tip beside the pointer, flipped/clamped inside the chart host.
+  function placeTip(tip, host, cx, cy) {
     tip.classList.add("show");
     const W = host.clientWidth, H = host.clientHeight, tw = tip.offsetWidth, th = tip.offsetHeight;
     let x = cx + 14; if (x + tw > W) x = Math.max(0, cx - tw - 14);
     const yy = Math.max(-8, Math.min(H - th, cy - th / 2));
     tip.style.left = x + "px"; tip.style.top = yy + "px";
-    highlight(i, key);
   }
   function hideTip() { $("tip").classList.remove("show"); highlight(-1, null); }
   function highlight(i, key) {
@@ -974,22 +1093,27 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     ["cost", "Cost", (r) => metricOf(r, "cost")],
     ["metric", "Share", (r) => metricOf(r, S.metric)]
   ];
-  function renderTable() {
-    const table = $("breakdown"), thead = table.tHead, tbody = table.tBodies[0];
-    clear(thead); clear(tbody);
+  // Sortable header row; clicking a column updates st ({col, dir}) in place and calls redraw.
+  function sortHeader(thead, cols, st, redraw) {
     const hr = el("tr");
-    COLS.forEach(([id, label]) => {
+    cols.forEach(([id, label]) => {
       const th = el("th");
-      th.setAttribute("aria-sort", sort.col === id ? (sort.dir < 0 ? "descending" : "ascending") : "none");
-      const b = el("button", sort.col === id ? "sorted" : null, label + (sort.col === id ? (sort.dir < 0 ? " ↓" : " ↑") : ""));
+      th.setAttribute("aria-sort", st.col === id ? (st.dir < 0 ? "descending" : "ascending") : "none");
+      const b = el("button", st.col === id ? "sorted" : null, label + (st.col === id ? (st.dir < 0 ? " ↓" : " ↑") : ""));
       b.type = "button";
       b.addEventListener("click", () => {
-        sort = sort.col === id ? { col: id, dir: -sort.dir } : { col: id, dir: id === "key" ? 1 : -1 };
-        renderTable();
+        st.dir = st.col === id ? -st.dir : id === "key" ? 1 : -1;
+        st.col = id;
+        redraw();
       });
       th.appendChild(b); hr.appendChild(th);
     });
     thead.appendChild(hr);
+  }
+  function renderTable() {
+    const table = $("breakdown"), thead = table.tHead, tbody = table.tBodies[0];
+    clear(thead); clear(tbody);
+    sortHeader(thead, COLS, sort, renderTable);
 
     const doc = data.main;
     // The server lists at most 200 keys; the rest are only in totals.
@@ -1030,6 +1154,246 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
       fill.style.width = (share * 100).toFixed(1) + "%"; fill.style.background = colorOf(r.key);
       track.appendChild(fill); bar.appendChild(track); bar.appendChild(el("span", "sval", shareText(share)));
       st.appendChild(bar); tr.appendChild(st);
+      tr.addEventListener("click", () => drillInto(r.key));
+      tr.addEventListener("keydown", (e) => { if (e.key === "Enter") drillInto(r.key); });
+      tbody.appendChild(tr);
+    });
+  }
+
+  // ======================================================================
+  // Render: performance (KPIs, notes, legend, line chart, table)
+  // ======================================================================
+  const statKey = (pm, ps) => PM[pm].fast ? SLOW_TAIL[ps] : ps;
+  function statLabel(pm, ps) {
+    if (ps === "p50") return "Median";
+    return PM[pm].fast ? "Slowest " + (ps === "p90" ? "10%" : "1%") : ps;
+  }
+  const distOf = (row, pm) => (row && row[PM[pm].field]) || null;
+  // The selected statistic of metric pm in a PerfRow; null when it has no samples.
+  function perfVal(row, pm, ps) { const d = distOf(row, pm); return d ? d[statKey(pm, ps)] : null; }
+  const perfName = (pm) => PERF_METRICS.find((x) => x[0] === pm)[1];
+  // e.g. "median TTFT", "p90 latency", "slowest 10% decode speed"
+  function perfTitle(pm, ps) {
+    const lower = (s) => s.replace(/^[A-Z](?=[a-z])/, (c) => c.toLowerCase());   // keeps "TTFT", "E2E"
+    return lower(statLabel(pm, ps)) + " " + lower(perfName(pm));
+  }
+  // The drawn perf chart (doc, metric, statistic, colors, geometry), so a
+  // deferred redraw never mixes new data into the hover of the old drawing.
+  let perfGeo = null;
+
+  function renderPerf() {
+    const doc = data.perf;
+    assignPerfColors((doc && doc.series) || []);
+    renderPerfKpis(); renderPerfMsg(); renderPerfLegend(); renderPerfChart(); renderPerfTable();
+    $("perfnote").textContent = doc ? perfTitle(S.pm, S.ps) + " by " + S.group + " · " + (doc.bucket === "day" ? "daily" : "hourly") + " buckets" : "";
+  }
+  function renderPerfKpis() {
+    const root = $("pkpis");
+    clear(root);
+    const t = data.perf && data.perf.totals;
+    const d = (pm) => distOf(t, pm);
+    const items = [
+      ["ttft", "Median TTFT", d("ttft") ? fmtMs(d("ttft").p50) : "—", d("ttft") ? "p95 " + fmtMs(d("ttft").p95) : ""],
+      ["decode", "Median decode", d("decode") ? fmtTps(d("decode").p50) : "—",
+        t && t.decode_tps_weighted !== null && t.decode_tps_weighted !== undefined ? "weighted " + fmtTps(t.decode_tps_weighted) : ""],
+      ["latency", "Median latency", d("latency") ? fmtMs(d("latency").p50) : "—", d("latency") ? "p95 " + fmtMs(d("latency").p95) : ""],
+      [null, "Measured requests", t ? fmtCount(t.requests) : "—", t && t.requests ? pct(t.streamed_requests / t.requests) + " streamed" : ""]
+    ];
+    items.forEach(([pm, label, value, sub]) => {
+      const box = el(pm ? "button" : "div", "kpi" + (pm === S.pm ? " sel" : ""));
+      if (pm) { box.type = "button"; box.setAttribute("aria-pressed", String(pm === S.pm)); box.addEventListener("click", () => go({ pm: pm })); }
+      box.appendChild(el("span", "k-label", label));
+      box.appendChild(el("span", "k-value", value));
+      box.appendChild(el("span", "k-sub", sub || " "));   // keeps the strip's rows aligned
+      root.appendChild(box);
+    });
+  }
+  // Partial-history note: shown when some bucket has eligible requests but no TTFT sample.
+  function renderPerfMsg() {
+    const doc = data.perf, box = $("pmsg");
+    const msg = doc && noTTFTBucket(doc) ? "TTFT and decode speed exist only for streamed requests recorded since performance tracking was added; other requests show latency and E2E speed only." : "";
+    box.textContent = msg;
+    box.classList.toggle("hidden", !msg);
+  }
+  function noTTFTBucket(doc) {
+    const series = doc.series || [];
+    return (doc.bucket_starts || []).some((_, i) => series.some((s) => s.points[i] && s.points[i].requests > 0) &&
+      !series.some((s) => s.points[i] && s.points[i].ttft_ms));
+  }
+  function renderPerfLegend() {
+    legendChips($("plegend"), (data.perf && data.perf.series) || [], perfHidden, perfColors,
+      (s) => fmtPerf(S.pm, perfVal(s.total, S.pm, S.ps)), () => { renderPerfLegend(); renderPerfChart(); });
+  }
+
+  // ---- Perf line chart ----
+  function renderPerfChart() {
+    // Never redraw under the pointer or keyboard focus; flushed on leave/blur.
+    if (perfHovering || $("psvg").contains(document.activeElement)) { pendingPerf = true; return; }
+    pendingPerf = false;
+    const host = $("pchart"), root = $("psvg");
+    const W = host.clientWidth, H = host.clientHeight;
+    // Not laid out yet: keep the current drawing and retry on the next frame.
+    if (W < 80 || H < 60) { pendingPerf = true; requestAnimationFrame(() => { if (pendingPerf) renderPerfChart(); }); return; }
+    clear(root); hidePerfTip(); perfGeo = null;
+    perfWidth = W;
+    root.setAttribute("viewBox", "0 0 " + W + " " + H);
+    const doc = data.perf, pm = S.pm, ps = S.ps;
+    const n = doc && doc.bucket_starts ? doc.bucket_starts.length : 0;
+    const series = ((doc && doc.series) || []).filter((s) => !perfHidden.has(s.key));
+    let maxV = 0, any = false;
+    series.forEach((s) => s.points.forEach((p) => { const v = perfVal(p, pm, ps); if (v !== null) { any = true; maxV = Math.max(maxV, v); } }));
+    const empty = !doc ? "Performance unavailable" : !doc.totals.requests ? "No proxied requests in range" : !n ? "No buckets in range"
+      : !distOf(doc.totals, pm) ? "No " + perfName(pm) + " samples in range" : !any ? "No samples for the visible series" : "";
+    if (empty) {
+      root.appendChild(svg("text", { x: W / 2, y: H / 2, "text-anchor": "middle", class: "empty" }, empty));
+      root.setAttribute("aria-label", "Performance chart: " + empty.toLowerCase());
+      return;
+    }
+    const { M, ph, pw, y } = yAxis(root, W, H, maxV, 1, 1, (v) => fmtPerfAxis(pm, v));
+    const band = pw / n, xc = (i) => M.l + band * (i + 0.5);
+    const labelEvery = Math.max(1, Math.ceil(64 / band)), focusable = n <= 48;
+    // Hover/focus targets (one column per bucket) and x labels; lines are drawn on top.
+    for (let i = 0; i < n; i++) {
+      const hit = svg("rect", { x: M.l + i * band, y: M.t, width: band, height: ph, class: "hit", "data-pi": i });
+      if (focusable) {
+        hit.setAttribute("tabindex", "0");
+        hit.setAttribute("aria-label", bucketLabel(doc.bucket_starts[i], doc.bucket, true) + ": " +
+          series.map((s) => keyLabel(s.key) + " " + fmtPerf(pm, perfVal(s.points[i], pm, ps))).join(", "));
+      }
+      root.appendChild(hit);
+      if (i % labelEvery === 0) root.appendChild(svg("text", { x: xc(i), y: H - 7, "text-anchor": "middle", class: "axis" },
+        bucketLabel(doc.bucket_starts[i], doc.bucket, false)));
+    }
+    // One line per series; buckets without samples break the line, isolated points are dots.
+    series.forEach((s) => {
+      const vals = s.points.map((p) => perfVal(p, pm, ps));
+      const g = svg("g", {});
+      let d = "";
+      vals.forEach((v, i) => {
+        if (v === null) return;
+        const prev = i > 0 && vals[i - 1] !== null, next = i < n - 1 && vals[i + 1] !== null;
+        const px = xc(i).toFixed(1), py = y(v).toFixed(1);
+        if (prev || next) d += (prev ? "L" : "M") + px + "," + py;
+        else { const c = svg("circle", { cx: px, cy: py, r: 3, class: "pdot" }); c.style.fill = colorOf(s.key, perfColors); g.appendChild(c); }
+      });
+      if (d) { const p = svg("path", { d: d, class: "pline" }); p.style.stroke = colorOf(s.key, perfColors); g.insertBefore(p, g.firstChild); }
+      root.appendChild(g);
+    });
+    const hover = svg("g", {});
+    root.appendChild(hover);
+    perfGeo = { doc: doc, pm: pm, ps: ps, colors: perfColors, xc: xc, y: y, top: M.t, bottom: M.t + ph, series: series, hover: hover };
+    root.setAttribute("aria-label", perfSummary(doc, series));
+  }
+  function perfSummary(doc, series) {
+    const t = doc.totals;
+    const top = series.slice(0, 3).map((s) => keyLabel(s.key) + " " + fmtPerf(S.pm, perfVal(s.total, S.pm, S.ps))).join(", ");
+    return "Line chart of " + perfTitle(S.pm, S.ps) + " by " + S.group + ", " + doc.bucket_starts.length + " " + doc.bucket + " buckets; overall " +
+      fmtPerf(S.pm, perfVal(t, S.pm, S.ps)) + " over " + fmtCount(distOf(t, S.pm).n) + " samples" + (top ? "; " + top : "") +
+      ". The performance table below has the same data.";
+  }
+  function showPerfTip(i, cx, cy) {
+    const geo = perfGeo, tip = $("ptip");
+    if (!geo) return;
+    const doc = geo.doc, pm = geo.pm, ps = geo.ps;
+    clear(tip);
+    tip.appendChild(el("div", "tip-title", bucketLabel(doc.bucket_starts[i], doc.bucket, true)));
+    const rows = geo.series.map((s) => ({ s: s, v: perfVal(s.points[i], pm, ps), d: distOf(s.points[i], pm) }));
+    rows.sort((a, b) => (a.v === null) - (b.v === null) || (b.v || 0) - (a.v || 0));
+    clear(geo.hover);
+    geo.hover.appendChild(svg("line", { x1: geo.xc(i), x2: geo.xc(i), y1: geo.top, y2: geo.bottom, class: "guide" }));
+    rows.forEach((r) => {
+      const row = el("div", "tip-row");
+      row.appendChild(swatch(r.s.key, geo.colors));
+      row.appendChild(el("span", "tk", keyLabel(r.s.key)));
+      row.appendChild(el("span", null, fmtPerf(pm, r.v)));
+      row.appendChild(el("span", "ts", "n " + fmtCount(r.d ? r.d.n : 0)));
+      tip.appendChild(row);
+      if (r.v === null) return;
+      const c = svg("circle", { cx: geo.xc(i), cy: geo.y(r.v), r: 4, class: "pmark" });
+      c.style.fill = colorOf(r.s.key, geo.colors);
+      geo.hover.appendChild(c);
+    });
+    tip.appendChild(el("div", "tip-hint", perfTitle(pm, ps) + " · n = samples"));
+    placeTip(tip, $("pchart"), cx, cy);
+    $("psvg").querySelectorAll(".hit").forEach((h) => h.classList.toggle("hot", Number(h.dataset.pi) === i));
+  }
+  function hidePerfTip() {
+    $("ptip").classList.remove("show");
+    if (perfGeo) clear(perfGeo.hover);
+    $("psvg").querySelectorAll(".hit.hot").forEach((h) => h.classList.remove("hot"));
+  }
+  function wirePerfChart() {
+    const root = $("psvg"), host = $("pchart");
+    root.addEventListener("pointermove", (e) => {
+      const t = e.target;
+      if (!t.dataset || t.dataset.pi === undefined) { hidePerfTip(); return; }
+      const r = host.getBoundingClientRect();
+      showPerfTip(Number(t.dataset.pi), e.clientX - r.left, e.clientY - r.top);
+    });
+    root.addEventListener("pointerenter", () => { perfHovering = true; });
+    root.addEventListener("pointerleave", () => {
+      perfHovering = false; hidePerfTip();
+      if (pendingPerf) renderPerfChart();
+    });
+    root.addEventListener("focusin", (e) => {
+      const t = e.target;
+      if (!t.dataset || t.dataset.pi === undefined) return;
+      showPerfTip(Number(t.dataset.pi), Number(t.getAttribute("x")) + Number(t.getAttribute("width")) / 2, host.clientHeight / 2);
+    });
+    root.addEventListener("focusout", (e) => {
+      hidePerfTip();
+      if (pendingPerf && !perfHovering && !root.contains(e.relatedTarget)) setTimeout(renderPerfChart, 0);
+    });
+    const onResize = () => { if (host.clientWidth !== perfWidth) renderPerfChart(); };
+    if (window.ResizeObserver) new ResizeObserver(onResize).observe(host); else window.addEventListener("resize", onResize);
+  }
+
+  // ---- Perf table ----
+  const dv = (d, k) => d ? d[k] : null;
+  const PCOLS = [
+    ["key", "Key", (r) => keyLabel(r.key)],
+    ["requests", "Requests", (r) => r.requests, fmtCount],
+    ["streamed", "Streamed", (r) => r.requests ? r.streamed_requests / r.requests : null, pct],
+    ["ttft50", "TTFT p50", (r) => dv(r.ttft_ms, "p50"), fmtMs],
+    ["ttft95", "TTFT p95", (r) => dv(r.ttft_ms, "p95"), fmtMs],
+    ["dec50", "Decode p50", (r) => dv(r.decode_tps, "p50"), fmtTps],
+    ["decw", "Decode weighted", (r) => r.decode_tps_weighted === undefined ? null : r.decode_tps_weighted, fmtTps],
+    ["e2e50", "E2E p50", (r) => dv(r.e2e_tps, "p50"), fmtTps],
+    ["lat50", "Latency p50", (r) => dv(r.latency_ms, "p50"), fmtMs],
+    ["lat95", "Latency p95", (r) => dv(r.latency_ms, "p95"), fmtMs],
+    ["lat99", "Latency p99", (r) => dv(r.latency_ms, "p99"), fmtMs]
+  ];
+  function renderPerfTable() {
+    const table = $("perftable"), thead = table.tHead, tbody = table.tBodies[0];
+    clear(thead); clear(tbody);
+    sortHeader(thead, PCOLS, perfSort, renderPerfTable);
+    const doc = data.perf;
+    const omitted = (doc && doc.breakdown_omitted) || 0, more = $("perfmore");
+    more.textContent = omitted > 0 ? fmtCount(omitted) + " more not shown" : "";
+    more.classList.toggle("hidden", !(omitted > 0));
+    const rows = ((doc && doc.breakdown) || []).filter((r) => r.requests > 0);
+    if (!rows.length) {
+      const tr = el("tr", "empty-row"), td = el("td", null, doc ? "No proxied requests in range." : "Performance unavailable.");
+      td.colSpan = PCOLS.length; tr.appendChild(td); tbody.appendChild(tr);
+      return;
+    }
+    const get = PCOLS.find((c) => c[0] === perfSort.col)[2];
+    rows.sort((a, b) => {
+      const va = get(a), vb = get(b), byKey = String(a.key).localeCompare(String(b.key));
+      if (va === null || vb === null) return va === vb ? byKey : va === null ? 1 : -1;   // no data sorts last
+      const c = typeof va === "string" ? va.localeCompare(vb) : va - vb;
+      return c * perfSort.dir || byKey;
+    });
+    rows.forEach((r) => {
+      const tr = el("tr", "click");
+      tr.tabIndex = 0;
+      tr.title = "Drill into " + keyLabel(r.key);
+      const kt = el("td", "key"); kt.appendChild(swatch(r.key, perfColors)); kt.appendChild(document.createTextNode(keyLabel(r.key)));
+      tr.appendChild(kt);
+      PCOLS.slice(1).forEach(([, , getv, fmt]) => {
+        const v = getv(r);
+        tr.appendChild(el("td", v === null ? "na" : null, v === null ? "—" : fmt(v)));
+      });
       tr.addEventListener("click", () => drillInto(r.key));
       tr.addEventListener("keydown", (e) => { if (e.key === "Enter") drillInto(r.key); });
       tbody.appendChild(tr);
@@ -1174,17 +1538,22 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   // Server rule: cost_usd is null only when the row has requests and none were priced.
   function finishRow(r) { if (r.cost_usd === null && r.requests === 0) r.cost_usd = 0; return r; }
   const MAX_BREAKDOWN = 200; // core.AnalyticsMaxBreakdown
-  function demoAnalytics(q) {
+  // Query window shared by the demo endpoints: range/from/to, buckets, group, top, filters.
+  function demoWindow(q) {
     const span = { "24h": 24, "7d": 168, "30d": 720, "90d": 2160 }[q.get("range") || "7d"] * HOUR;
     const to = q.get("to") ? Date.parse(q.get("to")) : Date.now();
     const from = q.get("from") ? Date.parse(q.get("from")) : to - span;
     const bucket = q.get("bucket") || (to - from > 48 * HOUR ? "day" : "hour");
-    const group = q.get("group") || "host", top = Number(q.get("top")) || 8;
     const floorB = (t) => bucket === "hour" ? Math.floor(t / HOUR) * HOUR : new Date(t).setHours(0, 0, 0, 0);
     const nextB = (t) => { if (bucket === "hour") return t + HOUR; const d = new Date(t); d.setDate(d.getDate() + 1); return d.setHours(0, 0, 0, 0); };
     const starts = []; for (let b = floorB(from); b < to; b = nextB(b)) starts.push(b);
-    const idx = new Map(starts.map((b, i) => [b, i]));
     const filters = {}; q.forEach((v, k) => { if (k.startsWith("filter.")) filters[k.slice(7)] = v; });
+    return { from: from, to: to, bucket: bucket, starts: starts, idx: new Map(starts.map((b, i) => [b, i])), floorB: floorB,
+      group: q.get("group") || "host", top: Number(q.get("top")) || 8, filters: filters,
+      match: (r) => r.t >= from && r.t < to && Object.keys(filters).every((k) => r[k] === filters[k]) };
+  }
+  function demoAnalytics(q) {
+    const { from, to, bucket, starts, idx, floorB, group, top, filters } = demoWindow(q);
     const groups = new Map(), totals = zeroRow("");
     demoLedger().forEach((r) => {
       if (r.t < from || r.t >= to) return;
@@ -1205,6 +1574,76 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     return { schema_version: 1, from: new Date(from).toISOString(), to: new Date(to).toISOString(), bucket: bucket,
       bucket_starts: starts.map((b) => new Date(b).toISOString()), group: group, filters: filters,
       totals: finishRow(totals), breakdown: ranked.slice(0, MAX_BREAKDOWN).map((g) => g.total),
+      breakdown_omitted: Math.max(0, ranked.length - MAX_BREAKDOWN), series: series };
+  }
+  // Demo performance: synthetic per-request timings derived deterministically
+  // from each demo ledger row, aggregated like the server (percentiles over
+  // the pooled samples of every point, key total, "other" and totals).
+  const DEMO_PERF = { // model: [median TTFT ms, median decode tok/s]
+    "claude-opus-5-5": [950, 48], "glm-5.3-flash": [380, 115], "gpt-5.6-sol": [1250, 72], "deepseek-v4.1-flash": [260, 135] };
+  const DEMO_TTFT_DAYS = 21;   // older demo rows predate TTFT capture: latency/E2E only
+  function perfAcc() { return { requests: 0, streamed: 0, lat: [], ttft: [], dec: [], e2e: [], decTok: 0, decMs: 0, outTok: 0, latMs: 0 }; }
+  function addPerf(a, b) {
+    ["requests", "streamed", "decTok", "decMs", "outTok", "latMs"].forEach((f) => { a[f] += b[f]; });
+    ["lat", "ttft", "dec", "e2e"].forEach((f) => { for (const v of b[f]) a[f].push(v); });
+  }
+  function demoSamples(r) {
+    if (r.perf) return r.perf;
+    const a = r.perf = perfAcc(), mi = Object.keys(DEMO_PERF).indexOf(r.model);
+    // A model-specific outage day now and then, so the chart shows gaps.
+    if ((Math.floor(new Date(r.t).setHours(0, 0, 0, 0) / 864e5) * 7 + mi * 3) % 13 === 0) return a;
+    const rnd = mulberry32(hash(r.t + r.host + r.model));
+    const logn = (s) => Math.exp(s * Math.sqrt(-2 * Math.log(1 - rnd())) * Math.cos(2 * Math.PI * rnd()));
+    const old = r.t < Math.floor(Date.now() / HOUR) * HOUR - DEMO_TTFT_DAYS * 24 * HOUR;
+    const [ttft0, dec0] = DEMO_PERF[r.model], avgOut = r.row.output_tokens / r.row.requests;
+    for (let k = Math.min(8, Math.ceil(r.row.requests / 2)); k > 0; k--) {
+      const streamed = !old && rnd() < 0.85;
+      const ttft = Math.round(Math.min(8000, Math.max(90, ttft0 * logn(0.45))));
+      const out = Math.max(1, Math.round(avgOut * (0.3 + 1.4 * rnd())));
+      const lat = ttft + Math.round((out - 1) * 1000 / Math.min(220, Math.max(8, dec0 * logn(0.25))));
+      a.requests++; a.lat.push(lat); a.e2e.push(out * 1000 / lat); a.outTok += out; a.latMs += lat;
+      if (!streamed) continue;
+      a.streamed++; a.ttft.push(ttft);
+      const G = lat - ttft;
+      if (out >= 2 && G >= 1) { a.dec.push((out - 1) * 1000 / G); a.decTok += out - 1; a.decMs += G; }
+    }
+    return a;
+  }
+  // core.Dist over samples (linear interpolation between closest ranks); null when empty.
+  function demoDist(xs) {
+    if (!xs.length) return null;
+    const s = Float64Array.from(xs).sort(), n = s.length;
+    const q = (p) => { const h = (n - 1) * p, lo = Math.floor(h); return s[lo] + (h - lo) * (s[Math.ceil(h)] - s[lo]); };
+    return { n: n, mean: s.reduce((x, y) => x + y, 0) / n, min: s[0], p01: q(0.01), p05: q(0.05), p10: q(0.1), p50: q(0.5),
+      p90: q(0.9), p95: q(0.95), p99: q(0.99), max: s[n - 1] };
+  }
+  function perfRow(key, a) {
+    return { key: key, requests: a.requests, streamed_requests: a.streamed, latency_ms: demoDist(a.lat), ttft_ms: demoDist(a.ttft),
+      decode_tps: demoDist(a.dec), e2e_tps: demoDist(a.e2e), decode_tps_weighted: a.decMs ? a.decTok * 1000 / a.decMs : null,
+      e2e_tps_weighted: a.latMs ? a.outTok * 1000 / a.latMs : null };
+  }
+  function demoPerf(q) {
+    const w = demoWindow(q), groups = new Map(), totals = perfAcc();
+    demoLedger().forEach((r) => {
+      if (!w.match(r)) return;
+      const smp = demoSamples(r);
+      if (!smp.requests) return;
+      const key = r[w.group];
+      let g = groups.get(key);
+      if (!g) { g = { key: key, total: perfAcc(), points: w.starts.map(() => perfAcc()) }; groups.set(key, g); }
+      addPerf(g.total, smp); addPerf(g.points[w.idx.get(w.floorB(r.t))], smp); addPerf(totals, smp);
+    });
+    const ranked = Array.from(groups.values()).sort((a, b) => b.total.requests - a.total.requests || a.key.localeCompare(b.key));
+    const toSeries = (g) => ({ key: g.key, total: perfRow(g.key, g.total), points: g.points.map((p) => perfRow("", p)) });
+    const series = ranked.slice(0, w.top).map(toSeries);
+    if (ranked.length > w.top) {
+      const o = { key: OTHER, total: perfAcc(), points: w.starts.map(() => perfAcc()) };
+      ranked.slice(w.top).forEach((g) => { addPerf(o.total, g.total); g.points.forEach((p, i) => addPerf(o.points[i], p)); });
+      series.push(toSeries(o));
+    }
+    return { schema_version: 1, from: new Date(w.from).toISOString(), to: new Date(w.to).toISOString(), bucket: w.bucket,
+      bucket_starts: w.starts.map((b) => new Date(b).toISOString()), group: w.group, filters: w.filters,
+      totals: perfRow("", totals), breakdown: ranked.slice(0, MAX_BREAKDOWN).map((g) => perfRow(g.key, g.total)),
       breakdown_omitted: Math.max(0, ranked.length - MAX_BREAKDOWN), series: series };
   }
   function demoStatus() {
@@ -1241,6 +1680,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     const u = new URL(path, location.href);
     if (u.pathname === "/control/v1/status") return demoStatus();
     if (u.pathname === "/control/v1/analytics") return demoAnalytics(u.searchParams);
+    if (u.pathname === "/control/v1/analytics/performance") return demoPerf(u.searchParams);
     throw new Error(u.pathname + ": not in demo");
   }
 
@@ -1261,6 +1701,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   setInterval(() => { if (document.visibilityState === "visible") refresh(); }, POLL_MS);
 
   wireChart();
+  wirePerfChart();
   renderControls();
   refresh();
 })();

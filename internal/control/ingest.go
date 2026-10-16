@@ -316,6 +316,9 @@ func validateRecordFields(i int, rec *core.RequestRecord) error {
 	if rec.Status < 0 || rec.LatencyMS < 0 || rec.BytesOut < 0 {
 		return recErr("records[%d]: status, latency_ms and bytes_out must be non-negative", i)
 	}
+	if rec.TTFTMS != nil && (*rec.TTFTMS < 0 || *rec.TTFTMS > rec.LatencyMS) {
+		return recErr("records[%d]: ttft_ms must be between 0 and latency_ms", i)
+	}
 	return nil
 }
 
