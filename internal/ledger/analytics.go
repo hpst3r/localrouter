@@ -64,33 +64,13 @@ func (l *Ledger) analytics(ctx context.Context, q core.AnalyticsQuery, loc *time
 		slot = gcd(slot, s.UnixMilli()-base)
 	}
 
-	var filterSQL string
-	var filterArgs []any
-	keys := make([]string, 0, len(q.Filters))
-	for k := range q.Filters {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		filterSQL += " AND " + dimensionColumns[k] + " = ?"
-		filterArgs = append(filterArgs, q.Filters[k])
-	}
+	filterSQL, filterArgs := filterClause(q.Filters)
 
 	// The range is split at bucket boundaries into chunks queried
 	// concurrently (WAL readers don't block each other); SQLite's GROUP BY
 	// is the dominant cost on large ranges.
-	nChunks := min(analyticsChunks, len(starts))
-	bounds := make([][2]int64, nChunks)
-	for c := range nChunks {
-		lo, hi := q.From.UnixMilli(), q.To.UnixMilli()
-		if c > 0 {
-			lo = starts[c*len(starts)/nChunks].UnixMilli()
-		}
-		if c < nChunks-1 {
-			hi = starts[(c+1)*len(starts)/nChunks].UnixMilli()
-		}
-		bounds[c] = [2]int64{lo, hi}
-	}
+	bounds := chunkBounds(q.From, q.To, starts)
+	nChunks := len(bounds)
 
 	// Rank every key in range first and keep only the best
 	// core.AnalyticsMaxBreakdown, so memory does not grow with the number
@@ -181,6 +161,41 @@ func (l *Ledger) analytics(ctx context.Context, q core.AnalyticsQuery, loc *time
 		BreakdownOmitted: nKeys - len(breakdown),
 		Series:           series,
 	}, nil
+}
+
+// filterClause returns the SQL (" AND col = ?"..., in key order) and bind
+// arguments for validated analytics filters.
+func filterClause(filters map[string]string) (string, []any) {
+	var filterSQL string
+	var filterArgs []any
+	keys := make([]string, 0, len(filters))
+	for k := range filters {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		filterSQL += " AND " + dimensionColumns[k] + " = ?"
+		filterArgs = append(filterArgs, filters[k])
+	}
+	return filterSQL, filterArgs
+}
+
+// chunkBounds splits [from, to) at bucket boundaries into at most
+// analyticsChunks [lo, hi) millisecond ranges, each covering whole buckets.
+func chunkBounds(from, to time.Time, starts []time.Time) [][2]int64 {
+	nChunks := min(analyticsChunks, len(starts))
+	bounds := make([][2]int64, nChunks)
+	for c := range nChunks {
+		lo, hi := from.UnixMilli(), to.UnixMilli()
+		if c > 0 {
+			lo = starts[c*len(starts)/nChunks].UnixMilli()
+		}
+		if c < nChunks-1 {
+			hi = starts[(c+1)*len(starts)/nChunks].UnixMilli()
+		}
+		bounds[c] = [2]int64{lo, hi}
+	}
+	return bounds
 }
 
 // rankKeys aggregates every group key matching the filters within bounds and
