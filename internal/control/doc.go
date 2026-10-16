@@ -28,6 +28,9 @@
 //	                            (else 503). Ledger errors prefixed "analytics:" -> 400.
 //	GET  /control/v1/analytics/dimensions -> top 50 values per dimension
 //	                            in range (?range=30d, from/to, filter.<dim>)
+//	GET  /control/v1/analytics/performance -> core.PerfResult latency/TTFT/speed
+//	                            percentiles; same params and errors as analytics;
+//	                            503 unless Deps.Ledger implements core.PerfLedger
 //	POST /control/v1/admit   -> dry-run admission {class, model} or {class, account}
 //	                            (exactly one of model/account); never creates a lease
 //	POST /control/v1/ingest  -> agent push of claude usage records and quota
