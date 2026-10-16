@@ -1171,7 +1171,7 @@ excluded; failed/failover attempts carry an error and are excluded.) Samples:
 | `latency_ms` | every eligible row | `latency_ms` |
 | `ttft_ms` | `ttft_ms IS NOT NULL` | `ttft_ms` |
 | `e2e_tps` | `usage_known = 1 AND output_tokens > 0` | `output_tokens * 1000 / latency_ms` |
-| `decode_tps` | `streamed = 1 AND ttft_ms IS NOT NULL AND usage_known = 1 AND D ≥ 2 AND G ≥ 1` | `(D - 1) * 1000 / G` |
+| `decode_tps` | `streamed = 1 AND ttft_ms IS NOT NULL AND usage_known = 1 AND D ≥ 2 AND G ≥ 50` | `(D - 1) * 1000 / G` |
 
 where `G = latency_ms - ttft_ms` (decode window, ms) and `D` (decode tokens)
 = `output_tokens` if `first_token_reasoning = 1`, else `output_tokens -
@@ -1252,6 +1252,23 @@ performance view with the main view's group, filters and `top=8`).
 - Same constraints as the rest of the widget: single file, no external
   loads, CSP unchanged, text only via `textContent`, light/dark, narrow
   (~420 px) and wide.
+
+### Amendment 1 (post-review decisions)
+
+| # | Finding | Decision |
+|---|---|---|
+| A1 | Upstreams that buffer a whole stream into one read make G a few ms and rates ~1e5 tok/s | Decode samples require **G ≥ 50 ms** (table above). Faster/shorter decodes are too noisy to rate. |
+| A2 | `response.reasoning_summary_text.delta` counted as reasoning makes D include hidden reasoning produced before TTFT | **Keep** it as a reasoning event. Summaries stream while hidden reasoning continues, so counting reasoning tokens in D is closer to the true rate than subtracting them (which would divide visible tokens by a window mostly spent reasoning). The residual bias is the hidden reasoning before the first summary delta; documented, not corrected. |
+| A3 | Performance holds ~3 copies of every sample (529 MB/op at 1M rows) | Peak sample memory ≤ 2× one copy: compute per-point distributions first (sorting owned slices in place), then build each series total by concatenating its points' samples, and Totals from the series totals, releasing each level once used. Report B/op before/after. |
+| A4 | Ranking keeps every distinct key in maps (unbounded for group=task) | Rank like `Analytics` (bounded merge + heap; only the top `AnalyticsMaxBreakdown` keys get breakdown rows, the rest only count toward Totals/`__other__`). |
+| A5 | Perf errors log/return the analytics wording | Log `control: performance analytics failed`; 500 body `performance analytics failed`. |
+| W1 | `pm=toString` etc. passes validation (prototype keys) and breaks rendering | Validate hash values against explicit lists/own properties; same for `ps`. |
+| W2 | Union color assignment can give two perf lines the same color | Usage series keep today's colors. Perf-only keys take palette slots the usage view left free; they collide only if the perf chart itself needs more than 10. The usage table/legend keep the usage-only mapping (a usage "Other" row stays grey). |
+| W3 | Stale perf doc rendered after group/filter change when the fetch fails | Keep the last doc only if its group and filters equal the current view; otherwise show "Performance unavailable". |
+| W4 | Deferred tooltip mixes new bucket labels with old geometry | Tooltip reads bucket starts and values from the same rendered doc. |
+| W5 | Perf chart clears before the size check, leaving it blank during hover | Check size before clearing (perf chart only; the usage chart is unchanged in this feature). |
+| W6 | "Recorded only since <date>" can make a false claim | Use neutral wording without a date: shown when some buckets have eligible requests but no TTFT samples ("TTFT and decode speed exist only for streamed requests recorded since performance tracking was added; other requests show latency and E2E speed only."). |
+| W7 | `fmtMs(999.6)` → "1000 ms" | Round first, then choose the unit. |
 
 ### Acceptance tests (performance)
 
