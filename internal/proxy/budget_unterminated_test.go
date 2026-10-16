@@ -73,7 +73,8 @@ func TestBudgetUnterminatedStreamChargesAtLeastTheHold(t *testing.T) {
 			if status != http.StatusOK || body != orUsageEvent(tc.cost) {
 				t.Fatalf("relay = %d %q, want the upstream bytes unchanged", status, body)
 			}
-			rows, evs := settle(t, h, clk, 1, 2)
+			// 2 reads per attempt plus 1 for TTFT at the first output delta.
+			rows, evs := settle(t, h, clk, 1, 3)
 			row := rows[0]
 			if row.Error != unterminatedErr || row.UsageKnown || row.Status != http.StatusOK {
 				t.Fatalf("row = %+v, want %q with usage unknown and status 200", row, unterminatedErr)
@@ -179,7 +180,8 @@ func TestBudgetCodexResponsesTerminal(t *testing.T) {
 			h.startBudget(gate)
 
 			drain(h, "/v1/responses", `{"model":"gpt-x","input":"hi","stream":true}`)
-			rows, evs := settle(t, h, clk, 1, 2)
+			// 2 reads per attempt plus 1 for TTFT at the first output delta.
+			rows, evs := settle(t, h, clk, 1, 3)
 			if rows[0].Error != tc.wantErr || rows[0].UsageKnown {
 				t.Fatalf("row = %+v, want error %q with usage unknown", rows[0], tc.wantErr)
 			}
