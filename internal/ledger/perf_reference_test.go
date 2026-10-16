@@ -45,7 +45,7 @@ func (s *refSet) add(r core.RequestRecord) {
 			d -= r.Usage.ReasoningTokens
 		}
 		g := r.LatencyMS - *r.TTFTMS
-		if d >= 2 && g >= 1 {
+		if d >= 2 && g >= 50 { // SPEC Amendment 1, A1
 			s.dec = append(s.dec, float64(d-1)*1000/float64(g))
 			s.decTok += float64(d - 1)
 			s.decMS += float64(g)

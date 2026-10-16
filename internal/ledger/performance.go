@@ -1,6 +1,7 @@
 package ledger
 
 import (
+	"container/heap"
 	"context"
 	"database/sql"
 	"fmt"
@@ -18,6 +19,14 @@ var _ core.PerfLedger = (*Ledger)(nil)
 // perfMaxRows caps the eligible rows one Performance call reads (SPEC
 // "Performance metrics"); a variable so tests can lower it.
 var perfMaxRows int64 = 2_000_000
+
+// perfMaxBreakdown caps the breakdown rows (core.AnalyticsMaxBreakdown); a
+// variable so tests can lower it.
+var perfMaxBreakdown = core.AnalyticsMaxBreakdown
+
+// perfMinDecodeMS is the shortest decode window G that yields a decode
+// sample (SPEC Amendment 1, A1).
+const perfMinDecodeMS = 50
 
 // perfEligible selects perf-eligible rows: proxied (latency known), 2xx and
 // no error.
@@ -46,11 +55,11 @@ func (l *Ledger) performance(ctx context.Context, q core.AnalyticsQuery, loc *ti
 	bounds := chunkBounds(q.From, q.To, starts)
 	chunkArgs := func(b [2]int64) []any { return append([]any{b[0], b[1]}, filterArgs...) }
 
-	ranked, err := l.perfRank(ctx, `SELECT `+groupCol+`, COUNT(*)`+where+` GROUP BY `+groupCol, bounds, chunkArgs)
+	ranked, nKeys, err := l.perfRank(ctx, `SELECT `+groupCol+`, COUNT(*)`+where+` GROUP BY `+groupCol+` ORDER BY `+groupCol, bounds, chunkArgs)
 	if err != nil {
 		return core.PerfResult{}, err
 	}
-	nBreak := min(len(ranked), core.AnalyticsMaxBreakdown)
+	nBreak := len(ranked)
 	nTop := min(topN, nBreak)
 	acc := perfAcc{
 		startMS: make([]int64, len(starts)),
@@ -61,7 +70,7 @@ func (l *Ledger) performance(ctx context.Context, q core.AnalyticsQuery, loc *ti
 	for i, s := range starts {
 		acc.startMS[i] = s.UnixMilli()
 	}
-	for i, k := range ranked[:nBreak] {
+	for i, k := range ranked {
 		acc.rank[k.key] = i
 	}
 	for i := range acc.points {
@@ -82,34 +91,28 @@ func (l *Ledger) performance(ctx context.Context, q core.AnalyticsQuery, loc *ti
 		return core.PerfResult{}, err
 	}
 
-	// Every set is summarized from its own pooled raw samples: pool (copy)
-	// first, then summarize concurrently (row sorts a set's slices in place).
-	var totals sampleSet
-	seriesTotals := make([]sampleSet, nTop+1)
-	for i, pts := range acc.points {
-		for j := range pts {
-			seriesTotals[i].merge(&pts[j])
-		}
-		totals.merge(&seriesTotals[i])
-	}
-	restTotals := make([]sampleSet, nBreak-nTop)
-	for i := range restTotals {
-		for c := range rest {
-			restTotals[i].merge(&rest[c][i])
-		}
-	}
-	rest = nil
-
-	nSeries := nTop
-	if seriesTotals[nTop].requests > 0 {
-		nSeries++ // __other__
-	}
-	series := make([]core.PerfSeries, nSeries)
+	// Every set is summarized from its own pooled raw samples, level by
+	// level: each level is summarized (row sorts in place), then pooled into
+	// the next and released, so at most two copies of the samples are live.
 	breakdown := make([]core.PerfRow, nBreak)
-	var totalsRow core.PerfRow
 	var g errgroup.Group
 	g.SetLimit(analyticsChunks)
-	g.Go(func() error { totalsRow = totals.row(""); return nil })
+	for i := range nBreak - nTop {
+		g.Go(func() error {
+			sets := make([]*sampleSet, len(rest))
+			for c := range rest {
+				sets[c] = &rest[c][i]
+			}
+			s := pool(sets)
+			breakdown[nTop+i] = s.row(ranked[nTop+i].key)
+			return nil
+		})
+	}
+	_ = g.Wait()
+	rest = nil
+
+	seriesTotals := make([]sampleSet, nTop+1)
+	series := make([]core.PerfSeries, nTop+1)
 	for i := range series {
 		key := core.AnalyticsOtherKey
 		if i < nTop {
@@ -117,21 +120,30 @@ func (l *Ledger) performance(ctx context.Context, q core.AnalyticsQuery, loc *ti
 		}
 		g.Go(func() error {
 			pts := acc.points[i]
-			s := core.PerfSeries{Key: key, Total: seriesTotals[i].row(key), Points: make([]core.PerfRow, len(pts))}
+			s := core.PerfSeries{Key: key, Points: make([]core.PerfRow, len(pts))}
+			sets := make([]*sampleSet, len(pts))
 			for j := range pts {
 				s.Points[j] = pts[j].row("")
+				sets[j] = &pts[j]
 			}
+			seriesTotals[i] = pool(sets)
+			s.Total = seriesTotals[i].row(key)
 			series[i] = s
 			return nil
 		})
 	}
-	for i := range restTotals {
-		g.Go(func() error { breakdown[nTop+i] = restTotals[i].row(ranked[nTop+i].key); return nil })
-	}
 	_ = g.Wait()
+	if series[nTop].Total.Requests == 0 {
+		series = series[:nTop] // no __other__
+	}
 	for i := range nTop {
 		breakdown[i] = series[i].Total
 	}
+	sets := make([]*sampleSet, len(seriesTotals))
+	for i := range seriesTotals {
+		sets[i] = &seriesTotals[i]
+	}
+	totals := pool(sets)
 
 	filters := make(map[string]string, len(q.Filters))
 	for k, v := range q.Filters {
@@ -145,9 +157,9 @@ func (l *Ledger) performance(ctx context.Context, q core.AnalyticsQuery, loc *ti
 		BucketStarts:     starts,
 		Group:            q.Group,
 		Filters:          filters,
-		Totals:           totalsRow,
+		Totals:           totals.row(""),
 		Breakdown:        breakdown,
-		BreakdownOmitted: len(ranked) - nBreak,
+		BreakdownOmitted: nKeys - nBreak,
 		Series:           series,
 	}, nil
 }
@@ -158,59 +170,109 @@ type perfKey struct {
 	requests int64
 }
 
-// perfRank runs the per-key COUNT query over every chunk, enforces
-// perfMaxRows and returns the keys ranked by requests desc, then key asc.
-func (l *Ledger) perfRank(ctx context.Context, query string, bounds [][2]int64, chunkArgs func([2]int64) []any) ([]perfKey, error) {
-	counts := make([]map[string]int64, len(bounds))
+// perfRank runs the per-key COUNT query (ordered by key) over every chunk,
+// enforces perfMaxRows and returns the best perfMaxBreakdown keys ranked by
+// requests desc, then key asc, plus the number of distinct keys. As in
+// rankKeys, the chunk streams are merged by key through a bounded heap, so
+// memory does not depend on the number of keys.
+func (l *Ledger) perfRank(ctx context.Context, query string, bounds [][2]int64, chunkArgs func([2]int64) []any) ([]perfKey, int, error) {
 	eg, egctx := errgroup.WithContext(ctx)
+	streams := make([]chan perfKey, len(bounds))
 	for c, b := range bounds {
+		ch := make(chan perfKey, 64)
+		streams[c] = ch
 		eg.Go(func() error {
+			defer close(ch)
 			rows, err := l.db.QueryContext(egctx, query, chunkArgs(b)...)
 			if err != nil {
 				return fmt.Errorf("ledger: performance: %w", err)
 			}
 			defer rows.Close()
-			m := map[string]int64{}
 			for rows.Next() {
-				var k string
-				var n int64
-				if err := rows.Scan(&k, &n); err != nil {
+				var k perfKey
+				if err := rows.Scan(&k.key, &k.requests); err != nil {
 					return fmt.Errorf("ledger: performance: %w", err)
 				}
-				m[k] = n
+				select {
+				case ch <- k:
+				case <-egctx.Done():
+					return egctx.Err()
+				}
 			}
 			if err := rows.Err(); err != nil {
 				return fmt.Errorf("ledger: performance: %w", err)
 			}
-			counts[c] = m
 			return nil
 		})
 	}
-	if err := eg.Wait(); err != nil {
-		return nil, err
+
+	// SQLite's default BINARY collation orders like Go string comparison.
+	heads := make([]perfKey, len(streams))
+	live := make([]bool, len(streams))
+	for c, ch := range streams {
+		heads[c], live[c] = <-ch
 	}
-	merged := map[string]int64{}
-	var n int64
-	for _, m := range counts {
-		for k, v := range m {
-			merged[k] += v
-			n += v
+	h := &perfHeap{}
+	nKeys, n := 0, int64(0)
+	for {
+		first := -1
+		for c := range streams {
+			if live[c] && (first < 0 || heads[c].key < heads[first].key) {
+				first = c
+			}
+		}
+		if first < 0 {
+			break
+		}
+		k := perfKey{key: heads[first].key}
+		for c, ch := range streams {
+			if live[c] && heads[c].key == k.key {
+				k.requests += heads[c].requests
+				heads[c], live[c] = <-ch
+			}
+		}
+		nKeys++
+		n += k.requests
+		switch {
+		case h.Len() < perfMaxBreakdown:
+			heap.Push(h, k)
+		case perfRankBefore(k, (*h)[0]):
+			(*h)[0] = k
+			heap.Fix(h, 0)
 		}
 	}
-	out := make([]perfKey, 0, len(merged))
-	for k, v := range merged {
-		out = append(out, perfKey{k, v})
+	// A failed stream closes early; its error is reported here.
+	if err := eg.Wait(); err != nil {
+		return nil, 0, err
 	}
 	if n > perfMaxRows {
-		return nil, fmt.Errorf("analytics: too many requests in range for performance stats (%d); narrow the range or add filters", n)
+		return nil, 0, fmt.Errorf("analytics: too many requests in range for performance stats (%d); narrow the range or add filters", n)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].requests != out[j].requests {
-			return out[i].requests > out[j].requests
-		}
-		return out[i].key < out[j].key
-	})
-	return out, nil
+	out := []perfKey(*h)
+	sort.Slice(out, func(i, j int) bool { return perfRankBefore(out[i], out[j]) })
+	return out, nKeys, nil
+}
+
+// perfRankBefore reports whether a ranks above b.
+func perfRankBefore(a, b perfKey) bool {
+	if a.requests != b.requests {
+		return a.requests > b.requests
+	}
+	return a.key < b.key
+}
+
+// perfHeap is a min-heap by rank: the lowest-ranked kept key is at [0].
+type perfHeap []perfKey
+
+func (h perfHeap) Len() int           { return len(h) }
+func (h perfHeap) Less(i, j int) bool { return perfRankBefore(h[j], h[i]) }
+func (h perfHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *perfHeap) Push(x any)        { *h = append(*h, x.(perfKey)) }
+func (h *perfHeap) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
 }
 
 // perfAcc routes scanned rows to sample sets. points is shared by the scan
@@ -298,7 +360,7 @@ func (s *sampleSet) add(o perfObs) {
 		if !o.firstReasoning {
 			d -= o.reasoning // hidden reasoning finished before the first visible token
 		}
-		if g := o.latency - o.ttft; d >= 2 && g >= 1 {
+		if g := o.latency - o.ttft; d >= 2 && g >= perfMinDecodeMS {
 			s.decode = append(s.decode, float64(d-1)*1000/float64(g))
 			s.decodeTok += float64(d - 1)
 			s.decodeMS += float64(g)
@@ -318,6 +380,27 @@ func (s *sampleSet) merge(o *sampleSet) {
 	s.decodeMS += o.decodeMS
 	s.e2eTok += o.e2eTok
 	s.e2eMS += o.e2eMS
+}
+
+// pool moves the samples of sets into one new, exactly sized set, releasing
+// each input's samples once copied.
+func pool(sets []*sampleSet) sampleSet {
+	var nLat, nTTFT, nDec, nE2E int
+	for _, s := range sets {
+		nLat += len(s.latency)
+		nTTFT += len(s.ttft)
+		nDec += len(s.decode)
+		nE2E += len(s.e2e)
+	}
+	p := sampleSet{
+		latency: make([]float64, 0, nLat), ttft: make([]float64, 0, nTTFT),
+		decode: make([]float64, 0, nDec), e2e: make([]float64, 0, nE2E),
+	}
+	for _, s := range sets {
+		p.merge(s)
+		*s = sampleSet{}
+	}
+	return p
 }
 
 // row summarizes s. It sorts s's sample slices in place.

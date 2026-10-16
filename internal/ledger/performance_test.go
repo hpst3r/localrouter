@@ -282,6 +282,64 @@ func TestPerfBreakdownCap(t *testing.T) {
 	}
 }
 
+// TestPerfDecodeMinWindow: decode samples need G >= 50 ms (SPEC Amendment 1,
+// A1); shorter windows still count toward latency, TTFT and e2e.
+func TestPerfDecodeMinWindow(t *testing.T) {
+	l, _ := openTest(t, nil)
+	ts := time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC)
+	record(t, l,
+		streamed(ts, "m", 149, 100, 11, 0, false), // G = 49: excluded
+		streamed(ts, "m", 150, 100, 11, 0, false), // G = 50: 10 tokens / 50 ms
+	)
+	tot := mustPerf(t, l, core.AnalyticsQuery{From: ts, To: ts.Add(time.Hour), Bucket: "hour", Group: "model"}, time.UTC).Totals
+	if d := tot.DecodeTPS; d == nil || d.N != 1 || !near(d.Min, 200) {
+		t.Fatalf("decode = %+v", d)
+	}
+	if w := tot.DecodeTPSWeighted; w == nil || !near(*w, 200) {
+		t.Fatalf("decode weighted = %v", w)
+	}
+	if tot.LatencyMS.N != 2 || tot.TTFTMS.N != 2 || tot.E2ETPS.N != 2 {
+		t.Fatalf("other metrics: %+v", tot)
+	}
+}
+
+// TestPerfBoundedRanking lowers the breakdown cap below the number of keys,
+// spread over buckets in different scan chunks: only the top perfMaxBreakdown
+// keys (counts merged across chunks) get breakdown rows; the rest count
+// toward Totals and __other__ and in BreakdownOmitted (SPEC Amendment 1, A4).
+func TestPerfBoundedRanking(t *testing.T) {
+	defer func(v int) { perfMaxBreakdown = v }(perfMaxBreakdown)
+	perfMaxBreakdown = 3
+	l, _ := openTest(t, nil)
+	ts := time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)
+	var rs []core.RequestRecord
+	// Key i has 1+i%4 requests on each of days 0 and 9 (separate chunks):
+	// ranks are k3, k7 (8 each), then k2 (6, beating k6 by key).
+	for i := range 10 {
+		for range 1 + i%4 {
+			for _, day := range []int{0, 9} {
+				rs = append(rs, pr(ts.AddDate(0, 0, day), fmt.Sprintf("k%d", i), int64(10+i), nil))
+			}
+		}
+	}
+	record(t, l, rs...)
+	res := mustPerf(t, l, core.AnalyticsQuery{From: ts, To: ts.AddDate(0, 0, 10), Bucket: "day", Group: "model", TopN: 1}, time.UTC)
+	keys := []string{}
+	for _, b := range res.Breakdown {
+		keys = append(keys, b.Key)
+	}
+	if !reflect.DeepEqual(keys, []string{"k3", "k7", "k2"}) || res.BreakdownOmitted != 7 {
+		t.Fatalf("breakdown %v omitted %d", keys, res.BreakdownOmitted)
+	}
+	if res.Breakdown[1].Requests != 8 || res.Breakdown[2].Requests != 6 || res.Breakdown[2].LatencyMS.N != 6 {
+		t.Fatalf("breakdown rows: %+v %+v", res.Breakdown[1], res.Breakdown[2])
+	}
+	if res.Totals.Requests != int64(len(rs)) || len(res.Series) != 2 || res.Series[0].Key != "k3" ||
+		res.Series[1].Total.Requests != int64(len(rs))-8 || res.Series[1].Total.LatencyMS.N != int64(len(rs))-8 {
+		t.Fatalf("totals %d series %+v", res.Totals.Requests, res.Series)
+	}
+}
+
 // TestPerfBucketsMatchAnalytics checks that the same query yields the same
 // bucket starts and per-point requests as Analytics (hour and DST days).
 func TestPerfBucketsMatchAnalytics(t *testing.T) {
