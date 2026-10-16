@@ -329,9 +329,11 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   let S = readHash();
   // Last fetched documents.
   const data = { status: null, main: null, hosts: null, spark: null, clients: null, perf: null };
+  let perfView = "";               // group + filters that data.perf was fetched for
   let hidden = new Set();          // series keys toggled off in the legend
   let perfHidden = new Set();      // same for the performance chart
-  let colors = new Map();          // key -> palette slot for the current result
+  let colors = new Map();          // key -> palette slot for the current usage result
+  let perfColors = new Map();      // same for the performance result (see assignPerfColors)
   let sort = { col: "metric", dir: -1 };
   let perfSort = { col: "requests", dir: -1 };
   let hovering = false, pendingChart = false, seq = 0, lastWidth = 0;
@@ -355,7 +357,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     return e;
   }
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
-  function swatch(key) { const s = el("span", "swatch"); s.style.background = colorOf(key); return s; }
+  function swatch(key, map) { const s = el("span", "swatch"); s.style.background = colorOf(key, map); return s; }
 
   // ======================================================================
   // Formatting
@@ -384,7 +386,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   function shareText(f) { return !f ? "0%" : f < 0.01 ? "<1%" : Math.round(f * 100) + "%"; }
   // Durations in ms ("850 ms", "1.2 s", "2.5 min") and rates ("42 tok/s").
   function fmtMs(v) {
-    if (v < 1000) return Math.round(v) + " ms";
+    if (Math.round(v) < 1000) return Math.round(v) + " ms";   // round first: 999.6 is "1 s", not "1000 ms"
     if (v < 100000) return (v / 1000).toFixed(v < 10000 ? 2 : 1).replace(/\.?0+$/, "") + " s";
     if (v < 120000) return Math.round(v / 1000) + " s";
     return +(v / 60000).toFixed(1) + " min";
@@ -446,13 +448,31 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
       used.add(slot); colors.set(s.key, slot);
     });
   }
-  // One mapping for both charts: usage series first (so their colors don't
-  // depend on the perf view), then performance-only keys.
-  function syncColors() {
-    assignColors(((data.main && data.main.series) || []).concat((data.perf && data.perf.series) || []));
+  // Performance mapping: keys also in the usage view keep their usage color;
+  // perf-only keys take slots the usage view left free, then slots unused in
+  // the perf chart. Two perf lines share a color only past PALETTE_SIZE keys.
+  function assignPerfColors(series) {
+    perfColors = new Map();
+    const usage = new Set(colors.values()), mine = new Set();
+    const keys = series.map((s) => s.key).filter((k, i, a) => k !== OTHER && a.indexOf(k) === i);
+    keys.forEach((k) => { if (colors.has(k)) { perfColors.set(k, colors.get(k)); mine.add(colors.get(k)); } });
+    keys.forEach((k) => {
+      if (perfColors.has(k)) return;
+      const start = hash(k) % PALETTE_SIZE, probe = (taken) => {
+        for (let i = 0; i < PALETTE_SIZE; i++) { const s = (start + i) % PALETTE_SIZE; if (!taken(s)) return s; }
+        return -1;
+      };
+      let slot = probe((s) => usage.has(s) || mine.has(s));
+      if (slot < 0) slot = probe((s) => mine.has(s));
+      if (slot < 0) slot = start;
+      mine.add(slot); perfColors.set(k, slot);
+    });
   }
   // Keys outside the top-N series are folded into "Other" in the chart, so they share its grey.
-  function colorOf(key) { return colors.has(key) ? "var(--s" + colors.get(key) + ")" : "var(--other)"; }
+  function colorOf(key, map) {
+    map = map || colors;
+    return map.has(key) ? "var(--s" + map.get(key) + ")" : "var(--other)";
+  }
 
   // ======================================================================
   // URL hash state
@@ -465,7 +485,8 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     if (!st.from && RANGES.indexOf(st.range) < 0) st.range = "7d";
     if (DIMS.indexOf(st.group) < 0) st.group = "model";
     if (!METRICS.some((m) => m[0] === st.metric)) st.metric = "tokens";
-    if (!PM[st.pm]) st.pm = "ttft";
+    // Explicit lists, never object lookups: "toString" or "__proto__" must not pass.
+    if (!PERF_METRICS.some((m) => m[0] === st.pm)) st.pm = "ttft";
     if (PERF_STATS.indexOf(st.ps) < 0) st.ps = "p50";
     p.forEach((v, k) => { if (k.startsWith("f.") && DIMS.indexOf(k.slice(2)) >= 0) st.filters[k.slice(2)] = v; });
     return st;
@@ -541,6 +562,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   // and the performance view (same time range, group, filters and top as the main view).
   function refresh() {
     const my = ++seq;
+    const view = JSON.stringify([S.group, Object.keys(S.filters).sort().map((k) => [k, S.filters[k]])]);
     const main = timeParams(new URLSearchParams());
     main.set("group", S.group); main.set("top", "8");
     Object.keys(S.filters).forEach((k) => main.set("filter." + k, S.filters[k]));
@@ -563,7 +585,9 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
         if (res[2].ok) data.hosts = res[2].v;
         if (res[3].ok) data.spark = res[3].v;
         if (res[4].ok) data.clients = res[4].v;
-        data.perf = res[5].ok ? res[5].v : (unauthorized ? null : data.perf);
+        // On failure keep the last perf doc only if it shows the current group and filters.
+        if (res[5].ok) { data.perf = res[5].v; perfView = view; }
+        else if (unauthorized || perfView !== view) { data.perf = null; perfView = ""; }
         renderAll();
         $("updated").textContent = res[0].ok ? "updated " + new Date().toLocaleTimeString()
           : unauthorized ? "key required" : "update failed " + new Date().toLocaleTimeString();
@@ -763,7 +787,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   }
   function renderView() {
     const doc = data.main;
-    syncColors();
+    assignColors((doc && doc.series) || []);
     renderCrumbs(); renderKpis(); renderLegend(); renderChart(); renderTable();
     $("usagenote").textContent = doc ? "by " + S.group + " · " + (S.from ? "zoomed" : S.range) + " · " + (doc.bucket === "day" ? "daily" : "hourly") + " buckets" : "";
   }
@@ -816,11 +840,11 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   }
 
   function renderLegend() {
-    legendChips($("legend"), (data.main && data.main.series) || [], hidden,
+    legendChips($("legend"), (data.main && data.main.series) || [], hidden, colors,
       (s) => fmtMetric(S.metric, metricOf(s.total, S.metric)), () => { renderLegend(); renderChart(); });
   }
   // Legend chips: the main button toggles key in off (then calls redraw), the arrow drills down.
-  function legendChips(root, series, off, valueText, redraw) {
+  function legendChips(root, series, off, cmap, valueText, redraw) {
     clear(root);
     if (series.length < 2) return;   // a single series is named by the header
     series.forEach((s) => {
@@ -829,7 +853,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
       main.type = "button";
       main.setAttribute("aria-pressed", String(!off.has(s.key)));
       main.title = "Show/hide " + keyLabel(s.key);
-      main.appendChild(swatch(s.key));
+      main.appendChild(swatch(s.key, cmap));
       main.appendChild(el("span", null, keyLabel(s.key)));
       main.appendChild(el("span", "l-val num", valueText(s)));
       main.addEventListener("click", () => {
@@ -1149,17 +1173,19 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
   function perfVal(row, pm, ps) { const d = distOf(row, pm); return d ? d[statKey(pm, ps)] : null; }
   const perfName = (pm) => PERF_METRICS.find((x) => x[0] === pm)[1];
   // e.g. "median TTFT", "p90 latency", "slowest 10% decode speed"
-  function perfTitle() {
+  function perfTitle(pm, ps) {
     const lower = (s) => s.replace(/^[A-Z](?=[a-z])/, (c) => c.toLowerCase());   // keeps "TTFT", "E2E"
-    return lower(statLabel(S.pm, S.ps)) + " " + lower(perfName(S.pm));
+    return lower(statLabel(pm, ps)) + " " + lower(perfName(pm));
   }
-  let perfGeo = null;   // geometry of the drawn perf chart, for hover
+  // The drawn perf chart (doc, metric, statistic, colors, geometry), so a
+  // deferred redraw never mixes new data into the hover of the old drawing.
+  let perfGeo = null;
 
   function renderPerf() {
     const doc = data.perf;
-    syncColors();
+    assignPerfColors((doc && doc.series) || []);
     renderPerfKpis(); renderPerfMsg(); renderPerfLegend(); renderPerfChart(); renderPerfTable();
-    $("perfnote").textContent = doc ? perfTitle() + " by " + S.group + " · " + (doc.bucket === "day" ? "daily" : "hourly") + " buckets" : "";
+    $("perfnote").textContent = doc ? perfTitle(S.pm, S.ps) + " by " + S.group + " · " + (doc.bucket === "day" ? "daily" : "hourly") + " buckets" : "";
   }
   function renderPerfKpis() {
     const root = $("pkpis");
@@ -1182,31 +1208,20 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
       root.appendChild(box);
     });
   }
-  // Partial-history note: TTFT/decode only exist for streamed requests proxied since the feature.
+  // Partial-history note: shown when some bucket has eligible requests but no TTFT sample.
   function renderPerfMsg() {
-    const doc = data.perf, t = doc && doc.totals, box = $("pmsg");
-    let msg = "";
-    if (t && t.requests > 0) {
-      if (!t.ttft_ms) msg = "TTFT and decode speed are recorded only for streamed requests proxied since performance tracking was added; this view has latency and E2E speed only.";
-      else {
-        const since = ttftSince(doc);
-        if (since > 0) msg = "TTFT and decode speed are recorded only since " + bucketLabel(doc.bucket_starts[since], doc.bucket, true) +
-          " (streamed requests proxied since performance tracking was added); earlier requests have latency and E2E speed only.";
-      }
-    }
+    const doc = data.perf, box = $("pmsg");
+    const msg = doc && noTTFTBucket(doc) ? "TTFT and decode speed exist only for streamed requests recorded since performance tracking was added; other requests show latency and E2E speed only." : "";
     box.textContent = msg;
     box.classList.toggle("hidden", !msg);
   }
-  // First bucket with any TTFT sample, if earlier buckets have requests without one; else 0.
-  function ttftSince(doc) {
-    const has = (i, f) => doc.series.some((s) => s.points[i] && s.points[i][f]);
-    for (let i = 0; i < doc.bucket_starts.length; i++) {
-      if (has(i, "ttft_ms")) { for (let j = 0; j < i; j++) if (has(j, "latency_ms")) return i; return 0; }
-    }
-    return 0;
+  function noTTFTBucket(doc) {
+    const series = doc.series || [];
+    return (doc.bucket_starts || []).some((_, i) => series.some((s) => s.points[i] && s.points[i].requests > 0) &&
+      !series.some((s) => s.points[i] && s.points[i].ttft_ms));
   }
   function renderPerfLegend() {
-    legendChips($("plegend"), (data.perf && data.perf.series) || [], perfHidden,
+    legendChips($("plegend"), (data.perf && data.perf.series) || [], perfHidden, perfColors,
       (s) => fmtPerf(S.pm, perfVal(s.total, S.pm, S.ps)), () => { renderPerfLegend(); renderPerfChart(); });
   }
 
@@ -1216,9 +1231,10 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
     if (perfHovering || $("psvg").contains(document.activeElement)) { pendingPerf = true; return; }
     pendingPerf = false;
     const host = $("pchart"), root = $("psvg");
-    clear(root); hidePerfTip(); perfGeo = null;
     const W = host.clientWidth, H = host.clientHeight;
+    // Not laid out yet: keep the current drawing and retry on the next frame.
     if (W < 80 || H < 60) { pendingPerf = true; requestAnimationFrame(() => { if (pendingPerf) renderPerfChart(); }); return; }
+    clear(root); hidePerfTip(); perfGeo = null;
     perfWidth = W;
     root.setAttribute("viewBox", "0 0 " + W + " " + H);
     const doc = data.perf, pm = S.pm, ps = S.ps;
@@ -1258,45 +1274,46 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
         const prev = i > 0 && vals[i - 1] !== null, next = i < n - 1 && vals[i + 1] !== null;
         const px = xc(i).toFixed(1), py = y(v).toFixed(1);
         if (prev || next) d += (prev ? "L" : "M") + px + "," + py;
-        else { const c = svg("circle", { cx: px, cy: py, r: 3, class: "pdot" }); c.style.fill = colorOf(s.key); g.appendChild(c); }
+        else { const c = svg("circle", { cx: px, cy: py, r: 3, class: "pdot" }); c.style.fill = colorOf(s.key, perfColors); g.appendChild(c); }
       });
-      if (d) { const p = svg("path", { d: d, class: "pline" }); p.style.stroke = colorOf(s.key); g.insertBefore(p, g.firstChild); }
+      if (d) { const p = svg("path", { d: d, class: "pline" }); p.style.stroke = colorOf(s.key, perfColors); g.insertBefore(p, g.firstChild); }
       root.appendChild(g);
     });
     const hover = svg("g", {});
     root.appendChild(hover);
-    perfGeo = { xc: xc, y: y, top: M.t, bottom: M.t + ph, series: series, hover: hover };
+    perfGeo = { doc: doc, pm: pm, ps: ps, colors: perfColors, xc: xc, y: y, top: M.t, bottom: M.t + ph, series: series, hover: hover };
     root.setAttribute("aria-label", perfSummary(doc, series));
   }
   function perfSummary(doc, series) {
     const t = doc.totals;
     const top = series.slice(0, 3).map((s) => keyLabel(s.key) + " " + fmtPerf(S.pm, perfVal(s.total, S.pm, S.ps))).join(", ");
-    return "Line chart of " + perfTitle() + " by " + S.group + ", " + doc.bucket_starts.length + " " + doc.bucket + " buckets; overall " +
+    return "Line chart of " + perfTitle(S.pm, S.ps) + " by " + S.group + ", " + doc.bucket_starts.length + " " + doc.bucket + " buckets; overall " +
       fmtPerf(S.pm, perfVal(t, S.pm, S.ps)) + " over " + fmtCount(distOf(t, S.pm).n) + " samples" + (top ? "; " + top : "") +
       ". The performance table below has the same data.";
   }
   function showPerfTip(i, cx, cy) {
-    const doc = data.perf, geo = perfGeo, tip = $("ptip");
-    if (!doc || !geo) return;
+    const geo = perfGeo, tip = $("ptip");
+    if (!geo) return;
+    const doc = geo.doc, pm = geo.pm, ps = geo.ps;
     clear(tip);
     tip.appendChild(el("div", "tip-title", bucketLabel(doc.bucket_starts[i], doc.bucket, true)));
-    const rows = geo.series.map((s) => ({ s: s, v: perfVal(s.points[i], S.pm, S.ps), d: distOf(s.points[i], S.pm) }));
+    const rows = geo.series.map((s) => ({ s: s, v: perfVal(s.points[i], pm, ps), d: distOf(s.points[i], pm) }));
     rows.sort((a, b) => (a.v === null) - (b.v === null) || (b.v || 0) - (a.v || 0));
     clear(geo.hover);
     geo.hover.appendChild(svg("line", { x1: geo.xc(i), x2: geo.xc(i), y1: geo.top, y2: geo.bottom, class: "guide" }));
     rows.forEach((r) => {
       const row = el("div", "tip-row");
-      row.appendChild(swatch(r.s.key));
+      row.appendChild(swatch(r.s.key, geo.colors));
       row.appendChild(el("span", "tk", keyLabel(r.s.key)));
-      row.appendChild(el("span", null, fmtPerf(S.pm, r.v)));
+      row.appendChild(el("span", null, fmtPerf(pm, r.v)));
       row.appendChild(el("span", "ts", "n " + fmtCount(r.d ? r.d.n : 0)));
       tip.appendChild(row);
       if (r.v === null) return;
       const c = svg("circle", { cx: geo.xc(i), cy: geo.y(r.v), r: 4, class: "pmark" });
-      c.style.fill = colorOf(r.s.key);
+      c.style.fill = colorOf(r.s.key, geo.colors);
       geo.hover.appendChild(c);
     });
-    tip.appendChild(el("div", "tip-hint", perfTitle() + " · n = samples"));
+    tip.appendChild(el("div", "tip-hint", perfTitle(pm, ps) + " · n = samples"));
     placeTip(tip, $("pchart"), cx, cy);
     $("psvg").querySelectorAll(".hit").forEach((h) => h.classList.toggle("hot", Number(h.dataset.pi) === i));
   }
@@ -1371,7 +1388,7 @@ footer { margin-top: 26px; display: flex; justify-content: space-between; align-
       const tr = el("tr", "click");
       tr.tabIndex = 0;
       tr.title = "Drill into " + keyLabel(r.key);
-      const kt = el("td", "key"); kt.appendChild(swatch(r.key)); kt.appendChild(document.createTextNode(keyLabel(r.key)));
+      const kt = el("td", "key"); kt.appendChild(swatch(r.key, perfColors)); kt.appendChild(document.createTextNode(keyLabel(r.key)));
       tr.appendChild(kt);
       PCOLS.slice(1).forEach(([, , getv, fmt]) => {
         const v = getv(r);
