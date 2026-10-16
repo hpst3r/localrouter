@@ -15,7 +15,10 @@ See [the specification](docs/SPEC.md) for the behavior contract and
 [Network deployment and operations](docs/NETWORK.md) for secure central-server
 setup, remote verification, key rotation, troubleshooting, and backup/restore.
 For the container image under rootless Podman/Quadlet with an NGINX TLS edge,
-see [Container deployment](docs/CONTAINERS.md).
+see [Container deployment](docs/CONTAINERS.md). For the read-only MCP adapter
+that lets an agent read quota status, summarize recorded usage and dry-run
+admission (`localrouter mcp`), see [MCP adapter](docs/MCP.md); the matching agent
+workflow ships in [`skills/localrouter-usage/`](skills/localrouter-usage/SKILL.md).
 
 ## Build
 
