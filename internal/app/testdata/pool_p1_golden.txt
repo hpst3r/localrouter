@@ -1,0 +1,75 @@
+== interactive ok: POST /v1/responses
+status 200 retry-after=""
+{"id":"resp-a","object":"response","usage":{"input_tokens":10,"output_tokens":5}}
+== interactive failover: POST /v1/responses
+status 200 retry-after=""
+{"id":"resp-b","object":"response","usage":{"input_tokens":10,"output_tokens":5}}
+== background order: POST /v1/responses
+status 200 retry-after=""
+{"id":"resp-b","object":"response","usage":{"input_tokens":10,"output_tokens":5}}
+== session label: POST /v1/responses
+status 200 retry-after=""
+{"id":"resp-a","object":"response","usage":{"input_tokens":10,"output_tokens":5}}
+== chat: POST /v1/chat/completions
+status 200 retry-after=""
+{"id":"resp-a","object":"response","usage":{"input_tokens":10,"output_tokens":5}}
+== capability unsupported: POST /v1/responses
+status 400 retry-after=""
+{"error":{"message":"localrouter: no account supports the capabilities this request needs","type":"capability_unsupported"}}
+== capability ok: POST /v1/responses
+status 200 retry-after=""
+{"id":"resp-a","object":"response","usage":{"input_tokens":10,"output_tokens":5}}
+== dead upstream: POST /v1/responses
+status 502 retry-after=""
+{"error":{"message":"localrouter: upstream unreachable","type":"upstream_error"}}
+== breaker refusal: POST /v1/responses
+status 503 retry-after="10"
+{"error":{"message":"localrouter: upstream unreachable: dead","type":"upstream_unavailable"}}
+== unknown model: POST /v1/responses
+status 404 retry-after=""
+{"error":{"message":"localrouter: unknown model","type":"model_not_found"}}
+== admit {"class":"interactive","model":"m1"}: POST /control/v1/admit
+status 200 retry-after=""
+{"decision":"allow","account_id":"a","reason":"admitted a"}
+== admit {"class":"background","model":"m1"}: POST /control/v1/admit
+status 200 retry-after=""
+{"decision":"allow","account_id":"b","reason":"admitted b"}
+== admit {"class":"interactive","model":"m3"}: POST /control/v1/admit
+status 200 retry-after=""
+{"decision":"deny","account_id":"","reason":"dead: upstream unreachable (breaker open until 2026-10-01T12:00:10Z)"}
+== admit {"class":"interactive","account":"b"}: POST /control/v1/admit
+status 200 retry-after=""
+{"decision":"allow","account_id":"b","reason":"admitted b"}
+== admit {"class":"interactive","model":"m2","requirements":{"protocol":"responses","tools":true}}: POST /control/v1/admit
+status 400 retry-after=""
+{"error":{"message":"localrouter: capability requirements must name at least one input modality","type":"capability_requirements_required"}}
+== admit {"class":"interactive","model":"m2","requirements":{"protocol":"responses","input_modalities":["text"]}}: POST /control/v1/admit
+status 400 retry-after=""
+{"error":{"message":"localrouter: capability requirements must name at least one input modality","type":"capability_requirements_required"}}
+== status: GET /control/v1/status
+status 200 retry-after=""
+{"schema_version":1,"now":"2026-10-01T12:00:00Z","accounts":[{"id":"a","provider":"openai_compat","healthy":true,"cooldown_until":null,"inflight":0,"reserve":{},"windows":[],"background_admissible":true,"interactive_admissible":true,"snapshot_age_s":null,"stale":true,"error":null,"breaker":{"state":"closed","consecutive_failures":0}},{"id":"b","provider":"openai_compat","healthy":true,"cooldown_until":null,"inflight":0,"reserve":{},"windows":[],"background_admissible":true,"interactive_admissible":true,"snapshot_age_s":null,"stale":true,"error":null,"breaker":{"state":"closed","consecutive_failures":0}},{"id":"dead","provider":"openai_compat","healthy":false,"cooldown_until":null,"inflight":0,"reserve":{},"windows":[],"background_admissible":false,"interactive_admissible":false,"snapshot_age_s":null,"stale":true,"error":null,"reason":"upstream unreachable (breaker open until 2026-10-01T12:00:10Z)","breaker":{"state":"open","consecutive_failures":1,"open_until":"2026-10-01T12:00:10Z"}}],"clients":[{"name":"ide","class":"interactive","host":"goldenhost","ingest":false},{"name":"bot","class":"background","host":"goldenhost","ingest":false}]}
+== diagnostics: GET /control/v1/diagnostics
+status 200 retry-after=""
+{"schema_version":1,"now":"2026-10-01T12:00:00Z","ready":true,"storage":{"configured":true,"ok":true},"inflight":{"global_limit":0,"global_active":0,"global_peak":1,"clients":[]},"reload":{"generation":1,"ok":true,"at":"2026-10-01T12:00:00Z"},"accounts":[{"id":"a","provider":"openai_compat","healthy":false,"stale":true,"cooldown":false,"snapshot_age_s":null},{"id":"b","provider":"openai_compat","healthy":false,"stale":true,"cooldown":false,"snapshot_age_s":null},{"id":"dead","provider":"openai_compat","healthy":false,"stale":true,"cooldown":false,"reason":"upstream unreachable (breaker open until 2026-10-01T12:00:10Z)","snapshot_age_s":null}]}
+== ledger
+id=ID1 started_at=1790856000000 finished_at=1790856000000 client=ide class=interactive route=r1 model=m1 provider=openai_compat account_id=a upstream_identity=a status=200 failover_of=<nil> input_tokens=10 cached_input_tokens=0 output_tokens=5 reasoning_tokens=0 usage_known=1 cost_usd=<nil> cost_basis=<nil> latency_ms=0 bytes_out=82 session= task= agent= error= cache_creation_input_tokens=0 host=goldenhost upstream_model=up-m1 pricing_model=<nil>
+id=ID2 started_at=1790856000000 finished_at=1790856000000 client=ide class=interactive route=r1 model=m1 provider=openai_compat account_id=a upstream_identity=a status=502 failover_of=<nil> input_tokens=0 cached_input_tokens=0 output_tokens=0 reasoning_tokens=0 usage_known=0 cost_usd=<nil> cost_basis=<nil> latency_ms=0 bytes_out=0 session= task= agent= error=upstream 502; failing over cache_creation_input_tokens=0 host=goldenhost upstream_model=up-m1 pricing_model=<nil>
+id=ID3 started_at=1790856000000 finished_at=1790856000000 client=ide class=interactive route=r1 model=m1 provider=openai_compat account_id=b upstream_identity=b status=200 failover_of=ID2 input_tokens=10 cached_input_tokens=0 output_tokens=5 reasoning_tokens=0 usage_known=1 cost_usd=<nil> cost_basis=<nil> latency_ms=0 bytes_out=82 session= task= agent= error= cache_creation_input_tokens=0 host=goldenhost upstream_model=up-m1 pricing_model=<nil>
+id=ID4 started_at=1790856000000 finished_at=1790856000000 client=bot class=background route=r1 model=m1 provider=openai_compat account_id=b upstream_identity=b status=200 failover_of=<nil> input_tokens=10 cached_input_tokens=0 output_tokens=5 reasoning_tokens=0 usage_known=1 cost_usd=<nil> cost_basis=<nil> latency_ms=0 bytes_out=82 session= task= agent= error= cache_creation_input_tokens=0 host=goldenhost upstream_model=up-m1 pricing_model=<nil>
+id=ID5 started_at=1790856000000 finished_at=1790856000000 client=ide class=interactive route=r1 model=m1 provider=openai_compat account_id=a upstream_identity=a status=200 failover_of=<nil> input_tokens=10 cached_input_tokens=0 output_tokens=5 reasoning_tokens=0 usage_known=1 cost_usd=<nil> cost_basis=<nil> latency_ms=0 bytes_out=82 session=sess-1 task= agent= error= cache_creation_input_tokens=0 host=goldenhost upstream_model=up-m1 pricing_model=<nil>
+id=ID6 started_at=1790856000000 finished_at=1790856000000 client=ide class=interactive route=r1 model=m1 provider=openai_compat account_id=a upstream_identity=a status=200 failover_of=<nil> input_tokens=10 cached_input_tokens=0 output_tokens=5 reasoning_tokens=0 usage_known=1 cost_usd=<nil> cost_basis=<nil> latency_ms=0 bytes_out=82 session= task= agent= error= cache_creation_input_tokens=0 host=goldenhost upstream_model=up-m1 pricing_model=<nil>
+id=ID7 started_at=1790856000000 finished_at=1790856000000 client=ide class=interactive route=r2 model=m2 provider=openai_compat account_id=a upstream_identity=a status=200 failover_of=<nil> input_tokens=10 cached_input_tokens=0 output_tokens=5 reasoning_tokens=0 usage_known=1 cost_usd=<nil> cost_basis=<nil> latency_ms=0 bytes_out=82 session= task= agent= error= cache_creation_input_tokens=0 host=goldenhost upstream_model=m2 pricing_model=m2
+id=ID8 started_at=1790856000000 finished_at=1790856000000 client=ide class=interactive route=r3 model=m3 provider=openai_compat account_id=dead upstream_identity=dead status=0 failover_of=<nil> input_tokens=0 cached_input_tokens=0 output_tokens=0 reasoning_tokens=0 usage_known=0 cost_usd=<nil> cost_basis=<nil> latency_ms=0 bytes_out=0 session= task= agent= error=upstream transport error: dial tcp DEADHOST: connect: connection refused cache_creation_input_tokens=0 host=goldenhost upstream_model=m3 pricing_model=<nil>
+== log events
+{"level":"INFO","msg":"attempt completed","event":"routing_attempt_completed","request_id":"ID1","attempt_id":"ID1","client":"ide","account":"a","provider":"openai_compat","class":"interactive","status":200,"outcome":"success","auth_retry":false,"failover_eligible":false,"latency_ms":0}
+{"level":"INFO","msg":"attempt completed","event":"routing_attempt_completed","request_id":"ID2","attempt_id":"ID2","client":"ide","account":"a","provider":"openai_compat","class":"interactive","status":502,"outcome":"upstream_error","auth_retry":false,"failover_eligible":true,"latency_ms":0}
+{"level":"INFO","msg":"attempt completed","event":"routing_attempt_completed","request_id":"ID2","attempt_id":"ID3","client":"ide","account":"b","provider":"openai_compat","class":"interactive","status":200,"outcome":"success","auth_retry":false,"failover_eligible":false,"latency_ms":0,"failover_of":"ID2"}
+{"level":"INFO","msg":"attempt completed","event":"routing_attempt_completed","request_id":"ID4","attempt_id":"ID4","client":"bot","account":"b","provider":"openai_compat","class":"background","status":200,"outcome":"success","auth_retry":false,"failover_eligible":false,"latency_ms":0}
+{"level":"INFO","msg":"attempt completed","event":"routing_attempt_completed","request_id":"ID5","attempt_id":"ID5","client":"ide","account":"a","provider":"openai_compat","class":"interactive","status":200,"outcome":"success","auth_retry":false,"failover_eligible":false,"latency_ms":0}
+{"level":"INFO","msg":"attempt completed","event":"routing_attempt_completed","request_id":"ID6","attempt_id":"ID6","client":"ide","account":"a","provider":"openai_compat","class":"interactive","status":200,"outcome":"success","auth_retry":false,"failover_eligible":false,"latency_ms":0}
+{"level":"INFO","msg":"attempt completed","event":"routing_attempt_completed","request_id":"ID7","attempt_id":"ID7","client":"ide","account":"a","provider":"openai_compat","class":"interactive","status":200,"outcome":"success","auth_retry":false,"failover_eligible":false,"latency_ms":0}
+{"level":"INFO","msg":"attempt completed","event":"routing_attempt_completed","request_id":"ID8","attempt_id":"ID8","client":"ide","account":"dead","provider":"openai_compat","class":"interactive","status":0,"outcome":"transport_error","auth_retry":false,"failover_eligible":true,"latency_ms":0}
+{"level":"INFO","msg":"policy denied","class":"interactive","reason":"dead: excluded"}
+{"level":"INFO","msg":"policy denied","class":"interactive","reason":"dead: upstream unreachable (breaker open until 2026-10-01T12:00:10Z)"}
+{"level":"INFO","msg":"policy denied","client":"ide","class":"interactive","model":"m3","reason":"dead: upstream unreachable (breaker open until 2026-10-01T12:00:10Z)","denial":"breaker_open"}
