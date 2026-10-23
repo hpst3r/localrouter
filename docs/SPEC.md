@@ -1122,9 +1122,9 @@ The TypeSafe SDK pointed at `http://<router>` appends `/v1/systemone`, so it
 works with only a base-URL and key change. `/v1/decisions` serves any
 OpenRouter decision model (e.g. `typesafe/jev-1.14`,
 `openai/gpt-6-luna-decisions`). OpenAI's native `/v1/decisions` body uses
-`input` instead of `state`; v1 does not translate it: a `/v1/decisions` body
-with `input` and no `state` is 400 `decision_unsupported` with a message
-telling the caller to send `state`.
+`input` instead of `state`; v1 does not translate it: a top-level `input`
+member on either decision path, with or without `state`, is 400
+`decision_unsupported` with a message telling the caller to send `state`.
 
 **Opt-in.** With no route declaring `systemone`/`decisions`, both paths are not
 registered (the same 404 `invalid_request_error` as any unknown path), the
@@ -1230,14 +1230,24 @@ Strict decoding and bounds:
   members are passed through untouched. Unknown question types, missing or
   wrongly typed `criteria`, empty `questions`, and missing/non-container
   `state` are 400 `invalid_request_error`.
-- `stream: true`, any `assets` member (even null), a `box` question, and an
-  image part in `state` (an object whose `type` is `image_url` or
-  `input_image`) are 400 `decision_unsupported`. `stream: false`/`null` is
-  accepted.
+- `stream: true`, any `assets` member (even null), a `box` question, and a
+  top-level `input` member (with or without `state`) are 400
+  `decision_unsupported`. `stream: false`/`null` is accepted.
+- Text only (descriptors are `input_modalities: [text]`): a non-text part is
+  an object, at any depth within `max_nesting`, whose exact `type` member is
+  one of `image_url`, `input_image`, `input_audio`, `audio_url`, `file`,
+  `input_file`, `video_url`, `video`. One in `state`, in any question's
+  `instructions` or `criteria`, or in any other top-level member except
+  `questions` (named or unknown passthrough members are scanned exactly like
+  `state`) is 400 `decision_unsupported` before egress. Strings are never
+  inspected: a string `"image_url"`, a key named `image_url`, or a
+  `type`-like key under another name is text. (The chat/responses classifier
+  is unchanged.)
 - More than `max_questions` questions, more than `max_choice_options` options,
   more than `max_score_levels` levels, a name over `max_question_name_bytes`,
-  or `state`/`instructions`/`criteria` nesting deeper than `max_nesting` (a
-  scalar is depth 0, `{}`/`[]` depth 1) is 400 `decision_bounds_exceeded`.
+  or `state`/`instructions`/`criteria` (or any other top-level member except
+  `questions`) nesting deeper than `max_nesting` (a scalar is depth 0,
+  `{}`/`[]` depth 1) is 400 `decision_bounds_exceeded`.
   Values exactly at a bound are accepted. Messages name fields and bounds, never
   body content.
 - No gateway token counting; upstream context limits are relayed as final 400s.
@@ -1289,6 +1299,8 @@ another branch); a local decision backend; images/box/multipart; OpenAI
 | T6 strict JSON (duplicate/case-variant names, member variants, malformed shapes) | `routing.TestT6StrictJSON`, `proxy.TestT6T7T8RejectedBeforeEgress` |
 | T7 bounds: one over each → `decision_bounds_exceeded`, at limit accepted, configured bounds apply | `routing.TestT7Bounds`, `proxy.TestT6T7T8RejectedBeforeEgress`, `proxy.TestT7ConfiguredBoundsApply` |
 | T8 unsupported: box, assets, image state, stream:true, `input` without `state`, multipart, Content-Encoding | `routing.TestT8UnsupportedFeatures`, `proxy.TestT6T7T8RejectedBeforeEgress` |
+| T8a (R1.1) non-text parts (every listed `type`) in `state`, `instructions`, `criteria` or another top-level member → `decision_unsupported`; strings and other keys are text; nesting bound applies to other top-level members | `routing.TestDC1FixNonTextContentRejected`, `routing.TestT8aNonTextParts`, `proxy.TestT6T7T8RejectedBeforeEgress` |
+| T8b (R1.2) top-level `input` on both paths, with or without `state` → `decision_unsupported` naming `state` | `routing.TestDC1FixNonTextContentRejected`, `routing.TestT8bInputMember`, `proxy.TestT6T7T8RejectedBeforeEgress` |
 | T9 question-type filter keeps order; none → `capability_unsupported` | `routing.TestT9FilterDecision`, `proxy.TestT9QuestionTypeFilter` |
 | T10 endpoint/route family mismatch → 400 `capability_unsupported`, zero egress | `proxy.TestT10EndpointRouteMismatch` |
 | T11 error table (final 400/404/413/422/529 with Retry-After relayed, 401 refresh then failover, 429 hint + failover + last relayed, 5xx/524/transport failover) | `proxy.TestT11ErrorTable` |

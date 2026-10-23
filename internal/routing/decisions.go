@@ -29,8 +29,8 @@ const (
 )
 
 // ErrDecisionUnsupported reports a decision request that uses a feature v1
-// does not route: images, assets, box questions, streaming, or an OpenAI-style
-// input field in place of state. The caller answers 400 decision_unsupported.
+// does not route: non-text (image, audio, file, video) parts, assets, box
+// questions, streaming, or an OpenAI-style input field. The caller answers 400 decision_unsupported.
 var ErrDecisionUnsupported = errors.New("routing: decision feature unsupported")
 
 // ErrDecisionBounds reports a decision request over a configured bound
@@ -114,10 +114,12 @@ var (
 // (ProtocolSystemOne or ProtocolDecisions). Members are read by exact name; a
 // duplicate or case variant of a member it reads is ErrMalformed, as are
 // duplicate or case-fold-variant question and choice option names. Unknown
-// members (top level and inside questions) are skipped and forwarded untouched.
-// Images in state, assets, box questions, stream:true and (decisions) an
-// input-without-state body are ErrDecisionUnsupported; exceeding b is
-// ErrDecisionBounds. Returned error text never quotes body content.
+// members (top level and inside questions) are forwarded untouched; unknown
+// top-level members are still scanned like state. A non-text part
+// (nonTextTypes) in state, instructions, criteria or any other top-level
+// member, assets, box questions, stream:true and an input member (with or
+// without state) are ErrDecisionUnsupported; exceeding b is ErrDecisionBounds.
+// Returned error text never quotes body content.
 func InferDecision(protocol string, body []byte, b DecisionBounds) (DecisionRequirements, error) {
 	b = b.withDefaults()
 	reqs := DecisionRequirements{Protocol: protocol}
@@ -141,22 +143,20 @@ func InferDecision(protocol string, body []byte, b DecisionBounds) (DecisionRequ
 	if _, ok := root["assets"]; ok {
 		return reqs, unsupported("assets (images) are not supported")
 	}
+	if _, ok := root["input"]; ok {
+		return reqs, unsupported("the OpenAI-style input field is not translated; send the content as state")
+	}
 	state, ok := root["state"]
 	if !ok || isNull(state) {
-		if _, hasInput := root["input"]; hasInput && protocol == ProtocolDecisions {
-			return reqs, unsupported("the OpenAI-style input field is not translated; send the content as state")
-		}
 		return reqs, malformed("state is required")
 	}
 	if c := state[0]; c != '"' && c != '{' && c != '[' {
 		return reqs, malformed("state must be a string, object or array")
 	}
-	image, err := scanValue("state", state, b.MaxNesting)
-	if err != nil {
+	// Every top-level member but questions (checked per question below),
+	// including unknown passthrough members, is scanned exactly like state.
+	if err := scanTopLevel(body, members, b.MaxNesting); err != nil {
 		return reqs, err
-	}
-	if image {
-		return reqs, unsupported("image content in state is not supported")
 	}
 
 	qraw, ok := root["questions"]
@@ -196,13 +196,13 @@ func question(raw json.RawMessage, b DecisionBounds) (string, error) {
 		return "", malformed("question type must be a non-empty string")
 	}
 	if ins, ok := q["instructions"]; ok {
-		if _, err := scanValue("instructions", ins, b.MaxNesting); err != nil {
+		if err := textOnly("instructions", ins, b.MaxNesting); err != nil {
 			return "", err
 		}
 	}
 	crit, hasCrit := q["criteria"]
 	if hasCrit {
-		if _, err := scanValue("criteria", crit, b.MaxNesting); err != nil {
+		if err := textOnly("criteria", crit, b.MaxNesting); err != nil {
 			return "", err
 		}
 	}
@@ -318,14 +318,66 @@ func foldKey(s string) string {
 	return sb.String()
 }
 
-// imageTypes are content-part type values that carry an image (OpenRouter's
-// state image parts use image_url; input_image is the Responses spelling).
-var imageTypes = map[string]bool{"image_url": true, "input_image": true}
+// nonTextTypes are the content-part type values that carry non-text input on a
+// text-only decision route: the chat/responses image, audio and file part
+// types plus audio_url and the video spellings. Only an exact "type" member
+// value counts; strings elsewhere are text and never inspected.
+var nonTextTypes = map[string]bool{
+	"image_url": true, "input_image": true,
+	"input_audio": true, "audio_url": true,
+	"file": true, "input_file": true,
+	"video_url": true, "video": true,
+}
+
+// textOnly scans raw (bounded by maxDepth) and fails with
+// ErrDecisionUnsupported when it holds a non-text part.
+func textOnly(what string, raw []byte, maxDepth int) error {
+	nonText, err := scanValue(what, raw, maxDepth)
+	if err != nil {
+		return err
+	}
+	if nonText {
+		return unsupported("non-text content in %s is not supported", what)
+	}
+	return nil
+}
+
+// scanTopLevel applies textOnly to every member of the request object body
+// except questions. A member outside known is labelled generically so error
+// text never quotes a body-supplied name. object has already validated body.
+func scanTopLevel(body []byte, known []string, maxDepth int) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if _, err := dec.Token(); err != nil {
+		return malformed("request body must be a JSON object")
+	}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return malformed("request body must be a JSON object")
+		}
+		name, _ := tok.(string)
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return malformed("request body must be a JSON object")
+		}
+		if name == "questions" {
+			continue
+		}
+		what := "a top-level member"
+		if contains(known, name) {
+			what = name
+		}
+		if err := textOnly(what, v, maxDepth); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // scanValue walks one JSON value without recursion. It fails with
 // ErrDecisionBounds when the value nests deeper than maxDepth, and reports
-// whether any object in it has a "type" member naming an image part.
-func scanValue(what string, raw []byte, maxDepth int) (image bool, err error) {
+// whether any object in it has a "type" member naming a non-text part.
+func scanValue(what string, raw []byte, maxDepth int) (nonText bool, err error) {
 	type frame struct {
 		obj, wantKey bool
 		key          string
@@ -340,7 +392,7 @@ func scanValue(what string, raw []byte, maxDepth int) (image bool, err error) {
 	for {
 		tok, err := dec.Token()
 		if err == io.EOF {
-			return image, nil
+			return nonText, nil
 		}
 		if err != nil {
 			return false, malformed("%s is not valid JSON", what)
@@ -368,8 +420,8 @@ func scanValue(what string, raw []byte, maxDepth int) (image bool, err error) {
 				valueDone()
 			}
 		case string:
-			if n := len(stack); n > 0 && stack[n-1].obj && stack[n-1].key == "type" && imageTypes[v] {
-				image = true
+			if n := len(stack); n > 0 && stack[n-1].obj && stack[n-1].key == "type" && nonTextTypes[v] {
+				nonText = true
 			}
 			valueDone()
 		default:

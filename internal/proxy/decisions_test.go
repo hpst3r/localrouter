@@ -280,6 +280,10 @@ func TestT6T7T8RejectedBeforeEgress(t *testing.T) {
 		{"T8 assets", pathSystemOne, `{"model":"jev","state":"s","assets":{},"questions":{"q":{"type":"noul"}}}`, nil, errTypeDecisionUnsupported},
 		{"T8 image state", pathDecisions, `{"model":"jev","state":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AA"}}],"questions":{"q":{"type":"noul"}}}`, nil, errTypeDecisionUnsupported},
 		{"T8 input not state", pathDecisions, `{"model":"jev","input":"hello","questions":{"q":{"type":"noul"}}}`, nil, errTypeDecisionUnsupported},
+		{"T8a audio state", pathSystemOne, `{"model":"jev","state":[{"type":"input_audio","input_audio":{"data":"AA","format":"wav"}}],"questions":{"q":{"type":"noul"}}}`, nil, errTypeDecisionUnsupported},
+		{"T8a image criteria", pathDecisions, `{"model":"jev","state":"s","questions":{"q":{"type":"choice","instructions":"i","criteria":{"a":[{"type":"image_url","image_url":{"url":"x"}}]}}}}`, nil, errTypeDecisionUnsupported},
+		{"T8a file in unknown member", pathDecisions, `{"model":"jev","state":"s","extra":{"type":"file","file":{"file_id":"f"}},"questions":{"q":{"type":"noul"}}}`, nil, errTypeDecisionUnsupported},
+		{"T8b input next to state", pathSystemOne, `{"model":"jev","state":"s","input":"hello","questions":{"q":{"type":"noul"}}}`, nil, errTypeDecisionUnsupported},
 		{"T8 multipart", pathSystemOne, noulOnly, map[string]string{"Content-Type": "multipart/form-data; boundary=x"}, errTypeDecisionUnsupported},
 		{"T8 gzip", pathSystemOne, noulOnly, map[string]string{"Content-Encoding": "gzip"}, errTypeDecisionUnsupported},
 	}
@@ -299,7 +303,7 @@ func TestT6T7T8RejectedBeforeEgress(t *testing.T) {
 			if n := egress(ups); n != 0 {
 				t.Fatalf("egress = %d", n)
 			}
-			if c.name == "T8 input not state" && !strings.Contains(string(b), "state") {
+			if (c.name == "T8 input not state" || c.name == "T8b input next to state") && !strings.Contains(string(b), "state") {
 				t.Fatalf("message must name state: %s", b)
 			}
 		})
