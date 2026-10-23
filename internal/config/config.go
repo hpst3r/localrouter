@@ -45,6 +45,31 @@ type Config struct {
 	Routes     []RouteConfig    `yaml:"routes"`
 	ClaudeLogs ClaudeLogsConfig `yaml:"claude_logs"`
 	HermesLogs HermesLogsConfig `yaml:"hermes_logs"`
+	// ModelCheck is the optional backend model drift check. Nil (absent) or a
+	// zero interval disables it, leaving startup and diagnostics unchanged.
+	ModelCheck *ModelCheckConfig `yaml:"model_check"`
+}
+
+// ModelCheckConfig enables the periodic backend model check (docs/SPEC.md,
+// "Backend model check"). Interval 0 disables it; otherwise it must be within
+// [MinModelCheckInterval, MaxModelCheckInterval]. It is restart-only.
+type ModelCheckConfig struct {
+	Interval Duration `yaml:"interval"`
+}
+
+// Backend model check interval bounds.
+const (
+	MinModelCheckInterval = 30 * time.Second
+	MaxModelCheckInterval = 24 * time.Hour
+)
+
+// ModelCheckInterval returns the configured check interval, or 0 when the
+// check is disabled.
+func (c *Config) ModelCheckInterval() time.Duration {
+	if c.ModelCheck == nil {
+		return 0
+	}
+	return c.ModelCheck.Interval.D()
 }
 
 // ClaudeLogsConfig controls ingestion of Claude Code transcript token usage.
@@ -765,6 +790,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Budgets != nil {
 		errs = append(errs, c.Budgets.validate(seenC, accts)...)
+	}
+	if iv := c.ModelCheckInterval(); iv != 0 && (iv < MinModelCheckInterval || iv > MaxModelCheckInterval) {
+		errs = append(errs, fmt.Errorf("model_check.interval must be 0 (disabled) or within [%s, %s]", MinModelCheckInterval, MaxModelCheckInterval))
 	}
 	return errors.Join(errs...)
 }

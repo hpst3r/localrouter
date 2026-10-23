@@ -33,12 +33,36 @@ type listing struct {
 	dropped int      // invalid ids plus ids over the per-account cap
 }
 
+// Eligible reports whether accounts of provider serve an OpenAI-style
+// GET {base_url}/models listing that discovery (and the backend model check)
+// may poll: openai_compat and ollama. Codex, claude and openrouter are not.
+func Eligible(provider string) bool {
+	return provider == core.ProviderOpenAICompat || provider == core.ProviderOllama
+}
+
+// Fetch performs one GET {account.BaseURL}/models exactly as a discovery poll
+// does (credential headers, bounds, redirects, id validation), using opts'
+// HTTPClient, Timeout, MaxBodyBytes and MaxIDs (zero values select the
+// defaults; a nil HTTPClient builds a fresh NewHTTPClient). It returns the
+// sorted, unique valid ids and the dropped count, or a non-empty error class.
+// It never returns the URL, the body or the credential.
+func Fetch(ctx context.Context, creds core.CredentialSource, account core.Account, opts Options) (ids []string, dropped int, errClass string) {
+	l, class := fetchListing(ctx, creds, opts.withDefaults(), account)
+	return l.ids, l.dropped, class
+}
+
 // fetch performs one GET {base_url}/models for account. It returns the
 // validated listing, or a non-empty error class.
 func (m *Manager) fetch(ctx context.Context, account core.Account) (listing, string) {
-	ctx, cancel := context.WithTimeout(ctx, m.opts.Timeout)
+	return fetchListing(ctx, m.creds, m.opts, account)
+}
+
+// fetchListing is fetch with explicit dependencies; opts has its defaults
+// applied.
+func fetchListing(ctx context.Context, creds core.CredentialSource, opts Options, account core.Account) (listing, string) {
+	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
-	cred, err := m.creds.Credential(ctx, account.ID)
+	cred, err := creds.Credential(ctx, account.ID)
 	if err != nil {
 		return listing{}, ErrClassCredential
 	}
@@ -54,7 +78,7 @@ func (m *Manager) fetch(ctx context.Context, account core.Account) (listing, str
 	}
 	// An error here includes response headers over the transport's
 	// MaxResponseHeaderBytes (64 KiB by default).
-	resp, err := m.opts.HTTPClient.Do(req)
+	resp, err := opts.HTTPClient.Do(req)
 	if err != nil {
 		return listing{}, ErrClassTransport
 	}
@@ -62,14 +86,14 @@ func (m *Manager) fetch(ctx context.Context, account core.Account) (listing, str
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return listing{}, ErrClassStatus
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, m.opts.MaxBodyBytes+1))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, opts.MaxBodyBytes+1))
 	if err != nil {
 		return listing{}, ErrClassTransport
 	}
-	if int64(len(body)) > m.opts.MaxBodyBytes {
+	if int64(len(body)) > opts.MaxBodyBytes {
 		return listing{}, ErrClassTooLarge
 	}
-	l, err := parseListing(body, m.opts.MaxIDs)
+	l, err := parseListing(body, opts.MaxIDs)
 	if err != nil {
 		return listing{}, ErrClassMalformed
 	}

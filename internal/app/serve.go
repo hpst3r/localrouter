@@ -141,6 +141,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 	if a.Discovery != nil {
 		defer a.Discovery.Close()
 	}
+	if a.ModelCheck != nil {
+		defer a.ModelCheck.Close()
+	}
 	if srv == nil {
 		return nil
 	}
