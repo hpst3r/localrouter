@@ -1,7 +1,6 @@
 package policy
 
 import (
-	"fmt"
 	"strings"
 	"time"
 
@@ -64,7 +63,8 @@ type poolScan struct {
 // != "") and creates a lease on it, atomically under the admission mutex.
 //
 // Each candidate not in exclude is checked like Acquire (reachability breaker,
-// then admission) and then against route.BalanceMaxInflight. Among the
+// then admission) and then against its max_inflight (Options.MaxInflight,
+// else route.BalanceMaxInflight). Among the
 // eligible members a live session binding wins (when route.BalanceStickyTTL >
 // 0 and session != "") unless the bound member is uncapped and more than two
 // leases above the least-loaded eligible member; otherwise the member with the
@@ -153,9 +153,9 @@ func (p *Policy) scanPoolLocked(c *cfg, class core.Class, candidates []string, e
 			others++
 			continue
 		}
-		limit := route.BalanceMaxInflight[id]
-		if limit > 0 && st.inflight >= limit {
-			reasons = append(reasons, fmt.Sprintf("%s: saturated (%d/%d in flight)", id, st.inflight, limit))
+		limit := c.capOf(id, route.BalanceMaxInflight[id])
+		if why, full := c.saturated(id, st.inflight, limit); full {
+			reasons = append(reasons, why)
 			saturated = append(saturated, id)
 			continue
 		}

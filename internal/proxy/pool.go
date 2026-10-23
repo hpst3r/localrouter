@@ -30,6 +30,14 @@ type balancedPolicy interface {
 	AcquireBalanced(class core.Class, candidates []string, exclude map[string]bool, route core.Route, session string) (l core.Lease, dec core.Decision, denial string, accounts []string, retryIn time.Duration)
 }
 
+// cappedPolicy is implemented by policies that enforce a per-account
+// max_inflight on unpooled routes too (internal/policy.Policy).
+// AcquireCapped is Acquire with the denial kinds and accounts of
+// balancedPolicy.
+type cappedPolicy interface {
+	AcquireCapped(class core.Class, candidates []string, exclude map[string]bool) (l core.Lease, dec core.Decision, denial string, accounts []string, retryIn time.Duration)
+}
+
 // pooledLease is implemented by the leases AcquireBalanced returns.
 type pooledLease interface {
 	Pick() (pick string, inflight, maxInflight int)
@@ -42,18 +50,28 @@ type poolPick struct {
 	maxInflight int
 }
 
-// acquireFor admits one attempt of req. An unpooled route (or a policy
-// without pooling) takes the unchanged acquire path; a pooled route asks
-// AcquireBalanced and maps its denial: breaker -> unreachable/retryIn (the
-// breaker's 503), saturated -> saturated members (429 pool_saturated),
-// anything else -> neither (429 quota_reserve).
+// acquireFor admits one attempt of req. A pooled route asks AcquireBalanced;
+// an unpooled route asks AcquireCapped (so a per-account max_inflight holds
+// there too), or takes the plain acquire path with a policy that has
+// neither. The denial maps as: breaker -> unreachable/retryIn (the breaker's
+// 503), saturated -> saturated accounts (429 pool_saturated), anything else
+// -> neither (429 quota_reserve).
 func (p *Proxy) acquireFor(req *request, exclude map[string]bool) (l core.Lease, dec core.Decision, unreachable []string, retryIn time.Duration, saturated []string) {
-	bp, ok := p.deps.Policy.(balancedPolicy)
-	if req.route.BalanceStrategy == "" || !ok {
+	var (
+		denial   string
+		accounts []string
+	)
+	bp, pooled := p.deps.Policy.(balancedPolicy)
+	cp, capped := p.deps.Policy.(cappedPolicy)
+	switch {
+	case req.route.BalanceStrategy != "" && pooled:
+		l, dec, denial, accounts, retryIn = bp.AcquireBalanced(req.class, req.candidates, exclude, req.route, req.session)
+	case capped:
+		l, dec, denial, accounts, retryIn = cp.AcquireCapped(req.class, req.candidates, exclude)
+	default:
 		l, dec, unreachable, retryIn = p.acquire(req.class, req.candidates, exclude)
 		return l, dec, unreachable, retryIn, nil
 	}
-	l, dec, denial, accounts, retryIn := bp.AcquireBalanced(req.class, req.candidates, exclude, req.route, req.session)
 	switch denial {
 	case poolDenyBreaker:
 		return l, dec, accounts, retryIn, nil
@@ -63,8 +81,9 @@ func (p *Proxy) acquireFor(req *request, exclude map[string]bool) (l core.Lease,
 	return l, dec, nil, 0, nil
 }
 
-// writePoolSaturated answers a pooled route whose members are all at their
-// max_inflight (the rest, if any, held open by the breaker).
+// writePoolSaturated answers a request whose candidates are all at their
+// max_inflight (the rest, if any, held open by the breaker), on a pooled or
+// an unpooled route.
 func writePoolSaturated(w http.ResponseWriter, accounts []string) {
 	w.Header().Set("Retry-After", poolRetryAfter)
 	writeError(w, http.StatusTooManyRequests,

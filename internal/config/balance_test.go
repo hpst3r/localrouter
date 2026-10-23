@@ -166,3 +166,37 @@ routes:
 		t.Fatal(err)
 	}
 }
+
+// TestR1CrossRouteBalanceRules: Amendment R1.1 (one max_inflight per account
+// across balance blocks) and R1.2 (unique route names once any route pools).
+func TestR1CrossRouteBalanceRules(t *testing.T) {
+	pool := func(name, caps string) string {
+		return "  - name: " + name + "\n    models: [m-" + name + "]\n    interactive: [g1, g2]\n" +
+			"    balance: {strategy: least_inflight, identity: x, members: " + caps + "}\n"
+	}
+	const plain = "  - {name: plain, models: [m-plain], interactive: [g1]}\n"
+	cases := []struct {
+		name, routes, want string
+	}{
+		{"same cap", pool("p1", "{g1: {max_inflight: 2}, g2: {}}") + pool("p2", "{g1: {max_inflight: 2}, g2: {}}") + plain, ""},
+		{"capped member also unpooled", pool("p1", "{g1: {max_inflight: 2}, g2: {}}") + plain, ""},
+		{"different caps", pool("p1", "{g1: {max_inflight: 2}, g2: {}}") + pool("p2", "{g1: {max_inflight: 3}, g2: {}}"),
+			`account "g1": balance members max_inflight differs between routes p1 (2) and p2 (3)`},
+		{"cap and uncapped", pool("p1", "{g1: {}, g2: {}}") + pool("p2", "{g1: {}, g2: {max_inflight: 1}}"),
+			`account "g2": balance members max_inflight differs between routes p1 (0) and p2 (1)`},
+		{"duplicate name with pool", pool("p1", "{g1: {}, g2: {}}") + "  - {name: p1, models: [other], interactive: [g1]}\n",
+			`route name "p1" is not unique`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(write(t, poolAccounts+"\nroutes:\n"+tc.routes))
+			if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	// Without a balance block, duplicate route names stay accepted.
+	if _, err := Load(write(t, poolAccounts+"\nroutes:\n  - {name: r, models: [a], interactive: [g1]}\n  - {name: r, models: [b], interactive: [g2]}\n")); err != nil {
+		t.Fatalf("unpooled duplicate names: %v", err)
+	}
+}

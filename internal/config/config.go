@@ -760,6 +760,7 @@ func (c *Config) Validate() error {
 		errs = append(errs, validateUpstreams(r, provider)...)
 		errs = append(errs, validateBalance(r, c.Accounts)...)
 	}
+	errs = append(errs, validateBalanceRoutes(c.Routes)...)
 	if c.ClaudeLogs.Enabled {
 		if c.ClaudeLogs.Account == "" {
 			errs = append(errs, errors.New("claude_logs.account is required when claude_logs.enabled"))

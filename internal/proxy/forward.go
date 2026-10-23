@@ -93,7 +93,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 					"reason", dec.Reason, "denial", denialBreakerOpen)
 				writeUnreachable(w, unreachable, retryIn)
 			case len(saturated) > 0:
-				// Pooled route, every member at max_inflight (or breaker-open).
+				// Every candidate at max_inflight (or breaker-open), pooled or not.
 				p.log.Info("policy denied", "client", req.client.Name, "class", req.class, "model", req.model,
 					"reason", dec.Reason, "denial", denialPoolSaturated)
 				writePoolSaturated(w, saturated)

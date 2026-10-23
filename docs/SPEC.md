@@ -634,6 +634,45 @@ Acceptance tests (ids follow the design's P-numbering):
   exists only with a pooled route and has no URLs or keys
   (`TestP19DiagnosticsPools`, `TestP19DiagnosticsWithoutPoolsOmitsBlock`).
 
+Amendment R1 (review findings PL-1..PL-3 and two scope gaps; supersedes the
+text above where they differ):
+
+- R1.1 `max_inflight` is a per-ACCOUNT cap: llama-server `-np` slots belong
+  to the server, not the alias. If an account has a non-zero `max_inflight`
+  in any balance block, every balance block that lists it must give the same
+  value (config error naming both routes). The cap is enforced for that
+  account on every route, including unpooled ones (`policy.Options.MaxInflight`,
+  built by `policy.AccountCaps(routes)`; checked inside the admission mutex):
+  an unpooled route skips a candidate at its cap like a saturated pool member
+  (reason `<id>: saturated (<n>/<cap> in flight)`), and when every candidate
+  is excluded only by the cap, or by the cap and the breaker, the answer is
+  429 `pool_saturated` + `Retry-After: 1` exactly as on a pooled route (the
+  proxy admits unpooled routes through `AcquireCapped`). With no balance block
+  anywhere nothing changes (P1 golden byte-identical).
+- R1.2 When any route has a balance block, route names must be unique (config
+  error). Without balance blocks, validation is unchanged.
+- R1.3 The duplicated sentence in the `internal/proxy` package comment is
+  removed.
+- R1.4 `localrouter check` prints, for each pooled route whose member count
+  exceeds `policy.max_failovers + 1`, `info: route R pool has N members but at
+  most M attempts per request (policy.max_failovers)`. It is informational:
+  the exit code is unchanged.
+- R1.5 docs/ROUTING-OBSERVABILITY.md documents `pool_pick`,
+  `member_inflight`, `member_cap` and `denial=pool_saturated`; the closed-key
+  event contract test covers a pooled route.
+- R1.6 Acceptance tests: config rules (`TestR1CrossRouteBalanceRules`); cap
+  derivation, unpooled skip and denial kinds, pooled routes honoring the
+  account cap, reload and validation (`TestR1AccountCaps`,
+  `TestR1UnpooledRouteHonorsAccountCap`, `TestR1PoolUsesAccountCap`,
+  `TestR1MaxInflightReloadAndValidation`); 200 concurrent requests split
+  between a pooled and an unpooled route sharing a capped account never exceed
+  its cap under `-race` (`TestR1SharedCapRace`,
+  `TestR1SharedCapRaceThroughProxy`); an unpooled route at the cap answers 429
+  `pool_saturated` with no backend contact, row or event
+  (`TestR1UnpooledRouteAtCapIs429`); the check info line
+  (`TestR1CheckPoolInfo`); pooled event contract
+  (`TestRoutingObservabilityPooledEventContract`).
+
 ## Concurrency limits and inbound timeouts
 
 `limits.max_concurrent` (global) and `limits.max_concurrent_per_client`

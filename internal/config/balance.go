@@ -44,8 +44,9 @@ type BalanceConfig struct {
 type BalanceMember struct {
 	// Weight is an integer in [1, 100]; absent means 1.
 	Weight *int `yaml:"weight"`
-	// MaxInflight caps the member's open leases (llama-server -np); 0 or
-	// absent means uncapped.
+	// MaxInflight caps the member account's open leases on every route
+	// (llama-server -np); 0 or absent means uncapped. Every balance block
+	// listing the account must give the same value.
 	MaxInflight int `yaml:"max_inflight"`
 }
 
@@ -151,6 +152,48 @@ func validateBalance(r RouteConfig, accounts []AccountConfig) []error {
 			}
 			if !sameCapabilities(r.Upstreams[ref], spec) {
 				add("members %q and %q must declare identical upstreams capabilities (protocols, input_modalities, tools, json_schema, stream); only upstream_model may differ", ref, id)
+			}
+		}
+	}
+	return errs
+}
+
+// validateBalanceRoutes enforces the cross-route pooled-backend rules. With no
+// balance block anywhere it reports nothing. Otherwise route names must be
+// unique (affinity bindings and diagnostics are keyed by name), and an account
+// whose max_inflight is non-zero in any balance block must have the same value
+// in every balance block that lists it: the cap belongs to the server
+// (llama-server -np) and is enforced on every route.
+func validateBalanceRoutes(routes []RouteConfig) []error {
+	if !slices.ContainsFunc(routes, func(r RouteConfig) bool { return r.Balance != nil }) {
+		return nil
+	}
+	var errs []error
+	names := map[string]bool{}
+	for _, r := range routes {
+		if r.Name != "" && names[r.Name] {
+			errs = append(errs, fmt.Errorf("route name %q is not unique (required when any route has a balance block)", r.Name))
+		}
+		names[r.Name] = true
+	}
+	type capAt struct {
+		route string
+		n     int
+	}
+	first := map[string]capAt{}
+	for _, r := range routes {
+		if r.Balance == nil {
+			continue
+		}
+		for _, id := range sortedKeys(r.Balance.Members) {
+			n := r.Balance.Members[id].MaxInflight
+			prev, ok := first[id]
+			if !ok {
+				first[id] = capAt{r.Name, n}
+				continue
+			}
+			if prev.n != n {
+				errs = append(errs, fmt.Errorf("account %q: balance members max_inflight differs between routes %s (%d) and %s (%d); the cap is per account and must be the same in every balance block", id, prev.route, prev.n, r.Name, n))
 			}
 		}
 	}

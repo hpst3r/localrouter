@@ -57,4 +57,12 @@
 //
 //	lease, dec, denial, accounts, retryIn := p.AcquireBalanced(class, candidates, exclude, route, session)
 //	pick, inflight, maxInflight := lease.(*policy.PoolLease).Pick()
+//
+// Options.MaxInflight (built with AccountCaps(routes)) makes a member's
+// max_inflight a per-account cap enforced on every route: Acquire, DryRun
+// and AcquireWithBreaker skip a capped account at its cap, and AcquireCapped
+// is AcquireWithBreaker for unpooled routes that reports a cap-only denial
+// as PoolDenySaturated:
+//
+//	lease, dec, denial, accounts, retryIn := p.AcquireCapped(class, candidates, exclude)
 package policy
