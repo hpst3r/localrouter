@@ -384,6 +384,28 @@ responses stay JSON-encodable.
   buffer the entire stream (scan incrementally; keep ≤ 4 MiB per event).
   Non-stream JSON capture is bounded to 16 MiB; oversized bodies are still
   relayed, but their usage and cost are left unknown.
+- Mode: an upstream `Content-Type` starting with `text/event-stream` is SSE and
+  any other present value is JSON; the body never overrides it. A response
+  with NO `Content-Type` (the Codex backend sends none on its streams) is
+  sniffed: after leading whitespace, `{` means JSON and an SSE field or
+  comment start (`event:`, `data:`, `id:`, `retry:`, `:`) means SSE. The
+  sniff buffers at most 64 KiB; a body still undecided past that, or at end
+  of body, is JSON (unless its bytes already identify SSE).
+- Relay header rule: when the upstream sent no `Content-Type` and the sniff
+  decided SSE, the client response carries `Content-Type: text/event-stream`.
+  The status line is held until the sniff decides (bounded by the 64 KiB cap
+  and by the stream idle timeout; end of body or a read error also decides),
+  and the bytes read meanwhile are then relayed unchanged. A sniffed JSON body
+  is relayed byte-for-byte with no `Content-Type` added. An upstream
+  `Content-Type` that is present is never overridden.
+- Codex prompt-cache affinity: the Codex backend reuses its prompt cache only
+  for requests carrying a `session_id` header. For a Codex attempt whose
+  client sent no `session_id` (any case), LocalRouter sends `session_id` (that
+  literal lowercase name) set to the body's `prompt_cache_key` when that is a
+  non-empty JSON string of at most 256 printable ASCII bytes; anything else
+  synthesizes nothing (never truncated). A client `session_id` always wins,
+  and non-Codex attempts (including other candidates of the same request) never
+  get one. `X-Codex-Turn-State` is forwarded upstream and relayed back.
 
 ## Auth
 
@@ -695,6 +717,20 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
   are bounded with `core.TruncateLabel`.
 - A ledger error with `Permanent() == true` drops the row (`Stats.Dropped`)
   and rebases it; other errors leave state unchanged for retry.
+- One-time backfill of self-routed usage the proxy failed to meter:
+  `localrouter hermeslog backfill-self --model M [--model M ...] --account ID
+  --before RFC3339 [--apply] [-config PATH]` (requires `hermes_logs.enabled`
+  and a configured account). It selects only the rows the regular scan skips
+  as self-routed, whose model is one of `--model` and whose `last_seen` is
+  strictly before `--before` (rows with no `last_seen`, or active at/after the
+  cutoff, are listed as excluded and never recorded), and records each as ONE
+  row for its full cumulative counters, attributed to `--account` and that
+  account's provider, with the same plausibility checks and labels as the
+  scan. IDs are `hermes-backfill:` + the scan's deterministic hash, so a
+  rerun records nothing new; rows whose ID is already in the ledger are
+  reported as present and not sent. Without `--apply` it is a dry run that
+  prints the selection with estimated cost and writes nothing. The collector
+  state file is neither read nor written.
 
 ### Ledger changes
 
