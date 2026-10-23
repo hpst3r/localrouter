@@ -90,7 +90,7 @@ routes:
   #     identity: "Qwen3.5-9B Q4_K_M"       # required declaration of model+quant
   #     sticky_ttl: 15m                     # optional X-LocalRouter-Session affinity; 0/absent = off
   #     members:
-  #       lab-6800xt: {weight: 2, max_inflight: 4}   # max_inflight = llama-server -np; 0 = uncapped
+  #       lab-6800xt: {weight: 2, max_inflight: 4}   # max_inflight = llama-server -np; 0 = uncapped; per ACCOUNT, enforced on every route
   #       lab-p100:   {weight: 1, max_inflight: 2}
 
 claude_logs:                  # ingest Claude Code token usage from local transcripts
