@@ -37,6 +37,25 @@ func (p *Proxy) acquire(class core.Class, candidates []string, exclude map[strin
 	return l, dec, nil, 0
 }
 
+// reachedLease is implemented by leases that observe upstream reachability
+// as soon as response headers arrive (internal/policy leases): a half-open
+// probe closes the breaker then, not when a long stream ends, and the lease's
+// later Release no longer counts toward the breaker.
+type reachedLease interface {
+	Reached()
+}
+
+// markReached reports to l, when it supports it, that the upstream answered
+// with response headers (and the answer is not request-scoped).
+func markReached(l core.Lease) {
+	if ol, ok := l.(*onceLease); ok {
+		l = ol.Lease
+	}
+	if r, ok := l.(reachedLease); ok {
+		r.Reached()
+	}
+}
+
 // writeUnreachable answers a request whose every candidate is held open by
 // the reachability breaker: 503 upstream_unavailable with Retry-After set to
 // the whole seconds until the earliest half-open (at least 1).

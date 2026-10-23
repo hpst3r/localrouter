@@ -309,3 +309,165 @@ func TestB12LogsOpenAndClose(t *testing.T) {
 		t.Fatalf("want one info close line, got %d:\n%s", n, logs)
 	}
 }
+
+// BR-1 (SPEC Amendment R1.1, R1.2): a lease admitted under a generation with
+// the breaker disabled is released after a reload enabled it. Transitions use
+// the current generation's knobs and the old lease is not the probe, so its
+// release leaves the open/half-open breaker and the single probe intact.
+func TestBRFixBR1StaleGenerationLeaseKeepsBreaker(t *testing.T) {
+	for _, o := range []core.Outcome{{}, answered, dead} {
+		accts := []core.Account{acct("a", 0)}
+		h := newHarness(accts, Options{}) // generation 1: breaker disabled
+		// A long-running request (e.g. a multi-minute stream) admitted before
+		// the reload that enables the breaker.
+		old, d := h.p.Acquire(core.ClassInteractive, []string{"a"}, nil)
+		if !d.Allow {
+			t.Fatalf("acquire: %s", d.Reason)
+		}
+		on := mustView(t, h.p, accts, Options{Breaker: BreakerOptions{Threshold: 1, Base: 5 * time.Second, Max: time.Minute}})
+		l, d := on.Acquire(core.ClassInteractive, []string{"a"}, nil)
+		if !d.Allow {
+			t.Fatalf("acquire: %s", d.Reason)
+		}
+		l.Release(dead)
+		old.Release(o) // while open
+		if state, _, until, _ := on.Breaker("a"); state != BreakerOpen || !until.Equal(t0.Add(5*time.Second)) {
+			t.Fatalf("%+v: breaker %s until %v after a stale release while open, want open until t0+5s", o, state, until)
+		}
+		h.clock.Advance(5 * time.Second)
+		probe, d := on.Acquire(core.ClassInteractive, []string{"a"}, nil)
+		if !d.Allow {
+			t.Fatalf("probe denied: %s", d.Reason)
+		}
+		if state, _, _, _ := on.Breaker("a"); state != BreakerHalfOpen {
+			t.Errorf("%+v: breaker state %q with a probe in flight, want half_open", o, state)
+		}
+		if l2, d := on.Acquire(core.ClassInteractive, []string{"a"}, nil); d.Allow {
+			l2.Release(core.Outcome{})
+			t.Errorf("%+v: second request admitted while the half-open probe is in flight: %s", o, d.Reason)
+		}
+		probe.Release(dead)
+		if state, _, _, _ := on.Breaker("a"); state != BreakerOpen {
+			t.Errorf("%+v: breaker state %q after a failed probe, want open", o, state)
+		}
+	}
+}
+
+// BR-1 (R1.5 at the policy level): the original reviewer scenario, where the
+// stale lease ends while the probe is in flight.
+func TestBRFixBR1StaleLeaseDuringProbe(t *testing.T) {
+	accts := []core.Account{acct("a", 0)}
+	h := newHarness(accts, Options{})
+	old, _ := h.p.Acquire(core.ClassInteractive, []string{"a"}, nil)
+	on := mustView(t, h.p, accts, Options{Breaker: BreakerOptions{Threshold: 1, Base: 5 * time.Second, Max: time.Minute}})
+	l, _ := on.Acquire(core.ClassInteractive, []string{"a"}, nil)
+	l.Release(dead)
+	h.clock.Advance(5 * time.Second)
+	probe, d := on.Acquire(core.ClassInteractive, []string{"a"}, nil)
+	if !d.Allow {
+		t.Fatalf("probe denied: %s", d.Reason)
+	}
+	old.Release(answered)
+	if state, _, _, _ := on.Breaker("a"); state != BreakerHalfOpen {
+		t.Errorf("breaker state %q after a stale release, want half_open", state)
+	}
+	if _, d := on.Acquire(core.ClassInteractive, []string{"a"}, nil); d.Allow {
+		t.Errorf("second request admitted while the half-open probe is in flight: %s", d.Reason)
+	}
+	probe.Release(dead)
+	if state, _, _, _ := on.Breaker("a"); state != BreakerOpen {
+		t.Errorf("breaker state %q after a failed probe, want open", state)
+	}
+}
+
+// BR-1 (R1.1): a view built by a reload is inert for the breaker until it is
+// activated, and then its knobs apply to leases of every view.
+func TestBRFixBR1CurrentKnobsApplyToEveryView(t *testing.T) {
+	accts := []core.Account{acct("a", 0)}
+	h := newHarness(accts, Options{})
+	on, err := h.p.WithConfig(accts, Options{Breaker: BreakerOptions{Threshold: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, enabled := on.Breaker("a"); enabled {
+		t.Fatal("breaker enabled by a view that was never activated")
+	}
+	on.Activate()
+	h.attempt(t, "a", dead) // through the old (disabled) view
+	if state, _, _, _ := on.Breaker("a"); state != BreakerOpen {
+		t.Fatalf("state %q after an unreachable release through the old view, want open", state)
+	}
+	if _, d := h.p.Acquire(core.ClassInteractive, []string{"a"}, nil); d.Allow {
+		t.Fatal("old view admitted an open account")
+	}
+	// Disabling clears state on the next release, but keeps the epoch: a
+	// probe from before can never resolve a later open period.
+	h.clock.Advance(5 * time.Second)
+	probe, _ := on.Acquire(core.ClassInteractive, []string{"a"}, nil)
+	mustView(t, h.p, accts, Options{})
+	h.attempt(t, "a", core.Outcome{})
+	mustView(t, h.p, accts, Options{Breaker: BreakerOptions{Threshold: 1}})
+	h.attempt(t, "a", dead) // re-opens: a new epoch
+	h.clock.Advance(5 * time.Second)
+	probe.Release(answered)
+	if state, _, _, _ := on.Breaker("a"); state != BreakerHalfOpen {
+		t.Fatalf("state %q after a stale-epoch probe release, want half_open", state)
+	}
+}
+
+// BR-2 (R1.3): Reached observes reachability when headers arrive. The current
+// probe closes the breaker at once, so other requests are admitted while it
+// streams; its later Release carries no breaker semantics.
+func TestBRFixBR2ReachedClosesProbeBeforeRelease(t *testing.T) {
+	h := breakerHarness(1, 5*time.Second, time.Minute)
+	h.attempt(t, "a", dead)
+	h.clock.Advance(5 * time.Second)
+	probe, d := h.p.Acquire(core.ClassInteractive, []string{"a"}, nil)
+	if !d.Allow {
+		t.Fatalf("probe denied: %s", d.Reason)
+	}
+	probe.(*lease).Reached()
+	if state, fails, _ := h.breaker(t, "a"); state != BreakerClosed || fails != 0 {
+		t.Fatalf("state=%s fails=%d after the probe reached the upstream, want closed/0", state, fails)
+	}
+	other, d := h.p.Acquire(core.ClassInteractive, []string{"a"}, nil)
+	if !d.Allow {
+		t.Fatalf("request refused while the successful probe streams: %s", d.Reason)
+	}
+	other.Release(answered)
+	probe.Release(dead) // e.g. the stream broke: not a reachability failure
+	if state, fails, _ := h.breaker(t, "a"); state != BreakerClosed || fails != 0 {
+		t.Fatalf("state=%s fails=%d, the reached lease's release counted", state, fails)
+	}
+}
+
+// BR-2 (R1.2, R1.3): Reached on a closed breaker resets the count; on a
+// non-probe lease while open it is ignored; after Release it is a no-op.
+func TestBRFixBR2ReachedRules(t *testing.T) {
+	h := breakerHarness(2, 5*time.Second, time.Minute)
+	h.attempt(t, "a", dead)
+	l, _ := h.p.Acquire(core.ClassInteractive, []string{"a"}, nil)
+	l.(*lease).Reached()
+	if _, fails, _ := h.breaker(t, "a"); fails != 0 {
+		t.Fatalf("fails=%d after Reached on a closed breaker, want 0", fails)
+	}
+	l.Release(dead)
+	if _, fails, _ := h.breaker(t, "a"); fails != 0 {
+		t.Fatalf("fails=%d, a reached lease's release counted", fails)
+	}
+	early, _ := h.p.Acquire(core.ClassInteractive, []string{"a"}, nil)
+	h.attempt(t, "a", dead)
+	h.attempt(t, "a", dead)
+	early.(*lease).Reached() // admitted before the breaker opened
+	if state, _, _ := h.breaker(t, "a"); state != BreakerOpen {
+		t.Fatalf("state=%s after Reached on a pre-open lease, want open", state)
+	}
+	early.Release(answered)
+	h.clock.Advance(5 * time.Second)
+	probe, _ := h.p.Acquire(core.ClassInteractive, []string{"a"}, nil)
+	probe.Release(core.Outcome{}) // cancelled: half-open again
+	probe.(*lease).Reached()      // after Release: no-op
+	if state, _, _ := h.breaker(t, "a"); state != BreakerHalfOpen {
+		t.Fatalf("state=%s after Reached on a released probe, want half_open", state)
+	}
+}

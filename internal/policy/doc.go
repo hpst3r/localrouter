@@ -40,4 +40,10 @@
 //
 //	lease, dec, unreachable, retryIn := p.AcquireWithBreaker(class, candidates, exclude)
 //	state, fails, openUntil, enabled := p.Breaker(accountID)
+//
+// Breaker state is shared by every WithConfig view and always follows the
+// knobs of the activated view: New activates itself, and the app calls
+// view.Activate() when it installs a reloaded generation. Leases also
+// implement Reached(), which the proxy calls once response headers arrive so
+// a half-open probe closes the breaker before a long stream ends.
 package policy

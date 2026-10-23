@@ -27,6 +27,9 @@ type runtimeGeneration struct {
 	handler http.Handler
 	pricing *ledger.PricingView
 	status  core.ReloadStatus
+	// policy is the generation's policy view; activated at cutover so its
+	// breaker knobs apply to every in-flight lease (SPEC Amendment R1.1).
+	policy *policy.Policy
 }
 
 func cloneConfig(c *config.Config) (*config.Config, error) {
@@ -193,6 +196,7 @@ func (a *App) reloadConfigLocked(c *config.Config) (core.ReloadStatus, error) {
 		a.srvMu.Unlock()
 		return a.reloadFailure("router shutting down", nil, ErrNotServing)
 	}
+	g.policy.Activate()
 	a.current.Store(g)
 	a.srvMu.Unlock()
 	return a.generationStatus(g), nil
@@ -248,7 +252,7 @@ func (a *App) makeGeneration(c *config.Config, number uint64) (*runtimeGeneratio
 	}
 	routes := c.CoreRoutes()
 	px := proxy.New(proxy.Deps{Accounts: acctMap, Routes: routes, Creds: a.Auth, Quota: a.Quota, Policy: pol, Ledger: priceView, Budget: gate, Authenticate: authenticate, Clock: a.reloadClock, Logger: a.Logger, Limiter: lim}, proxy.Options{MaxFailovers: c.Policy.MaxFailovers})
-	g := &runtimeGeneration{pricing: priceView, status: core.ReloadStatus{Generation: number, OK: true, At: a.reloadClock.Now()}}
+	g := &runtimeGeneration{pricing: priceView, policy: pol, status: core.ReloadStatus{Generation: number, OK: true, At: a.reloadClock.Now()}}
 	deps := control.Deps{Accounts: accounts, Quota: a.Quota, Policy: pol, Ledger: priceView, Routes: routes, Authenticate: authenticate, Clock: a.reloadClock, Storage: a.Ledger, Inflight: viewInflight{lim}, Ready: a.Serving, ReloadStatus: func() core.ReloadStatus { return a.generationStatus(g) }, Budgets: a.budgetSource(c.Budgets)}
 	for _, cl := range c.Clients {
 		deps.Clients = append(deps.Clients, control.ClientInfo{Name: cl.Name, Class: cl.Class, Host: clients[cl.Name].Host, Ingest: cl.Ingest})
