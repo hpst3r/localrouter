@@ -41,6 +41,12 @@
 //	lease, dec, unreachable, retryIn := p.AcquireWithBreaker(class, candidates, exclude)
 //	state, fails, openUntil, enabled := p.Breaker(accountID)
 //
+// Breaker state is shared by every WithConfig view and always follows the
+// knobs of the activated view: New activates itself, and the app calls
+// view.Activate() when it installs a reloaded generation. Leases also
+// implement Reached(), which the proxy calls once response headers arrive so
+// a half-open probe closes the breaker before a long stream ends.
+//
 // A pooled route (core.Route.BalanceStrategy != "", routes[].balance) uses
 // AcquireBalanced instead: among members that pass the breaker, admission and
 // their BalanceMaxInflight cap it picks the lowest (inflight+1)/weight (ties

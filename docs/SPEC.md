@@ -408,6 +408,59 @@ Acceptance tests:
 - B14 60 s of traffic at 10 req/s to a dead single candidate with 3/5s/60s
   reaches the upstream exactly 6 times (`TestB14DeadUpstreamRequestCount`).
 
+Amendment R1 (review findings BR-1, BR-2; supersedes the text above where
+they differ):
+
+- R1.1 Breaker transitions, admission, `Breaker` and status always use the
+  CURRENT generation's breaker knobs, never the knobs of the view that
+  admitted a lease. A policy view becomes current when it is activated
+  (`Policy.Activate`); `New` activates itself and the app activates a
+  reload's view at the generation cutover, so a view built by a reload that
+  then fails never takes effect. If the current knobs disable the breaker,
+  state is cleared lazily on the next lease observation, as before.
+- R1.2 Each account breaker has an `epoch` that increments on every
+  transition into `open` and is never reset. A lease records at admission
+  whether it is the probe and the epoch it was admitted in. Only the probe
+  lease of the current epoch resolves `half_open` (close, re-open, or a
+  neutral end back to `half_open`). Any other lease changes the breaker only
+  while it is `closed` (count or reset); while `open`/`half_open` its outcome
+  is ignored, and a probe lease from an older epoch is ignored.
+- R1.3 Reachability is observed when response headers arrive, not at
+  release. Policy leases implement an optional `Reached()` method; the proxy
+  detects it by a package-local interface (like `AcquireWithBreaker`) and
+  calls it as soon as the headers of an answer that is not request-scoped
+  arrive (after the request-scope classification, before the body is
+  relayed). For the current-epoch probe it closes the breaker immediately and
+  frees the probe slot; on a `closed` breaker it resets the consecutive
+  count. The lease's later Release still applies cooldowns but carries no
+  breaker semantics (it never re-counts; a stream error after headers, or a
+  transport failure on the same lease's credential-refresh retry, does not
+  count). Transport failures are still counted at release (no headers ever
+  arrived). Leases without `Reached` keep the release-time rules above.
+- R1.4 `breakerState` is the single source of truth: status, admission and
+  logs derive from it; the Warn `upstream breaker open` line is emitted
+  exactly when the state becomes `open`, the Info close line exactly when it
+  becomes `closed`.
+- R1.5 Acceptance tests:
+  - BR-1 a lease admitted under a breaker-disabled generation and released
+    (neutral, success or unreachable) after a reload enabled and opened the
+    breaker changes nothing; exactly one probe; a failed probe re-opens
+    (`TestBRFixBR1StaleGenerationLeaseKeepsBreaker`,
+    `TestBRFixBR1StaleLeaseDuringProbe`); knobs take effect on activation for
+    leases of every view, and a stale-epoch probe cannot resolve a later open
+    period (`TestBRFixBR1CurrentKnobsApplyToEveryView`); end to end, a reload
+    enables the breaker while a long response admitted under the disabled
+    configuration is in flight, the breaker opens, the old response ends
+    during the probe without changing state, a second request gets 503 and
+    exactly one probe reaches the upstream
+    (`TestBRFixBR1ReloadEnablesBreakerDuringStream`).
+  - BR-2 a half-open probe that receives 200 headers closes the breaker while
+    its stream continues; other requests are served
+    (`TestBRFixBR2StreamingProbeClosesOnHeaders`,
+    `TestBRFixBR2ReachedClosesProbeBeforeRelease`); `Reached` resets the count
+    when closed, is ignored for a pre-open lease, and is a no-op after
+    Release (`TestBRFixBR2ReachedRules`).
+
 ## Pooled backends (`routes[].balance`)
 
 Opt-in, per route: treat the route's candidates as a pool of equal

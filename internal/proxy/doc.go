@@ -12,6 +12,9 @@
 // response headers (DNS, dial, TLS, reset, header timeout) is reported as
 // core.Outcome.Unreachable for the reachability breaker; when a policy
 // implementing AcquireWithBreaker (internal/policy) refuses every candidate
+// only because of the breaker, the answer is 503 upstream_unavailable. A
+// lease implementing Reached() is told as soon as the headers of an answer
+// that is not request-scoped arrive, before the body is relayed.
 // only because of the breaker, the answer is 503 upstream_unavailable.
 // A pooled route (core.Route.BalanceStrategy set) is admitted through a
 // policy implementing AcquireBalanced; when every member is at max_inflight

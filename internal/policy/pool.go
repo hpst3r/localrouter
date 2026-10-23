@@ -91,7 +91,7 @@ func (p *Policy) AcquireBalanced(class core.Class, candidates []string, exclude 
 	if s.key != "" {
 		p.aff.put(s.key, s.id, s.now.Add(route.BalanceStickyTTL))
 	}
-	base := p.leaseLocked(c, s.id)
+	base := p.leaseLocked(s.id)
 	return &PoolLease{lease: base, pick: s.pick, inflight: p.state[s.id].inflight, cap: s.cap}, s.dec, "", nil, 0
 }
 
@@ -140,7 +140,7 @@ func (p *Policy) scanPoolLocked(c *cfg, class core.Class, candidates []string, e
 			continue
 		}
 		st := p.state[id]
-		if blocked, why, at := breakerBlocks(c, &st.br, s.now); blocked {
+		if blocked, why, at := breakerBlocks(p.breakerOpts(), &st.br, s.now); blocked {
 			reasons = append(reasons, id+": "+why)
 			unreachable = append(unreachable, id)
 			if s.retryAt.IsZero() || at.Before(s.retryAt) {

@@ -251,6 +251,9 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		status := resp.StatusCode
 
 		scoped, final, idledOut := p.classify(account, status, resp, cancelUp)
+		if !scoped {
+			markReached(lease)
+		}
 		if idledOut {
 			// The error body stalled: keep what was read, and fail over or
 			// relay it.

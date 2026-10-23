@@ -76,6 +76,9 @@ type Policy struct {
 	// aff is the pooled-route session-affinity table, guarded by mu and
 	// shared by reference across views like state.
 	aff *affinity
+	// brOpts holds the breaker knobs of the activated generation (see
+	// Activate), shared by reference across views like state.
+	brOpts *atomic.Pointer[BreakerOptions]
 }
 
 type accountState struct {
@@ -98,12 +101,14 @@ func New(accounts []core.Account, quota core.QuotaSource, opts Options) *Policy 
 	opts = normalizeOptions(opts)
 	c := buildCfg(accounts, opts)
 	p := &Policy{
-		quota: quota,
-		mu:    &sync.Mutex{},
-		state: make(map[string]*accountState, len(c.accounts)),
-		aff:   newAffinity(),
+		quota:  quota,
+		mu:     &sync.Mutex{},
+		state:  make(map[string]*accountState, len(c.accounts)),
+		aff:    newAffinity(),
+		brOpts: &atomic.Pointer[BreakerOptions]{},
 	}
 	p.cur.Store(c)
+	p.Activate()
 	for id := range c.accounts {
 		p.state[id] = &accountState{}
 	}
@@ -119,7 +124,8 @@ func New(accounts []core.Account, quota core.QuotaSource, opts Options) *Policy 
 // Clock and Logger are process identity pinned by New and are carried over
 // unchanged; the reloadable knobs are StaleAfter, SafetyMargin and
 // InflightEstimate and Breaker. Inputs are validated and cloned, so the caller may freely
-// reuse or mutate its slices and maps afterwards.
+// reuse or mutate its slices and maps afterwards. The view's Breaker knobs take
+// effect, for every view, only once the view is activated (see Activate).
 //
 // WithConfig never mutates the receiver. It returns an error and mutates
 // nothing when the accounts are not the same topology as the running
@@ -137,7 +143,7 @@ func (p *Policy) WithConfig(accounts []core.Account, opts Options) (*Policy, err
 	opts.Logger = base.opts.Logger
 	opts = normalizeOptions(opts)
 
-	v := &Policy{quota: p.quota, mu: p.mu, state: p.state, aff: p.aff}
+	v := &Policy{quota: p.quota, mu: p.mu, state: p.state, aff: p.aff, brOpts: p.brOpts}
 	v.cur.Store(buildCfg(accounts, opts))
 	return v, nil
 }
@@ -154,17 +160,17 @@ func (p *Policy) Acquire(class core.Class, candidates []string, exclude map[stri
 		c.opts.Logger.Info("policy denied", "class", class, "reason", sel.dec.Reason)
 		return nil, sel.dec
 	}
-	return p.leaseLocked(c, sel.id), sel.dec
+	return p.leaseLocked(sel.id), sel.dec
 }
 
 // leaseLocked creates the lease on an admitted account. Admitting a half-open
-// account makes this lease its single breaker probe, atomically with the
-// admission decision. p.mu must be held.
-func (p *Policy) leaseLocked(c *cfg, id string) *lease {
+// account makes this lease its single breaker probe for the current epoch,
+// atomically with the admission decision. p.mu must be held.
+func (p *Policy) leaseLocked(id string) *lease {
 	st := p.state[id]
 	st.inflight++
-	l := &lease{p: p, id: id}
-	if c.opts.Breaker.enabled() && st.br.tripped {
+	l := &lease{p: p, id: id, epoch: st.br.epoch}
+	if p.breakerOpts().enabled() && st.br.tripped {
 		st.br.probe, l.probe = true, true
 	}
 	return l
@@ -192,7 +198,7 @@ func (p *Policy) Status(accountID string) core.AccountState {
 	snap, has := p.quota.Latest(accountID)
 	bgOK, bgReason := p.admitLocked(c, acct, core.ClassBackground, now)
 	inOK, inReason := p.admitLocked(c, acct, core.ClassInteractive, now)
-	if blocked, why, _ := breakerBlocks(c, &st.br, now); blocked {
+	if blocked, why, _ := breakerBlocks(p.breakerOpts(), &st.br, now); blocked {
 		bgOK, bgReason, inOK, inReason = false, why, false, why
 	}
 	out := core.AccountState{
@@ -246,7 +252,7 @@ func (p *Policy) selectLocked(c *cfg, class core.Class, candidates []string, exc
 			sel.others++
 			continue
 		}
-		if blocked, why, at := breakerBlocks(c, &p.state[id].br, sel.now); blocked {
+		if blocked, why, at := breakerBlocks(p.breakerOpts(), &p.state[id].br, sel.now); blocked {
 			reasons = append(reasons, id+": "+why)
 			sel.unreachable = append(sel.unreachable, id)
 			if sel.retryAt.IsZero() || at.Before(sel.retryAt) {
@@ -348,10 +354,12 @@ func (p *Policy) isStale(c *cfg, snap core.Snapshot, has bool, now time.Time) bo
 	return !has || now.Sub(snap.FetchedAt) > c.opts.StaleAfter
 }
 
-func (p *Policy) release(id string, o core.Outcome, probe bool) {
+func (p *Policy) release(l *lease, o core.Outcome) {
+	id := l.id
 	c := p.cur.Load()
 	now := c.opts.Clock.Now()
 	p.mu.Lock()
+	l.released = true
 	st := p.state[id]
 	if st.inflight > 0 {
 		st.inflight--
@@ -395,18 +403,12 @@ func (p *Policy) release(id string, o core.Outcome, probe bool) {
 			st.topUpFrom = &b
 		}
 	}
-	brClass := st.br.class
-	opened, closed := breakerRelease(c, &st.br, o, probe, now)
-	brFails, brUntil := st.br.fails, st.br.until
+	// Any received status is reachability unless request-scoped; a lease the
+	// proxy already marked Reached carries no breaker semantics here.
+	ev := p.observeLocked(l, o.Unreachable, o.Unreachable == "" && o.Status != 0 && !o.RequestScoped, now)
 	p.mu.Unlock()
 
-	if opened {
-		c.opts.Logger.Warn("upstream breaker open", "account", id, "error_class", o.Unreachable,
-			"consecutive_failures", brFails, "until", brUntil)
-	}
-	if closed {
-		c.opts.Logger.Info("upstream breaker closed", "account", id, "error_class", brClass)
-	}
+	ev.log(c.opts.Logger, id)
 	if !until.IsZero() {
 		c.opts.Logger.Info("account cooldown", "account", id, "status", o.Status, "until", until)
 	}
@@ -597,8 +599,12 @@ func hasReserve(a core.Account) bool {
 type lease struct {
 	p     *Policy
 	id    string
-	probe bool // the account's half-open breaker probe
+	probe bool   // the account's half-open breaker probe
+	epoch uint64 // the account's breaker epoch at admission
 	once  sync.Once
+	// reached and released are guarded by p.mu: reachability was observed
+	// (Reached), and the lease was released.
+	reached, released bool
 }
 
 // AccountID returns the leased account.
@@ -606,5 +612,5 @@ func (l *lease) AccountID() string { return l.id }
 
 // Release ends the lease; subsequent calls are no-ops.
 func (l *lease) Release(o core.Outcome) {
-	l.once.Do(func() { l.p.release(l.id, o, l.probe) })
+	l.once.Do(func() { l.p.release(l, o) })
 }

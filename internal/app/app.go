@@ -252,6 +252,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		_ = led.Close()
 		return nil, err
 	}
+	generation.policy.Activate()
 	a.current.Store(generation)
 	a.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		g := a.current.Load()
