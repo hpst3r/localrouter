@@ -536,10 +536,28 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	}
 
 	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_ = rc.Flush()
-
 	capture := newUsageCapture(resp.Header.Get("Content-Type"))
+
+	// An upstream without a Content-Type (the Codex backend's streams) has its
+	// body sniffed by the capture. The status line waits for that decision so
+	// an event stream is relayed as text/event-stream; the bytes read meanwhile
+	// (bounded by maxSniffBytes plus one chunk, and in time by the idle
+	// timeout) are held and then relayed unchanged. An upstream Content-Type
+	// is never overridden.
+	var held []byte
+	headerSent := false
+	sendHeader := func() {
+		headerSent = true
+		if capture.sse && resp.Header.Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "text/event-stream")
+		}
+		w.WriteHeader(resp.StatusCode)
+		_ = rc.Flush()
+	}
+	if capture.Decided() {
+		sendHeader()
+	}
+
 	buf := make([]byte, streamChunkSize)
 	var (
 		written  int64
@@ -547,6 +565,29 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 		idledOut bool
 		readErr  error
 	)
+	// relay writes b to the client, sending the held status line and bytes
+	// first once the capture has decided (or end decides for it). It reports
+	// false if the client write failed.
+	relay := func(b []byte) bool {
+		if !headerSent {
+			if !capture.Decided() {
+				held = append(held, b...)
+				return true
+			}
+			sendHeader()
+			b, held = append(held, b...), nil
+		}
+		if len(b) == 0 {
+			return true
+		}
+		wn, werr := w.Write(b)
+		written += int64(wn)
+		if werr != nil {
+			return false
+		}
+		_ = rc.Flush()
+		return true
+	}
 	for {
 		if timer != nil {
 			timer.Reset(p.opts.StreamIdleTimeout)
@@ -557,13 +598,19 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 		}
 		if n > 0 {
 			_, _ = capture.Write(buf[:n])
-			wn, werr := w.Write(buf[:n])
-			written += int64(wn)
-			if werr != nil {
+			if !relay(buf[:n]) {
 				aborted = true
 				break
 			}
-			_ = rc.Flush()
+		}
+		if err != nil && !headerSent {
+			// The body ended (or failed) while still undecided: settle the
+			// mode from what arrived and relay it.
+			capture.settle()
+			if !relay(nil) {
+				aborted = true
+				break
+			}
 		}
 		if err == io.EOF {
 			break

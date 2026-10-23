@@ -246,8 +246,12 @@ func (c *usageCapture) decide(sse bool) {
 	_, _ = c.Write(pending)
 }
 
+// Decided reports whether the body's mode (SSE or JSON) is known. It is false
+// only while an untyped body is still being sniffed.
+func (c *usageCapture) Decided() bool { return !c.sniffing }
+
 // settle ends any undecided sniff at end of body, as JSON unless the bytes
-// already identify SSE.
+// already identify SSE. It is idempotent.
 func (c *usageCapture) settle() {
 	if c.sniffing {
 		sse, _ := sniffSSE(c.pending)

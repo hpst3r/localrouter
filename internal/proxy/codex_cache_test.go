@@ -220,8 +220,8 @@ func codexLiveStream() string {
 		`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n" +
 		"event: response.completed\n" +
 		`data: {"type":"response.completed","response":{"id":"r1","instructions":"` + instr + `","usage":` +
-		`{"input_tokens":3521,"input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0},"output_tokens":5,` +
-		`"output_tokens_details":{"reasoning_tokens":0},"total_tokens":3526,"attribution":{"source":"x","n":[1,2]}}}}` + "\n\n"
+		`{"input_tokens":3521,"input_tokens_details":{"cached_tokens":3328,"cache_write_tokens":0},"output_tokens":5,` +
+		`"output_tokens_details":{"reasoning_tokens":2},"total_tokens":3526,"attribution":{"source":"x","n":[1,2]}}}}` + "\n\n"
 }
 
 // noContentType suppresses net/http's Content-Type sniffing on w.
@@ -229,7 +229,7 @@ func noContentType(w http.ResponseWriter) { w.Header()["Content-Type"] = nil }
 
 func TestUsageCapturedFromSSEWithoutContentType(t *testing.T) {
 	stream := codexLiveStream()
-	want := core.Usage{InputTokens: 3521, OutputTokens: 5}
+	want := core.Usage{InputTokens: 3521, CachedInputTokens: 3328, OutputTokens: 5, ReasoningTokens: 2}
 	for _, tc := range []struct {
 		name  string
 		steps []int // chunk sizes cycled over the stream
@@ -258,7 +258,8 @@ func TestUsageCapturedFromSSEWithoutContentType(t *testing.T) {
 			if string(body) != stream {
 				t.Fatalf("relayed body differs (len %d vs %d)", len(body), len(stream))
 			}
-			if ct, ok := resp.Header["Content-Type"]; ok {
+			// Sniffed SSE is relayed as an event stream.
+			if ct := resp.Header.Values("Content-Type"); len(ct) != 1 || ct[0] != "text/event-stream" {
 				t.Fatalf("client got Content-Type %q", ct)
 			}
 			row := h.waitRows(1)[0]
