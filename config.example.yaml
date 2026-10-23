@@ -75,6 +75,23 @@ routes:
     models: [deepseek-v4.1-flash, kimi-k3]
     interactive: [ollama-cloud]
     background:  [ollama-cloud]
+  # Pooled self-hosted replicas (routes[].balance): spread one alias over
+  # equal llama-server boxes by weighted least in-flight instead of "first
+  # admissible wins". Members must equal interactive ∪ background, share one
+  # openai_compat/ollama provider and cost_basis, and (with upstreams) declare
+  # identical capabilities. Absent block = the ordered route above.
+  # - name: qwen-local
+  #   models: [qwen3.5:9b]
+  #   upstream_model: unsloth/Qwen3.5-9B-GGUF:Q4_K_M
+  #   interactive: [lab-6800xt, lab-p100]   # order = tie-break preference
+  #   background:  [lab-p100, lab-6800xt]
+  #   balance:
+  #     strategy: least_inflight            # required; only value
+  #     identity: "Qwen3.5-9B Q4_K_M"       # required declaration of model+quant
+  #     sticky_ttl: 15m                     # optional X-LocalRouter-Session affinity; 0/absent = off
+  #     members:
+  #       lab-6800xt: {weight: 2, max_inflight: 4}   # max_inflight = llama-server -np; 0 = uncapped
+  #       lab-p100:   {weight: 1, max_inflight: 2}
 
 claude_logs:                  # ingest Claude Code token usage from local transcripts
   enabled: true

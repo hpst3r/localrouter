@@ -73,6 +73,9 @@ type Policy struct {
 	// reference across views so an outstanding lease's Release finds its
 	// counter in any generation.
 	state map[string]*accountState
+	// aff is the pooled-route session-affinity table, guarded by mu and
+	// shared by reference across views like state.
+	aff *affinity
 }
 
 type accountState struct {
@@ -98,6 +101,7 @@ func New(accounts []core.Account, quota core.QuotaSource, opts Options) *Policy 
 		quota: quota,
 		mu:    &sync.Mutex{},
 		state: make(map[string]*accountState, len(c.accounts)),
+		aff:   newAffinity(),
 	}
 	p.cur.Store(c)
 	for id := range c.accounts {
@@ -133,7 +137,7 @@ func (p *Policy) WithConfig(accounts []core.Account, opts Options) (*Policy, err
 	opts.Logger = base.opts.Logger
 	opts = normalizeOptions(opts)
 
-	v := &Policy{quota: p.quota, mu: p.mu, state: p.state}
+	v := &Policy{quota: p.quota, mu: p.mu, state: p.state, aff: p.aff}
 	v.cur.Store(buildCfg(accounts, opts))
 	return v, nil
 }

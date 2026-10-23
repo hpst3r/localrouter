@@ -88,6 +88,8 @@ type diagnosticsDoc struct {
 	// fabricating a generation.
 	Reload   *core.ReloadStatus `json:"reload,omitempty"`
 	Accounts []diagAccount      `json:"accounts"`
+	// Pools is present only when some route has a balance block.
+	Pools []diagPool `json:"pools,omitempty"`
 }
 
 type storageHealth struct {
@@ -134,6 +136,7 @@ func (s *Server) diagnostics(w http.ResponseWriter, r *http.Request) {
 	for _, a := range s.deps.Accounts {
 		doc.Accounts = append(doc.Accounts, s.diagAccount(a, now))
 	}
+	doc.Pools = s.pools()
 	writeJSON(w, http.StatusOK, doc)
 }
 

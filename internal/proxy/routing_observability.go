@@ -53,6 +53,9 @@ type attemptEvent struct {
 	// attempt — NOT an actual next lease. See the type comment.
 	failoverEligible bool
 	latencyMS        int64 // finalized ledger latency (core.RequestRecord.LatencyMS)
+	// pool is set only on a pooled route (routes[].balance): how the member
+	// was picked and its in-flight count/cap at pick time.
+	pool *poolPick
 }
 
 // emitAttempt writes one structured completion record through the proxy's
@@ -77,6 +80,9 @@ func (p *Proxy) emitAttempt(ev attemptEvent) {
 	}
 	if ev.prevID != "" {
 		attrs = append(attrs, "failover_of", ev.prevID)
+	}
+	if ev.pool != nil {
+		attrs = append(attrs, "pool_pick", ev.pool.pick, "member_inflight", ev.pool.inflight, "member_cap", ev.pool.maxInflight)
 	}
 	p.log.Info("attempt completed", attrs...)
 }

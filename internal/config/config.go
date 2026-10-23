@@ -370,6 +370,9 @@ type RouteConfig struct {
 	// unknown keys are rejected. Absent/empty preserves the legacy
 	// unconstrained route.
 	Upstreams map[string]UpstreamSpec `yaml:"upstreams"`
+	// Balance, when present, pools the route's candidates (see BalanceConfig).
+	// Absent keeps the legacy ordered first-admissible selection.
+	Balance *BalanceConfig `yaml:"balance"`
 }
 
 // UpstreamSpec is one candidate account's capability descriptor inside
@@ -755,6 +758,7 @@ func (c *Config) Validate() error {
 			}
 		}
 		errs = append(errs, validateUpstreams(r, provider)...)
+		errs = append(errs, validateBalance(r, c.Accounts)...)
 	}
 	if c.ClaudeLogs.Enabled {
 		if c.ClaudeLogs.Account == "" {
@@ -895,14 +899,16 @@ func (c *Config) CoreRoutes() []core.Route {
 				}
 			}
 		}
-		out = append(out, core.Route{
+		cr := core.Route{
 			Name:          r.Name,
 			Models:        append([]string(nil), r.Models...),
 			UpstreamModel: r.UpstreamModel,
 			Interactive:   append([]string(nil), r.Interactive...),
 			Background:    append([]string(nil), bg...),
 			Upstreams:     ups,
-		})
+		}
+		r.Balance.project(&cr)
+		out = append(out, cr)
 	}
 	return out
 }

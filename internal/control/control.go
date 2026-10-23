@@ -710,6 +710,7 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var candidates []string
+	var pooled *core.Route
 	if req.Account != "" {
 		if !slices.ContainsFunc(s.deps.Accounts, func(a core.Account) bool { return a.ID == req.Account }) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("unknown account %q", req.Account))
@@ -737,12 +738,13 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		candidates = filtered
+		pooled = &route
 	}
 	if s.deps.Policy == nil {
 		writeError(w, http.StatusServiceUnavailable, "policy unavailable")
 		return
 	}
-	d := s.deps.Policy.DryRun(class, candidates)
+	d := s.dryRun(r, class, candidates, pooled)
 	resp := admitResponse{Decision: "deny", AccountID: d.AccountID, Reason: d.Reason}
 	if resp.AccountID == "" {
 		resp.AccountID = req.Account

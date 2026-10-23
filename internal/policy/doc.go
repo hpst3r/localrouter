@@ -40,4 +40,15 @@
 //
 //	lease, dec, unreachable, retryIn := p.AcquireWithBreaker(class, candidates, exclude)
 //	state, fails, openUntil, enabled := p.Breaker(accountID)
+//
+// A pooled route (core.Route.BalanceStrategy != "", routes[].balance) uses
+// AcquireBalanced instead: among members that pass the breaker, admission and
+// their BalanceMaxInflight cap it picks the lowest (inflight+1)/weight (ties
+// to candidate order), or a live X-LocalRouter-Session binding kept in a
+// 4,096-entry LRU shared across views. A denial carries a PoolDeny* kind;
+// DryRunBalanced evaluates without side effects and AffinityEntries counts
+// bindings for diagnostics:
+//
+//	lease, dec, denial, accounts, retryIn := p.AcquireBalanced(class, candidates, exclude, route, session)
+//	pick, inflight, maxInflight := lease.(*policy.PoolLease).Pick()
 package policy
