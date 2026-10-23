@@ -226,7 +226,7 @@ func (a *App) makeGeneration(c *config.Config, number uint64) (*runtimeGeneratio
 	for _, acct := range accounts {
 		acctMap[acct.ID] = acct
 	}
-	pol, err := a.Policy.WithConfig(accounts, policy.Options{StaleAfter: c.Policy.StaleAfter.D(), SafetyMargin: c.Policy.SafetyMargin, InflightEstimate: c.Policy.InflightEstimate, Clock: a.reloadClock, Logger: a.Logger})
+	pol, err := a.Policy.WithConfig(accounts, policy.Options{StaleAfter: c.Policy.StaleAfter.D(), SafetyMargin: c.Policy.SafetyMargin, InflightEstimate: c.Policy.InflightEstimate, Clock: a.reloadClock, Logger: a.Logger, Breaker: breakerOptions(c.Policy.Breaker)})
 	if err != nil {
 		return nil, "policy invalid", err
 	}
@@ -330,3 +330,8 @@ func sanitizeCollectorRecord(r core.RequestRecord) (core.RequestRecord, error) {
 	return r, nil
 }
 func (l collectorLedger) Close() error { return nil }
+
+// breakerOptions maps policy.breaker onto the policy's breaker knobs.
+func breakerOptions(b config.BreakerConfig) policy.BreakerOptions {
+	return policy.BreakerOptions{Threshold: b.Threshold, Base: b.Base.D(), Max: b.Max.D()}
+}

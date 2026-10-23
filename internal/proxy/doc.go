@@ -8,7 +8,11 @@
 // reaches the client, and records one core.RequestRecord per attempt.
 // OpenRouter failures caused by the request itself (moderation 403, a 402
 // while funds are known, a non-exhaustion 429) are reported to policy as
-// request-scoped so they never cool the account down.
+// request-scoped so they never cool the account down. A send that got no
+// response headers (DNS, dial, TLS, reset, header timeout) is reported as
+// core.Outcome.Unreachable for the reachability breaker; when a policy
+// implementing AcquireWithBreaker (internal/policy) refuses every candidate
+// only because of the breaker, the answer is 503 upstream_unavailable.
 //
 // Public API wired by cmd/localrouter:
 //

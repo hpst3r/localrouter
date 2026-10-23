@@ -32,6 +32,9 @@ type Options struct {
 	Clock core.Clock
 	// Logger defaults to a discarding logger.
 	Logger *slog.Logger
+	// Breaker configures the reachability breaker; the zero value disables
+	// it. It is a reloadable knob.
+	Breaker BreakerOptions
 }
 
 // ErrTopologyChanged reports that a new generation's accounts differ from the
@@ -81,6 +84,8 @@ type accountState struct {
 	// when unknown, then any positive balance).
 	topUp     bool
 	topUpFrom *float64
+	// br is the reachability breaker (policy.breaker).
+	br breakerState
 }
 
 var _ core.Policy = (*Policy)(nil)
@@ -109,7 +114,7 @@ func New(accounts []core.Account, quota core.QuotaSource, opts Options) *Policy 
 //
 // Clock and Logger are process identity pinned by New and are carried over
 // unchanged; the reloadable knobs are StaleAfter, SafetyMargin and
-// InflightEstimate. Inputs are validated and cloned, so the caller may freely
+// InflightEstimate and Breaker. Inputs are validated and cloned, so the caller may freely
 // reuse or mutate its slices and maps afterwards.
 //
 // WithConfig never mutates the receiver. It returns an error and mutates
@@ -140,13 +145,25 @@ func (p *Policy) Acquire(class core.Class, candidates []string, exclude map[stri
 	c := p.cur.Load()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	id, dec := p.selectLocked(c, class, candidates, exclude)
-	if !dec.Allow {
-		c.opts.Logger.Info("policy denied", "class", class, "reason", dec.Reason)
-		return nil, dec
+	sel := p.selectLocked(c, class, candidates, exclude)
+	if !sel.dec.Allow {
+		c.opts.Logger.Info("policy denied", "class", class, "reason", sel.dec.Reason)
+		return nil, sel.dec
 	}
-	p.state[id].inflight++
-	return &lease{p: p, id: id}, dec
+	return p.leaseLocked(c, sel.id), sel.dec
+}
+
+// leaseLocked creates the lease on an admitted account. Admitting a half-open
+// account makes this lease its single breaker probe, atomically with the
+// admission decision. p.mu must be held.
+func (p *Policy) leaseLocked(c *cfg, id string) *lease {
+	st := p.state[id]
+	st.inflight++
+	l := &lease{p: p, id: id}
+	if c.opts.Breaker.enabled() && st.br.tripped {
+		st.br.probe, l.probe = true, true
+	}
+	return l
 }
 
 // DryRun evaluates candidates like Acquire without creating a lease.
@@ -154,8 +171,7 @@ func (p *Policy) DryRun(class core.Class, candidates []string) core.Decision {
 	c := p.cur.Load()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	_, dec := p.selectLocked(c, class, candidates, nil)
-	return dec
+	return p.selectLocked(c, class, candidates, nil).dec
 }
 
 // Status describes the admission state of one account.
@@ -172,6 +188,9 @@ func (p *Policy) Status(accountID string) core.AccountState {
 	snap, has := p.quota.Latest(accountID)
 	bgOK, bgReason := p.admitLocked(c, acct, core.ClassBackground, now)
 	inOK, inReason := p.admitLocked(c, acct, core.ClassInteractive, now)
+	if blocked, why, _ := breakerBlocks(c, &st.br, now); blocked {
+		bgOK, bgReason, inOK, inReason = false, why, false, why
+	}
 	out := core.AccountState{
 		Inflight:              st.inflight,
 		Stale:                 p.isStale(c, snap, has, now),
@@ -190,33 +209,65 @@ func (p *Policy) Status(accountID string) core.AccountState {
 	return out
 }
 
-func (p *Policy) selectLocked(c *cfg, class core.Class, candidates []string, exclude map[string]bool) (string, core.Decision) {
-	now := c.opts.Clock.Now()
+// selection is the result of one selectLocked pass.
+type selection struct {
+	id  string
+	dec core.Decision
+	now time.Time
+	// unreachable lists the candidates the reachability breaker refused and
+	// retryAt the earliest of their half-open times; others counts every
+	// other rejection.
+	unreachable []string
+	retryAt     time.Time
+	others      int
+}
+
+// onlyBreaker reports a denial in which every rejection was the breaker.
+func (s selection) onlyBreaker() bool {
+	return !s.dec.Allow && len(s.unreachable) > 0 && s.others == 0
+}
+
+func (p *Policy) selectLocked(c *cfg, class core.Class, candidates []string, exclude map[string]bool) selection {
+	sel := selection{now: c.opts.Clock.Now()}
 	var reasons []string
 	for _, id := range candidates {
 		if exclude[id] {
 			reasons = append(reasons, id+": excluded")
+			sel.others++
 			continue
 		}
 		acct, ok := c.accounts[id]
 		if !ok {
 			reasons = append(reasons, id+": unknown account")
+			sel.others++
 			continue
 		}
-		if ok, why := p.admitLocked(c, acct, class, now); !ok {
+		if blocked, why, at := breakerBlocks(c, &p.state[id].br, sel.now); blocked {
 			reasons = append(reasons, id+": "+why)
+			sel.unreachable = append(sel.unreachable, id)
+			if sel.retryAt.IsZero() || at.Before(sel.retryAt) {
+				sel.retryAt = at
+			}
+			continue
+		}
+		if ok, why := p.admitLocked(c, acct, class, sel.now); !ok {
+			reasons = append(reasons, id+": "+why)
+			sel.others++
 			continue
 		}
 		reason := "admitted " + id
 		if len(reasons) > 0 {
 			reason += " (skipped " + strings.Join(reasons, "; ") + ")"
 		}
-		return id, core.Decision{Allow: true, AccountID: id, Reason: reason}
+		sel.id, sel.dec = id, core.Decision{Allow: true, AccountID: id, Reason: reason}
+		return sel
 	}
 	if len(reasons) == 0 {
-		return "", core.Decision{Reason: "no candidate accounts"}
+		sel.dec = core.Decision{Reason: "no candidate accounts"}
+		return sel
 	}
-	return "", core.Decision{Reason: strings.Join(reasons, "; ")}
+	sel.dec = core.Decision{Reason: strings.Join(reasons, "; ")}
+	return sel
 }
 
 // admitLocked applies the admission rules to one account using configuration
@@ -293,7 +344,7 @@ func (p *Policy) isStale(c *cfg, snap core.Snapshot, has bool, now time.Time) bo
 	return !has || now.Sub(snap.FetchedAt) > c.opts.StaleAfter
 }
 
-func (p *Policy) release(id string, o core.Outcome) {
+func (p *Policy) release(id string, o core.Outcome, probe bool) {
 	c := p.cur.Load()
 	now := c.opts.Clock.Now()
 	p.mu.Lock()
@@ -340,8 +391,18 @@ func (p *Policy) release(id string, o core.Outcome) {
 			st.topUpFrom = &b
 		}
 	}
+	brClass := st.br.class
+	opened, closed := breakerRelease(c, &st.br, o, probe, now)
+	brFails, brUntil := st.br.fails, st.br.until
 	p.mu.Unlock()
 
+	if opened {
+		c.opts.Logger.Warn("upstream breaker open", "account", id, "error_class", o.Unreachable,
+			"consecutive_failures", brFails, "until", brUntil)
+	}
+	if closed {
+		c.opts.Logger.Info("upstream breaker closed", "account", id, "error_class", brClass)
+	}
 	if !until.IsZero() {
 		c.opts.Logger.Info("account cooldown", "account", id, "status", o.Status, "until", until)
 	}
@@ -362,6 +423,7 @@ func normalizeOptions(opts Options) Options {
 	if opts.Logger == nil {
 		opts.Logger = slog.New(slog.DiscardHandler)
 	}
+	opts.Breaker = normalizeBreaker(opts.Breaker)
 	return opts
 }
 
@@ -428,7 +490,7 @@ func validateOptions(opts Options) error {
 	if opts.InflightEstimate < 0 || opts.InflightEstimate >= 1 {
 		return fmt.Errorf("%w: inflight estimate %v out of range [0,1)", ErrInvalidConfig, opts.InflightEstimate)
 	}
-	return nil
+	return validateBreaker(opts.Breaker)
 }
 
 func effectiveUsed(w core.Window, now time.Time) float64 {
@@ -529,9 +591,10 @@ func hasReserve(a core.Account) bool {
 }
 
 type lease struct {
-	p    *Policy
-	id   string
-	once sync.Once
+	p     *Policy
+	id    string
+	probe bool // the account's half-open breaker probe
+	once  sync.Once
 }
 
 // AccountID returns the leased account.
@@ -539,5 +602,5 @@ func (l *lease) AccountID() string { return l.id }
 
 // Release ends the lease; subsequent calls are no-ops.
 func (l *lease) Release(o core.Outcome) {
-	l.once.Do(func() { l.p.release(l.id, o) })
+	l.once.Do(func() { l.p.release(l.id, o, l.probe) })
 }

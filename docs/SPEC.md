@@ -275,6 +275,139 @@ long the upstream request is aborted, the ledger row records `upstream idle
 timeout reading error body`, and the bytes read so far are failed over or
 relayed as the answer.
 
+## Reachability breaker (`policy.breaker`)
+
+Opt-in, per account: stop paying a DNS/dial timeout on every request to an
+upstream that cannot be reached.
+
+```yaml
+policy:
+  breaker:
+    threshold: 3   # consecutive unreachable attempts to open; 0/absent = disabled (default)
+    base: 5s       # first open period (default 5s when enabled)
+    max: 60s       # cap for the doubling open period (default 60s when enabled)
+```
+
+Negative values, and `max < base`, are rejected at load and by `localrouter
+check` (an enabled `base` above the 60s default needs an explicit `max`).
+With the block absent the router is unchanged. The block reloads on SIGHUP
+like the other policy knobs; breaker state lives with the cooldown/in-flight
+state shared by every policy generation, so it survives reloads (new knobs
+apply from the next transition). Disabling it by reload makes every account
+admissible immediately and clears its state on the next lease release.
+
+What counts (classification lives in the proxy, which releases the lease with
+`core.Outcome.Unreachable` = a fixed error class `dns`, `dial`, `tls`,
+`reset`, `timeout` or `transport`):
+
+- Failure: an attempt that got NO upstream response headers for a reason
+  other than the client cancelling — DNS failure, dial/connect error
+  (refused, unreachable, timeout), TLS handshake failure, connection reset /
+  EOF before headers, response-header timeout.
+- Success: any attempt that received HTTP response headers (any status,
+  2xx-5xx) resets the consecutive count to 0. Stream errors after headers do
+  not count.
+- Neither: request-scoped outcomes (`Outcome.RequestScoped`), client
+  cancellation, and attempts that never reached the transport (credential
+  unavailable, budget denial, body rewrite failure).
+
+States: `closed` → (`threshold` consecutive failures) → `open` for `base` →
+`half_open` when the open period ends. In `half_open` exactly ONE request is
+admitted as a probe, atomically with lease creation under the admission mutex;
+every other request keeps skipping the account while the probe is in flight.
+Probe success → `closed` (count and backoff reset). Probe failure → `open`
+again for double the previous period, capped at `max`. A probe released
+neutrally (client cancellation, request-scoped answer) returns the account to
+`half_open`, so the next request may probe. A lease admitted before the
+breaker opened is never the probe: its result does not close the breaker.
+
+Selection: an `open` (or `half_open` with a probe in flight) account is not
+admissible for any class. It is skipped like a cooled-down account and never
+adds a candidate: a route whose only candidates are open fails closed and
+does not spill to any other account. The policy reason is
+`<id>: upstream unreachable (breaker open until <RFC3339>)` or
+`<id>: upstream unreachable (breaker half-open, probe in flight)`.
+
+Refusal: when the policy denies and every rejected candidate was refused by
+the breaker, the proxy answers
+
+```
+503 Service Unavailable
+Retry-After: <whole seconds until the earliest half-open, rounded up, min 1>
+{"error":{"message":"localrouter: upstream unreachable: <id>, <id>","type":"upstream_unavailable"}}
+```
+
+never 429 (clients treat 502/503/504 as provider-unavailable and back off).
+If the exclusions are mixed (some quota/cooldown/excluded, some breaker) the
+existing `429 quota_reserve` answer is kept and its reason names the breaker
+accounts. A breaker refusal follows the admission-denial convention: no
+upstream attempt, no ledger row, no `routing_attempt_completed` event; the
+`policy denied` log line carries `denial=breaker_open`. A failed attempt
+earlier in the same request still answers with its own 502/relayed error.
+
+Visibility: `/control/v1/status` adds per account (only when the breaker is
+enabled)
+
+```json
+"breaker": {"state": "open", "consecutive_failures": 3, "open_until": "2026-10-01T12:00:05Z"}
+```
+
+`state` is `closed`, `open` or `half_open`; `open_until` (end of the open
+period) is omitted when closed. A non-closed breaker makes `healthy` false and
+the account non-admissible with the breaker reason. `POST /control/v1/admit`
+reports the breaker reason in a deny. The policy logs one Warn line `upstream
+breaker open` (account, error_class, consecutive_failures, until) on each
+open and one Info line `upstream breaker closed` (account, error_class) on
+close.
+
+With threshold 3 / base 5s / max 60s, 60 s of continuous traffic (10 req/s)
+at a dead single-candidate upstream reaches the upstream 6 times (3 to open,
+then probes at +5s, +15s, +35s) instead of 600.
+
+Acceptance tests:
+
+- B1 config: absent block disabled; enabled defaults 5s/60s; negative values
+  and `max < base` rejected (`TestB1BreakerConfig`).
+- B2 disabled breaker is unchanged: a scenario (success, 429 failover, DNS
+  failover, repeated dead single candidate, 500, cooldown denial) yields
+  identical statuses/bodies/Retry-After, ledger rows and attempt events with
+  the real policy (breaker disabled) and with the pre-breaker Acquire path
+  (`TestB2DisabledBreakerIsUnchanged`).
+- B3 counting: unreachable outcomes count; any status resets; request-scoped
+  and neutral releases neither count nor reset; disabled ignores all
+  (`TestB3CountingRules`, `TestB3BreakerDisabledIgnoresUnreachable`).
+- B4 open skips every class; half-open admits exactly one probe, also under
+  64 concurrent acquirers; DryRun never claims it
+  (`TestB4OpenSkipsEveryClassThenOneProbe`, `TestB4ConcurrentProbeIsExclusive`).
+- B5 probe failure doubles the period up to max; probe success closes and
+  resets backoff (`TestB5ProbeOutcomes`).
+- B6 a neutrally released probe returns to half-open; a pre-open lease does
+  not close the breaker (`TestB6CancelledProbeReturnsToHalfOpen`,
+  `TestB6StaleLeaseDoesNotCloseOpenBreaker`).
+- B7 state survives `WithConfig` generations; knobs reload; disabling clears;
+  invalid knobs rejected (`TestB7StateSurvivesReload`,
+  `TestB7ValidatesBreakerKnobs`).
+- B8 open accounts are skipped and never add a candidate; a local-only route
+  whose account is open fails closed with no request to any other account
+  (`TestB8SelectionSkipsOpenAccounts`, `TestB8LocalOnlyRouteFailsClosed`).
+- B9 all-breaker denial is 503 `upstream_unavailable` with ceil Retry-After,
+  no ledger row and no event; mixed denial keeps 429 `quota_reserve` naming
+  the breaker accounts (`TestB9AllBreakerRefusalIs503`,
+  `TestB9RetryAfterRoundsUpAndFloorsAtOne`, `TestB9MixedRefusalKeeps429`).
+- B10 proxy classification: DNS, refused, TLS, response-header timeout and
+  reset map to their classes; an answered 5xx, a client cancellation and a
+  pre-send error do not count (`TestB10ProxyReportsUnreachable`,
+  `TestB10ClientCancelDoesNotCount`, `TestB10ClassifiesTransportErrors`).
+- B11 status `breaker` object (open/closed/half_open, omitted when disabled)
+  and admit deny reason (`TestB11StatusAndAdmitReportBreaker`).
+- B12 one Warn line on open and one Info line on close
+  (`TestB12LogsOpenAndClose`).
+- B13 end to end through the App: config → dead upstream → 503 → status →
+  reload keeps state and applies the new max → removing the block disables
+  (`TestB13BreakerEndToEnd`).
+- B14 60 s of traffic at 10 req/s to a dead single candidate with 3/5s/60s
+  reaches the upstream exactly 6 times (`TestB14DeadUpstreamRequestCount`).
+
 ## Concurrency limits and inbound timeouts
 
 `limits.max_concurrent` (global) and `limits.max_concurrent_per_client`
