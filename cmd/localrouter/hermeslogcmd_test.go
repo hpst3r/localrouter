@@ -111,10 +111,9 @@ func TestCmdHermeslogBackfillSelf(t *testing.T) {
 		strings.Contains(s, "deepseek") {
 		t.Fatalf("dry run output:\n%s", s)
 	}
-	if _, err := os.Stat(filepath.Join(dataDir, "localrouter.db")); err == nil {
-		if n, _ := backfillRows(t, dataDir); n != 0 {
-			t.Fatalf("dry run recorded %d rows", n)
-		}
+	// A dry run writes nothing: it does not even create the ledger.
+	if _, err := os.Stat(filepath.Join(dataDir, "localrouter.db")); !os.IsNotExist(err) {
+		t.Fatalf("dry run created the ledger: %v", err)
 	}
 
 	out.Reset()
@@ -137,6 +136,18 @@ func TestCmdHermeslogBackfillSelf(t *testing.T) {
 	}
 	if n, _ := backfillRows(t, dataDir); n != 1 {
 		t.Fatalf("after second apply rows=%d", n)
+	}
+	// A dry run against the populated ledger reports the row as present and
+	// leaves it alone.
+	out.Reset()
+	if err := runHermeslog(args, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "already in ledger: 1") || !strings.Contains(out.String(), "pass --apply to record 0 new rows") {
+		t.Fatalf("dry run after apply output:\n%s", out.String())
+	}
+	if n, _ := backfillRows(t, dataDir); n != 1 {
+		t.Fatalf("after dry run rows=%d", n)
 	}
 	if _, err := os.Stat(filepath.Join(dataDir, "hermeslog-state.json")); !os.IsNotExist(err) {
 		t.Fatalf("backfill wrote collector state: %v", err)

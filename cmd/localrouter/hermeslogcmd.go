@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/url"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/config"
+	"github.com/hpst3r/localrouter/internal/core"
 	"github.com/hpst3r/localrouter/internal/hermeslog"
 	"github.com/hpst3r/localrouter/internal/ledger"
 )
@@ -86,24 +88,34 @@ func backfillSelf(ctx context.Context, cfg *config.Config, o hermeslog.BackfillO
 		basis[a.ID] = a.CostBasis
 	}
 	ledgerPath := filepath.Join(cfg.DataDir, "localrouter.db")
-	l, err := ledger.Open(ledgerPath, pricing, func(id string) string { return basis[id] })
-	if err != nil {
-		return err
+	// A dry run never opens the ledger for writing (opening creates and
+	// migrates it); it only reads which IDs are present, if the ledger exists.
+	var rec core.Ledger = dryRunLedger{}
+	if o.Apply {
+		l, err := ledger.Open(ledgerPath, pricing, func(id string) string { return basis[id] })
+		if err != nil {
+			return err
+		}
+		defer l.Close()
+		rec = l
 	}
-	defer l.Close()
-	ids, err := sql.Open("sqlite", "file:"+(&url.URL{Path: ledgerPath}).EscapedPath()+"?mode=ro&_pragma=busy_timeout(5000)")
-	if err != nil {
-		return err
-	}
-	defer ids.Close()
-	o.Exists = func(ctx context.Context, id string) (bool, error) {
-		var ok bool
-		err := ids.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM requests WHERE id = ?)`, id).Scan(&ok)
-		return ok, err
+	if _, err := os.Stat(ledgerPath); err == nil {
+		ids, err := sql.Open("sqlite", "file:"+(&url.URL{Path: ledgerPath}).EscapedPath()+"?mode=ro&_pragma=busy_timeout(5000)&_pragma=query_only(1)")
+		if err != nil {
+			return err
+		}
+		defer ids.Close()
+		o.Exists = func(ctx context.Context, id string) (bool, error) {
+			var ok bool
+			err := ids.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM requests WHERE id = ?)`, id).Scan(&ok)
+			return ok, err
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return errors.New("hermeslog backfill-self: cannot stat the ledger")
 	}
 	// Same wiring as the serve path, minus the state file: the backfill
 	// never reads or writes the collector's state.
-	c := hermeslog.New(l, hermeslog.Options{
+	c := hermeslog.New(rec, hermeslog.Options{
 		Home:      cfg.HermesLogs.Home,
 		Accounts:  cfg.HermesLogs.Accounts,
 		Client:    cfg.HermesLogs.Client,
@@ -118,6 +130,19 @@ func backfillSelf(ctx context.Context, cfg *config.Config, o hermeslog.BackfillO
 	printBackfill(out, o, res, pricing)
 	return nil
 }
+
+// dryRunLedger is the collector's ledger in a dry run, which never records.
+type dryRunLedger struct{}
+
+func (dryRunLedger) Record(context.Context, core.RequestRecord) error {
+	return errors.New("hermeslog backfill-self: dry run does not record")
+}
+
+func (dryRunLedger) Summary(context.Context, time.Time, string) ([]core.UsageRow, error) {
+	return nil, nil
+}
+
+func (dryRunLedger) Close() error { return nil }
 
 func printBackfill(out io.Writer, o hermeslog.BackfillOptions, res hermeslog.BackfillResult, pricing *ledger.Pricing) {
 	mode := "dry run"
