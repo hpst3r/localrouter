@@ -23,6 +23,11 @@ const (
 // The other error classes are discovery's (discovery.ErrClass*).
 const ErrClassPending = "pending"
 
+// ErrClassTruncated marks an expected id absent from a listing that dropped
+// ids (over the id cap, or invalid): the id may be among the dropped ones, so
+// the verdict is unchecked rather than missing.
+const ErrClassTruncated = "truncated"
+
 // MaxSuggestions bounds Verdict.Suggestions.
 const MaxSuggestions = 3
 
@@ -71,9 +76,11 @@ func Expectations(accounts map[string]core.Account, routes []core.Route) []Expec
 }
 
 // Listing is one account's /models result as the check sees it: the sorted
-// ids of a successful fetch, or a non-empty ErrorClass.
+// ids of a successful fetch and the count of ids discovery's parse dropped,
+// or a non-empty ErrorClass.
 type Listing struct {
 	IDs        []string
+	Dropped    int
 	ErrorClass string
 }
 
@@ -96,7 +103,9 @@ type Verdict struct {
 }
 
 // Evaluate computes one verdict per expectation, in order. An eligible
-// account without an entry in listings is unchecked with ErrClassPending.
+// account without an entry in listings is unchecked with ErrClassPending; an
+// expected id absent from a listing with dropped ids is unchecked with
+// ErrClassTruncated, never missing.
 func Evaluate(exps []Expectation, listings map[string]Listing) []Verdict {
 	out := make([]Verdict, 0, len(exps))
 	for _, e := range exps {
@@ -111,6 +120,8 @@ func Evaluate(exps []Expectation, listings map[string]Listing) []Verdict {
 			v.Status, v.ErrorClass = StatusUnchecked, l.ErrorClass
 		case slices.Contains(l.IDs, e.Expected):
 			v.Status = StatusOK
+		case l.Dropped > 0:
+			v.Status, v.ErrorClass = StatusUnchecked, ErrClassTruncated
 		default:
 			v.Status = StatusMissing
 			v.Suggestions = Suggest(e.Expected, l.IDs)
@@ -258,9 +269,9 @@ func fetchAll(ctx context.Context, creds core.CredentialSource, accounts map[str
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			got, _, class := discovery.Fetch(ctx, creds, accounts[id], opts.Fetch)
+			got, dropped, class := discovery.Fetch(ctx, creds, accounts[id], opts.Fetch)
 			mu.Lock()
-			out[id] = Listing{IDs: got, ErrorClass: class}
+			out[id] = Listing{IDs: got, Dropped: dropped, ErrorClass: class}
 			mu.Unlock()
 		}()
 	}

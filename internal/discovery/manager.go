@@ -449,18 +449,19 @@ func (m *Manager) Refresh(ctx context.Context, done func() bool) {
 }
 
 // Listing returns the shared listing held for accountID: its sorted ids (from
-// the last successful poll; the slice must not be modified), the time and
-// error class of the last poll attempt (zero and "" before the first one), and
-// whether the account is a current polling target at all. Other packages use
-// it to read an account discovery already polls instead of fetching it again.
-func (m *Manager) Listing(accountID string) (ids []string, attemptAt time.Time, errClass string, targeted bool) {
+// the last successful poll; the slice must not be modified) and that poll's
+// dropped count (invalid ids plus ids over the cap), the time and error class
+// of the last poll attempt (zero and "" before the first one), and whether the
+// account is a current polling target at all. Other packages use it to read an
+// account discovery already polls instead of fetching it again.
+func (m *Manager) Listing(accountID string) (ids []string, dropped int, attemptAt time.Time, errClass string, targeted bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	e := m.targets[accountID]
 	if e == nil {
-		return nil, time.Time{}, "", false
+		return nil, 0, time.Time{}, "", false
 	}
-	return e.sorted, e.lastAttempt, e.errClass, true
+	return e.sorted, e.dropped, e.lastAttempt, e.errClass, true
 }
 
 // candidates is interactive ∪ background in first-seen order.

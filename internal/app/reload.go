@@ -61,6 +61,10 @@ func restartFields(base, candidate *config.Config) []string {
 			c.Accounts[i].Reserve = nil
 		}
 		c.Budgets = budgetPresence(c.Budgets)
+		if c.ModelCheckInterval() == 0 {
+			// Absent, null, {} and interval 0 are the same disabled value.
+			c.ModelCheck = nil
+		}
 	}
 	l := reflect.ValueOf(*left)
 	r := reflect.ValueOf(*right)

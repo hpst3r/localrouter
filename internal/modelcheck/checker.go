@@ -15,9 +15,10 @@ import (
 // SharedListings is a source of listings another component already polls. It
 // is satisfied by *internal/discovery.Manager.
 type SharedListings interface {
-	// Listing returns accountID's last good ids, the last attempt's time and
-	// error class, and whether the account is polled at all.
-	Listing(accountID string) (ids []string, attemptAt time.Time, errClass string, targeted bool)
+	// Listing returns accountID's last good ids and their dropped count, the
+	// last attempt's time and error class, and whether the account is polled
+	// at all.
+	Listing(accountID string) (ids []string, dropped int, attemptAt time.Time, errClass string, targeted bool)
 }
 
 // Checker periodically re-runs the check against the current generation's
@@ -164,14 +165,14 @@ func (c *Checker) check(ctx context.Context, refetch bool) Result {
 	var fetch []string
 	for _, id := range ids {
 		if c.shared != nil {
-			if got, at, class, ok := c.shared.Listing(id); ok {
+			if got, dropped, at, class, ok := c.shared.Listing(id); ok {
 				ar := AccountResult{Account: id, Source: "discovery", FetchedAt: utcPtr(at), ModelCount: len(got), ErrorClass: class}
 				switch {
 				case at.IsZero():
 					ar.ErrorClass = ErrClassPending
 					listings[id] = Listing{ErrorClass: ErrClassPending}
 				default:
-					listings[id] = Listing{IDs: got, ErrorClass: class}
+					listings[id] = Listing{IDs: got, Dropped: dropped, ErrorClass: class}
 				}
 				results[id] = ar
 				continue

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -405,18 +406,63 @@ func TestMC11CheckerLogsVerdictChanges(t *testing.T) {
 	}
 }
 
-type fakeShared struct {
-	mu   sync.Mutex
-	ids  map[string][]string
-	at   time.Time
-	errs map[string]string
+// MC-1 (Amendment R1.1): a backend that lists more ids than discovery's cap,
+// with the expected id beyond it, is unchecked "truncated", never missing; an
+// expected id that survived the cap is still ok. The shared (discovery) path
+// carries the dropped count the same way.
+func TestMCFixMC1TruncatedListingUnchecked(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"object":"list","data":[`)
+	for i := range 1000 {
+		fmt.Fprintf(&b, `{"id":"filler-%04d"},`, i)
+	}
+	b.WriteString(`{"id":"wanted-model"}]}`)
+	u := newUpstream(t)
+	u.set("big", b.String())
+
+	res := probe(accountMap(u.account("big", core.ProviderOpenAICompat, "big")), []core.Route{
+		{Name: "r", Models: []string{"wanted-model"}, Interactive: []string{"big"}},
+		{Name: "f", Models: []string{"filler-0000"}, Interactive: []string{"big"}},
+	})
+	if len(res.Verdicts) != 2 {
+		t.Fatalf("verdicts = %+v", res.Verdicts)
+	}
+	if v := res.Verdicts[0]; v.Status != StatusUnchecked || v.ErrorClass != ErrClassTruncated || len(v.Suggestions) != 0 || v.SingleModel {
+		t.Fatalf("id beyond the cap: verdict %+v, want unchecked/truncated", v)
+	}
+	if v := res.Verdicts[1]; v.Status != StatusOK {
+		t.Fatalf("id within the cap: verdict %+v, want ok", v)
+	}
+	if res.Summary.Missing != 0 || res.Summary.Unchecked != 1 {
+		t.Fatalf("summary %+v", res.Summary)
+	}
+
+	shared := &fakeShared{ids: map[string][]string{"disc": {"other"}}, dropped: map[string]int{"disc": 1}, at: time.Now(), errs: map[string]string{}}
+	c := NewChecker(fakeCreds{}, shared, time.Minute, slog.New(slog.NewTextHandler(io.Discard, nil)), Options{})
+	defer c.Close()
+	c.SetTargets(accountMap(u.account("disc", core.ProviderOpenAICompat, "disc")),
+		[]core.Route{{Name: "r", Models: []string{"wanted-model"}, Interactive: []string{"disc"}}})
+	if v := c.Check(context.Background()).Verdicts[0]; v.Status != StatusUnchecked || v.ErrorClass != ErrClassTruncated {
+		t.Fatalf("shared truncated listing: verdict %+v, want unchecked/truncated", v)
+	}
+	if u.callCount("disc") != 0 {
+		t.Fatal("checker fetched an account discovery already polls")
+	}
 }
 
-func (f *fakeShared) Listing(id string) ([]string, time.Time, string, bool) {
+type fakeShared struct {
+	mu      sync.Mutex
+	ids     map[string][]string
+	dropped map[string]int
+	at      time.Time
+	errs    map[string]string
+}
+
+func (f *fakeShared) Listing(id string) ([]string, int, time.Time, string, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	ids, ok := f.ids[id]
-	return ids, f.at, f.errs[id], ok
+	return ids, f.dropped[id], f.at, f.errs[id], ok
 }
 
 // MC12: an account discovery already polls is read from the shared listing

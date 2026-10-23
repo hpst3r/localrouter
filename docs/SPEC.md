@@ -621,6 +621,23 @@ model_check:
   satisfied by `*modelcheck.Checker`. The app sets it only when the check is enabled.
   `App.ModelCheck` is nil when disabled.
 
+### Amendment R1 (post-review decisions)
+
+These override the rules above where they differ.
+
+- R1.1 Truncated listings (MC-1). A listing records how many ids discovery's parse dropped
+  (invalid ids plus ids over the 1,000-id cap): `discovery.Fetch` returns it, and
+  `(*Manager).Listing(id)` returns `(ids, dropped, attemptAt, errClass, targeted)`. When an
+  expected id is absent from a listing whose dropped count is > 0, the verdict is
+  `unchecked` with `error_class: "truncated"`, never `missing` (no suggestions, no
+  `single_model`). An id that is listed is still `ok`. Discovery's own behavior and goldens
+  are byte-identical. (`TestMCFixMC1TruncatedListingUnchecked`)
+- R1.2 Disabled forms are one value (MC-2). Before the restart-only comparison, a
+  `model_check` block whose effective interval is 0 (absent, null, `{}` or `interval: 0`)
+  is normalized to absent, so a reload that switches among those forms is accepted without
+  `restart required`. Changing to or from an enabled interval, or between two enabled
+  intervals, stays restart-only. (`TestMCFixMC2DisabledModelCheckFormsNotRestartOnly`)
+
 ### Phase 2 (not implemented)
 
 For `openai_compat` candidates, the proxy would compare the response's `model` field per
