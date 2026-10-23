@@ -1105,6 +1105,199 @@ The widget shows the signed balance (e.g. `-$0.08`; a non-zero amount below one
 cent keeps its sign as `<$0.01` / `-<$0.01` rather than rounding to `$0.00`),
 "unavailable" rather than $0, and "unlimited" for a null cap.
 
+## Typed decisions (`/v1/systemone`, `/v1/decisions`)
+
+Typed decision models (TypeSafe Jev and the other OpenRouter decision models)
+answer typed questions about a `state` with probabilities, not text. They are
+served through the existing `provider: openrouter` account; there is no
+separate TypeSafe provider or key. Two wire families exist, both opt-in, and
+they are never translated into each other or into chat/responses:
+
+| Path | Protocol | Wire shape | Upstream URL |
+|---|---|---|---|
+| `POST /v1/systemone` | `systemone` | TypeSafe System One | `<base_url>/systemone` (default `https://openrouter.ai/api/v1/systemone`) |
+| `POST /v1/decisions` | `decisions` | OpenRouter Decisions API | `<base_url>` with its final `/v1` segment replaced by `/alpha/decisions` (default `https://openrouter.ai/api/alpha/decisions`) |
+
+The TypeSafe SDK pointed at `http://<router>` appends `/v1/systemone`, so it
+works with only a base-URL and key change. `/v1/decisions` serves any
+OpenRouter decision model (e.g. `typesafe/jev-1.14`,
+`openai/gpt-6-luna-decisions`). OpenAI's native `/v1/decisions` body uses
+`input` instead of `state`; v1 does not translate it: a `/v1/decisions` body
+with `input` and no `state` is 400 `decision_unsupported` with a message
+telling the caller to send `state`.
+
+**Opt-in.** With no route declaring `systemone`/`decisions`, both paths are not
+registered (the same 404 `invalid_request_error` as any unknown path), the
+`decisions:` block is ignored, and nothing else changes. No local decision
+backend exists (deferred).
+
+### Wire shapes
+
+Request (both families): `model` (string), `state` (string, object or array),
+`questions` (object of named questions). `/v1/decisions` also accepts
+`provider`, `session_id`, `trace`, `user` (passed through). Questions:
+
+| type | members | v1 rule |
+|---|---|---|
+| `noul` | `instructions`; optional `criteria` | `criteria` absent, null, or an object whose only members are `true`/`false` |
+| `choice` | `instructions`, `criteria` object | 1..`max_choice_options` option names, no duplicate or case-fold variant |
+| `score` | `instructions`, `criteria` array | 1..`max_score_levels` levels |
+| `box` | image localization | 400 `decision_unsupported` |
+
+Response (relayed byte for byte): `id`, `model` (the dated snapshot that
+served the request, e.g. `typesafe/jev-1.13-20260917`), `provider`, `answers`
+keyed by question name, `usage{input_tokens, output_tokens, cost}`.
+
+The body is forwarded verbatim except the top-level `model`, rewritten to the
+route's pinned `upstream_model` (only when it differs from the client model).
+`x-session-id` (OpenRouter observability grouping only) is forwarded on
+decision paths in addition to the normal allowlist; nothing else changes:
+client `Authorization`, hop-by-hop headers and anything outside the allowlist
+(e.g. `TypeSafe-Danger-Zone-*`) are never forwarded.
+
+### Config
+
+```yaml
+routes:
+  - name: jev
+    models: [jev-1.13]
+    interactive: [openrouter-main, openrouter-backup]
+    upstreams:
+      openrouter-main:
+        upstream_model: typesafe/jev-1.13   # shared pin
+        protocols: [systemone]              # or [decisions]
+        input_modalities: [text]
+        question_types: [noul, choice, score]
+        # allow_alias: true                 # required on every candidate for a moving alias
+      openrouter-backup: { upstream_model: typesafe/jev-1.13, protocols: [systemone],
+                           input_modalities: [text], question_types: [noul, choice, score] }
+decisions:            # optional; zero = default, negative rejected
+  max_questions: 64
+  max_question_name_bytes: 128
+  max_choice_options: 255
+  max_score_levels: 10
+  max_nesting: 64
+```
+
+Validation (load and reload; a failure does not advance the generation):
+- A route whose descriptors declare `systemone` or `decisions` is a decision
+  route and is single-family: every candidate declares exactly `[systemone]`,
+  or every candidate exactly `[decisions]`. Mixed chat/decision or
+  systemone/decisions routes are rejected.
+- Every candidate is an `openrouter` account. A `decisions` candidate's
+  `base_url` path must end in `/v1`.
+- `input_modalities` is exactly `[text]`; `tools`, `json_schema`, `stream` must
+  be false.
+- `question_types` is a required, duplicate-free, non-empty subset of
+  `noul, choice, score`. `question_types` and `allow_alias` are rejected on
+  non-decision descriptors.
+- Pinning: every candidate resolves (descriptor `upstream_model`, else the
+  route's) to the same non-empty model. A moving alias - an id starting with
+  `~` (e.g. `~typesafe/jev-latest`) or ending in `-latest`/`-preview`
+  (case-insensitive; bare `jev-latest` included) - is rejected unless every
+  candidate sets `allow_alias: true`. `typesafe/jev-1.14` and bare `jev-1.13`
+  are pins. Failover therefore only runs between openrouter accounts serving
+  the same pin.
+- `core.UpstreamSpec` gains `QuestionTypes []string` and `AllowAlias bool`
+  (appended). The `decisions:` block is per generation and hot-reloadable.
+
+### Request handling
+
+`serveDecision` runs: POST only; client bearer auth; class downgrade; the
+concurrency limiter (before the body is read); then, before egress:
+1. Any `Content-Encoding` → 400 `decision_unsupported`. A `Content-Type`
+   other than `application/json` (e.g. multipart) → 400
+   `decision_unsupported`. An absent `Content-Type` is sent as
+   `application/json`.
+2. Body bound (`MaxBodyBytes`, 32 MiB) and `parseHead` (as for chat).
+3. Route lookup by `model` (404 `model_not_found`). The route's family must
+   equal the path's: a chat/responses route at a decision path, a decision
+   route at `/v1/chat/completions` or `/v1/responses`, and a systemone route at
+   `/v1/decisions` (or vice versa) are 400 `capability_unsupported`.
+4. `routing.InferDecision` (strict, below), then `routing.FilterDecision`:
+   candidates whose descriptor has the exact protocol, text, and every asked
+   question type, in the operator's order. None → 400 `capability_unsupported`.
+5. The shared attempt/failover loop (`forward`), unchanged.
+
+Strict decoding and bounds:
+- Members are read by exact name. A duplicate or case variant of a member the
+  classifier reads (top level: `model, stream, state, questions, assets,
+  input`, plus `provider, session_id, trace, user` on `/v1/decisions`;
+  question: `type, instructions, criteria`) is 400 `invalid_request_error`.
+- Question names: 1..`max_question_name_bytes` bytes; duplicates and case-fold
+  variants (Unicode simple folding, as `strings.EqualFold`) are 400
+  `invalid_request_error`; same for choice option names. Unknown question
+  members are passed through untouched. Unknown question types, missing or
+  wrongly typed `criteria`, empty `questions`, and missing/non-container
+  `state` are 400 `invalid_request_error`.
+- `stream: true`, any `assets` member (even null), a `box` question, and an
+  image part in `state` (an object whose `type` is `image_url` or
+  `input_image`) are 400 `decision_unsupported`. `stream: false`/`null` is
+  accepted.
+- More than `max_questions` questions, more than `max_choice_options` options,
+  more than `max_score_levels` levels, a name over `max_question_name_bytes`,
+  or `state`/`instructions`/`criteria` nesting deeper than `max_nesting` (a
+  scalar is depth 0, `{}`/`[]` depth 1) is 400 `decision_bounds_exceeded`.
+  Values exactly at a bound are accepted. Messages name fields and bounds, never
+  body content.
+- No gateway token counting; upstream context limits are relayed as final 400s.
+
+### Error mapping (openrouter accounts on decision paths)
+
+"Final" = relayed verbatim as the answer (status, headers minus hop headers,
+body), one attempt, no failover, request-scoped (no account cooldown).
+
+| Upstream | Action |
+|---|---|
+| 200 | relay; usage + `usage.cost` captured |
+| 400, 404, 413, 422 | final |
+| 529 | final (provider-wide overload; failover would only multiply load); its `Retry-After`, if any, is relayed |
+| 401 | existing: one rate-limited credential refresh on the same account, then failover |
+| 402, 403 | existing OpenRouter rules (affordability 402 request-scoped + failover; other 402 account-level; 403 final) |
+| 429 | existing OpenRouter rule; `Retry-After` becomes the outcome `ResetAt` hint; fails over; the last 429 is relayed with its `Retry-After` |
+| 500, 502, 503, 524, transport | existing failover, bounded by `max_failovers` |
+
+LocalRouter-originated errors keep their own `type`s (`decision_unsupported`,
+`decision_bounds_exceeded`, `capability_unsupported`, `invalid_request_error`,
+`budget_exceeded`, `quota_reserve`, `concurrency_limit_exceeded`).
+`retry-after-ms` is not parsed.
+
+### Accounting
+
+Spend controls, admission/quota, concurrency limits and ledger rows (one per
+attempt; `model` = client name, `upstream_model` = `pricing_model` = the pin)
+apply unchanged. `usageCapture` reads `usage.input_tokens/output_tokens` from
+the JSON body; `usage.cost` is the provider-reported cost exactly as for other
+OpenRouter rows (`ReportedCostUSD`, cost basis `provider_reported`). Missing,
+non-numeric or out-of-range usage is unknown (cost NULL, budget charged at the
+hold), never zero. An upstream `text/event-stream` answer on a decision path is
+never complete (usage unknown, `SettleIncomplete`). Nothing from request or
+response bodies is logged; the resolved model stays in the relayed response.
+**Deferred:** a ledger `response_model` column (needs migration v5, owned by
+another branch); a local decision backend; images/box/multipart; OpenAI
+`input` translation.
+
+### Acceptance tests
+
+| ID | Test |
+|---|---|
+| T1 flags off: no decision route → both paths 404 byte-identical to an unknown path, chat unchanged; a `decisions:` block alone changes nothing | `proxy.TestT1FlagsOffDecisionPaths404`, `app.TestT1T15T16DecisionsEndToEnd` |
+| T2 config validation (valid families; mixed/multi-family, non-openrouter, box/unknown/duplicate/missing question types, image modality, chat flags, mismatched or missing pin, alias without `allow_alias` on every candidate, decision keys on chat descriptors, non-`/v1` decisions base_url, negative bounds) | `config.TestT2DecisionConfigValid`, `config.TestT2DecisionConfigRejected`, `config.TestT2MovingAliasRequiresAllowAlias` |
+| T3 systemone happy path: path, account credential, header allowlist (+`x-session-id`), only `model` rewritten, byte-identical relay, ledger row, reported cost, no body logging | `proxy.TestT3SystemOneHappyPath` |
+| T4 decisions happy path: `/alpha/decisions`, optional members passed through | `proxy.TestT4DecisionsHappyPath` |
+| T5 missing/string/negative usage → unknown | `proxy.TestT5UnknownUsage` |
+| T6 strict JSON (duplicate/case-variant names, member variants, malformed shapes) | `routing.TestT6StrictJSON`, `proxy.TestT6T7T8RejectedBeforeEgress` |
+| T7 bounds: one over each → `decision_bounds_exceeded`, at limit accepted, configured bounds apply | `routing.TestT7Bounds`, `proxy.TestT6T7T8RejectedBeforeEgress`, `proxy.TestT7ConfiguredBoundsApply` |
+| T8 unsupported: box, assets, image state, stream:true, `input` without `state`, multipart, Content-Encoding | `routing.TestT8UnsupportedFeatures`, `proxy.TestT6T7T8RejectedBeforeEgress` |
+| T9 question-type filter keeps order; none → `capability_unsupported` | `routing.TestT9FilterDecision`, `proxy.TestT9QuestionTypeFilter` |
+| T10 endpoint/route family mismatch → 400 `capability_unsupported`, zero egress | `proxy.TestT10EndpointRouteMismatch` |
+| T11 error table (final 400/404/413/422/529 with Retry-After relayed, 401 refresh then failover, 429 hint + failover + last relayed, 5xx/524/transport failover) | `proxy.TestT11ErrorTable` |
+| T12 retry bound: 500s → exactly 1+max_failovers attempts; 529 → 1 | `proxy.TestT12RetryBound` |
+| T13 budget denial zero egress; completed decision settles once as complete | `proxy.TestT13Budget` |
+| T14 upstream SSE is incomplete | `proxy.TestT14UpstreamSSEIsIncomplete` |
+| T15 hot reload adds/removes the paths; bounds reload without restart | `app.TestT1T15T16DecisionsEndToEnd` |
+| T16 end-to-end ledger cost = OpenRouter `usage.cost` | `app.TestT1T15T16DecisionsEndToEnd` |
+
 ## Engineering constraints
 
 - Go 1.26.8 or newer (see `go.mod`), module `github.com/hpst3r/localrouter`.

@@ -114,6 +114,9 @@ type Options struct {
 	// StreamIdleTimeout aborts a response body relay when no upstream bytes
 	// arrive for this long. 0 means 300s; negative disables.
 	StreamIdleTimeout time.Duration
+	// DecisionBounds bounds typed-decision bodies (/v1/systemone,
+	// /v1/decisions). Zero fields take routing.DefaultDecisionBounds.
+	DecisionBounds routing.DecisionBounds
 }
 
 // Proxy is the inference HTTP surface. Create it with New.
@@ -186,12 +189,14 @@ func defaultHTTPClient(responseHeaderTimeout time.Duration) *http.Client {
 }
 
 // Handler returns the HTTP handler for /v1/responses, /v1/chat/completions
-// and /v1/models. Other paths return 404.
+// and /v1/models, plus /v1/systemone and /v1/decisions when some route serves
+// a typed-decision protocol. Other paths return 404.
 func (p *Proxy) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(pathResponses, func(w http.ResponseWriter, r *http.Request) { p.serveInference(w, r, "/responses") })
 	mux.HandleFunc(pathChat, func(w http.ResponseWriter, r *http.Request) { p.serveInference(w, r, "/chat/completions") })
 	mux.HandleFunc(pathModels, p.serveModels)
+	p.registerDecisions(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "localrouter: not found", "invalid_request_error")
 	})
@@ -296,6 +301,10 @@ func (p *Proxy) serveInference(w http.ResponseWriter, r *http.Request, endpoint 
 	route, ok := p.routes[head.Model]
 	if !ok {
 		writeError(w, http.StatusNotFound, "localrouter: unknown model", "model_not_found")
+		return
+	}
+	if routing.RouteDecisionProtocol(route) != "" {
+		writeDecisionEndpointMismatch(w)
 		return
 	}
 	candidates := route.Interactive

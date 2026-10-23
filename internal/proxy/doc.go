@@ -26,6 +26,12 @@
 //	mux.Handle("/v1/", p.Handler())
 //
 // Handler serves POST /v1/responses, POST /v1/chat/completions and
-// GET /v1/models. Secrets (client keys, upstream credentials) and request or
-// response bodies are never logged or recorded.
+// GET /v1/models. When a route declares a typed-decision protocol it also
+// serves POST /v1/systemone (TypeSafe System One shape, upstream
+// <base_url>/systemone) and POST /v1/decisions (OpenRouter Decisions API,
+// upstream <base_url minus /v1>/alpha/decisions): native passthroughs with
+// only the pinned model rewritten, strictly classified with
+// Options.DecisionBounds (routing.InferDecision). Secrets (client keys,
+// upstream credentials) and request or response bodies are never logged or
+// recorded.
 package proxy
