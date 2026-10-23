@@ -719,18 +719,45 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
   and rebases it; other errors leave state unchanged for retry.
 - One-time backfill of self-routed usage the proxy failed to meter:
   `localrouter hermeslog backfill-self --model M [--model M ...] --account ID
-  --before RFC3339 [--apply] [-config PATH]` (requires `hermes_logs.enabled`
-  and a configured account). It selects only the rows the regular scan skips
-  as self-routed, whose model is one of `--model` and whose `last_seen` is
-  strictly before `--before` (rows with no `last_seen`, or active at/after the
-  cutoff, are listed as excluded and never recorded), and records each as ONE
-  row for its full cumulative counters, attributed to `--account` and that
-  account's provider, with the same plausibility checks and labels as the
-  scan. IDs are `hermes-backfill:` + the scan's deterministic hash, so a
-  rerun records nothing new; rows whose ID is already in the ledger are
-  reported as present and not sent. Without `--apply` it is a dry run that
-  prints the selection with estimated cost and writes nothing. The collector
-  state file is neither read nor written.
+  --after RFC3339 --before RFC3339 [--apply [--accept-partial-sessions]]
+  [-config PATH]` (requires `hermes_logs.enabled` and a configured account).
+  It considers only the rows the regular scan skips as self-routed whose
+  model is one of `--model`, selects them by the window rules of Amendment R1
+  below, and records each as ONE row for its full cumulative counters,
+  attributed to `--account` and that account's provider, with the same
+  plausibility checks and labels as the scan. Without `--apply` it is a dry
+  run that prints the selection (selected, review and excluded rows with
+  reasons) with estimated cost and writes nothing. The collector state file
+  is neither read nor written.
+- Backfill Amendment R1 (review findings CX-1, CX-2):
+  - R1.1 IDs: a backfill row's ID is `hermes-backfill:k1:` + a hash of the
+    row KEY only (profile, session, model, billing provider, base URL, billing
+    mode, task); counters and `last_seen` are not part of it. Each key is
+    backfilled at most once, ever: a key already in the ledger is reported
+    `present` and never re-recorded, even if its counters grew since (e.g. the
+    session resumed and the proxy metered the new calls). Rows written by the
+    first backfill (`hermes-backfill:` IDs without `k1:`, which hashed the
+    counters) also count as present when client, session, model, agent and
+    task match. This replaces the earlier "a rerun records nothing new" rule,
+    which held only for an identical cutoff and unchanged counters.
+  - R1.2 Window: `--after` and `--before` are both required, `--after` <
+    `--before` (else a usage error). A row is selected only if its whole
+    activity lies inside [after, before): `session_model_usage.first_seen`
+    ≥ after (Hermes sets `first_seen` once when it inserts the row and never
+    updates it; `last_seen` is updated on every call) and `last_seen` <
+    before. A row without `first_seen` (NULL, or an older schema without the
+    column) whose `last_seen` is in [after, before) is listed under `review`
+    with a warning that calls in the same session before `--after` are
+    included; `--apply` records review rows only with
+    `--accept-partial-sessions`. Rows with no `last_seen`, `last_seen` ≥
+    before, `first_seen` < after, or (no `first_seen` and) `last_seen` < after
+    are excluded with that reason and never recorded.
+  - R1.3 Proxy cross-check: not implemented. The proxy stores `session` from
+    `X-LocalRouter-Session` only; Hermes does not send that header (its
+    LocalRouter providers set only `X-LocalRouter-Agent`), so proxied rows'
+    session label is not Hermes' session id and no mapping is invented. Double
+    counting against proxy-metered calls is bounded by R1.1 and R1.2: choose
+    `--after` as the time the proxy stopped metering.
 
 ### Ledger changes
 

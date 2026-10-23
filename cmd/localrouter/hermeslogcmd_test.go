@@ -26,9 +26,10 @@ CREATE TABLE session_model_usage (
   PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task));`
 
 // backfillEnv writes a Hermes home with one self-routed gpt-6.1-sol row
-// before the cutoff, one after it, and a self-routed Ollama row, plus a
-// config pointing hermes_logs at it. It returns the config path, the data
-// dir and the cutoff.
+// inside the window, one after the cutoff, one without first_seen (review)
+// and a self-routed Ollama row, plus a config pointing hermes_logs at it. It
+// returns the config path, the data dir and the cutoff; the window starts 3h
+// before the cutoff.
 func backfillEnv(t *testing.T, enabled bool) (string, string, time.Time) {
 	t.Helper()
 	dir := t.TempDir()
@@ -51,11 +52,13 @@ func backfillEnv(t *testing.T, enabled bool) (string, string, time.Time) {
 			t.Fatal(err)
 		}
 	}
-	ins := `INSERT INTO session_model_usage (session_id,model,billing_provider,billing_base_url,task,api_call_count,input_tokens,output_tokens,cache_read_tokens,last_seen) VALUES (?,?,?,?,?,?,?,?,?,?)`
+	first := float64(cutoff.Add(-2 * time.Hour).Unix())
+	ins := `INSERT INTO session_model_usage (session_id,model,billing_provider,billing_base_url,task,api_call_count,input_tokens,output_tokens,cache_read_tokens,first_seen,last_seen) VALUES (?,?,?,?,?,?,?,?,?,?,?)`
 	for _, a := range [][]any{
-		{"s1", "gpt-6.1-sol", "localrouter-codex", "http://127.0.0.1:8787/v1", "", 4, 100, 10, 1000, before},
-		{"s-late", "gpt-6.1-sol", "custom", "http://localhost:8787/v1", "approval", 1, 5, 1, 0, after},
-		{"s1", "deepseek-v4.1-flash", "localrouter-bg", "http://127.0.0.1:8787/v1", "", 9, 900, 90, 0, before},
+		{"s1", "gpt-6.1-sol", "localrouter-codex", "http://127.0.0.1:8787/v1", "", 4, 100, 10, 1000, first, before},
+		{"s-late", "gpt-6.1-sol", "custom", "http://localhost:8787/v1", "approval", 1, 5, 1, 0, first, after},
+		{"s-nofs", "gpt-6.1-sol", "localrouter-codex", "http://127.0.0.1:8787/v1", "", 2, 7, 1, 0, nil, before},
+		{"s1", "deepseek-v4.1-flash", "localrouter-bg", "http://127.0.0.1:8787/v1", "", 9, 900, 90, 0, first, before},
 	} {
 		if _, err := db.Exec(ins, a...); err != nil {
 			t.Fatal(err)
@@ -98,7 +101,8 @@ func backfillRows(t *testing.T, dataDir string) (n int, in int64) {
 
 func TestCmdHermeslogBackfillSelf(t *testing.T) {
 	cfg, dataDir, cutoff := backfillEnv(t, true)
-	args := []string{"backfill-self", "-config", cfg, "--model", "gpt-6.1-sol", "--account", "codex-main", "--before", cutoff.Format(time.RFC3339)}
+	args := []string{"backfill-self", "-config", cfg, "--model", "gpt-6.1-sol", "--account", "codex-main",
+		"--after", cutoff.Add(-3 * time.Hour).Format(time.RFC3339), "--before", cutoff.Format(time.RFC3339)}
 
 	var out strings.Builder
 	if err := runHermeslog(args, &out); err != nil {
@@ -107,7 +111,9 @@ func TestCmdHermeslogBackfillSelf(t *testing.T) {
 	s := out.String()
 	t.Logf("dry run output:\n%s", s)
 	if !strings.Contains(s, "dry run") || !strings.Contains(s, "selected: 1 rows") ||
-		!strings.Contains(s, "excluded: active after cutoff: 1") || !strings.Contains(s, "s-late") ||
+		!strings.Contains(s, "excluded: outside the window: 1") || !strings.Contains(s, "s-late") ||
+		!strings.Contains(s, "review: 1 rows have no first_seen; WARNING") || !strings.Contains(s, "s-nofs") ||
+		!strings.Contains(s, "--accept-partial-sessions") || !strings.Contains(s, "pass --apply to record 1 new rows") ||
 		strings.Contains(s, "deepseek") {
 		t.Fatalf("dry run output:\n%s", s)
 	}
@@ -149,6 +155,36 @@ func TestCmdHermeslogBackfillSelf(t *testing.T) {
 	if n, _ := backfillRows(t, dataDir); n != 1 {
 		t.Fatalf("after dry run rows=%d", n)
 	}
+
+	// A row from the first backfill (counter-hashed ID, no k1: prefix) with
+	// the same labels also counts as present.
+	ldb, err := sql.Open("sqlite", filepath.Join(dataDir, "localrouter.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ldb.Exec(`UPDATE requests SET id = 'hermes-backfill:0123456789abcdef0123456789abcdef' WHERE id LIKE 'hermes-backfill:k1:%'`); err != nil {
+		t.Fatal(err)
+	}
+	ldb.Close()
+	out.Reset()
+	if err := runHermeslog(append(args, "--apply"), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "recorded: 0") || !strings.Contains(out.String(), "already in ledger: 1") {
+		t.Fatalf("apply over first-backfill row output:\n%s", out.String())
+	}
+
+	// --accept-partial-sessions records the review row too, once.
+	out.Reset()
+	if err := runHermeslog(append(args, "--apply", "--accept-partial-sessions"), &out); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "recorded: 1") || !strings.Contains(out.String(), "already in ledger: 1") {
+		t.Fatalf("accept partial output:\n%s", out.String())
+	}
+	if n, in := backfillRows(t, dataDir); n != 2 || in != 1100+7 {
+		t.Fatalf("after accept partial rows=%d input=%d", n, in)
+	}
 	if _, err := os.Stat(filepath.Join(dataDir, "hermeslog-state.json")); !os.IsNotExist(err) {
 		t.Fatalf("backfill wrote collector state: %v", err)
 	}
@@ -157,18 +193,22 @@ func TestCmdHermeslogBackfillSelf(t *testing.T) {
 func TestCmdHermeslogErrors(t *testing.T) {
 	cfg, _, cutoff := backfillEnv(t, true)
 	ok := cutoff.Format(time.RFC3339)
+	af := cutoff.Add(-time.Hour).Format(time.RFC3339)
 	for name, tc := range map[string]struct {
 		args []string
 		want string
 	}{
-		"no subcommand":  {nil, "backfill-self"},
-		"bad subcommand": {[]string{"bogus"}, "backfill-self"},
-		"no model":       {[]string{"backfill-self", "-config", cfg, "--account", "codex-main", "--before", ok}, "usage"},
-		"no before":      {[]string{"backfill-self", "-config", cfg, "--model", "m", "--account", "codex-main"}, "usage"},
-		"no account":     {[]string{"backfill-self", "-config", cfg, "--model", "m", "--before", ok}, "usage"},
-		"bad before":     {[]string{"backfill-self", "-config", cfg, "--model", "m", "--account", "codex-main", "--before", "yesterday"}, "RFC3339"},
-		"unknown acct":   {[]string{"backfill-self", "-config", cfg, "--model", "m", "--account", "nope", "--before", ok}, "unknown account"},
-		"extra args":     {[]string{"backfill-self", "-config", cfg, "--model", "m", "--account", "codex-main", "--before", ok, "x"}, "usage"},
+		"no subcommand":   {nil, "backfill-self"},
+		"bad subcommand":  {[]string{"bogus"}, "backfill-self"},
+		"no model":        {[]string{"backfill-self", "-config", cfg, "--account", "codex-main", "--after", af, "--before", ok}, "usage"},
+		"no before":       {[]string{"backfill-self", "-config", cfg, "--model", "m", "--account", "codex-main", "--after", af}, "usage"},
+		"no after":        {[]string{"backfill-self", "-config", cfg, "--model", "m", "--account", "codex-main", "--before", ok}, "usage"},
+		"no account":      {[]string{"backfill-self", "-config", cfg, "--model", "m", "--after", af, "--before", ok}, "usage"},
+		"bad before":      {[]string{"backfill-self", "-config", cfg, "--model", "m", "--account", "codex-main", "--after", af, "--before", "yesterday"}, "RFC3339"},
+		"bad after":       {[]string{"backfill-self", "-config", cfg, "--model", "m", "--account", "codex-main", "--after", "yesterday", "--before", ok}, "RFC3339"},
+		"after >= before": {[]string{"backfill-self", "-config", cfg, "--model", "m", "--account", "codex-main", "--after", ok, "--before", ok}, "usage"},
+		"unknown acct":    {[]string{"backfill-self", "-config", cfg, "--model", "m", "--account", "nope", "--after", af, "--before", ok}, "unknown account"},
+		"extra args":      {[]string{"backfill-self", "-config", cfg, "--model", "m", "--account", "codex-main", "--after", af, "--before", ok, "x"}, "usage"},
 	} {
 		var out strings.Builder
 		err := runHermeslog(tc.args, &out)
@@ -179,7 +219,7 @@ func TestCmdHermeslogErrors(t *testing.T) {
 
 	disabled, _, _ := backfillEnv(t, false)
 	var out strings.Builder
-	err := runHermeslog([]string{"backfill-self", "-config", disabled, "--model", "m", "--account", "codex-main", "--before", ok}, &out)
+	err := runHermeslog([]string{"backfill-self", "-config", disabled, "--model", "m", "--account", "codex-main", "--after", af, "--before", ok}, &out)
 	if err == nil || !strings.Contains(err.Error(), "hermes_logs") {
 		t.Errorf("disabled: %v", err)
 	}
