@@ -30,4 +30,20 @@
 // release-once. Releasing with status 429 (or 401/403, or 402 on OpenRouter)
 // puts the account in cooldown; a newer snapshot showing headroom clears it
 // early. An Outcome with RequestScoped set never starts a cooldown.
+//
+// Options.Breaker enables the per-account reachability breaker
+// (policy.breaker): Threshold consecutive releases with Outcome.Unreachable
+// open it for Base (doubling per failed probe up to Max); when the period
+// ends exactly one lease is admitted as a probe. Breaker reports its state for
+// the control API, and AcquireWithBreaker tells the proxy when a denial was
+// caused by the breaker alone:
+//
+//	lease, dec, unreachable, retryIn := p.AcquireWithBreaker(class, candidates, exclude)
+//	state, fails, openUntil, enabled := p.Breaker(accountID)
+//
+// Breaker state is shared by every WithConfig view and always follows the
+// knobs of the activated view: New activates itself, and the app calls
+// view.Activate() when it installs a reloaded generation. Leases also
+// implement Reached(), which the proxy calls once response headers arrive so
+// a half-open probe closes the breaker before a long stream ends.
 package policy

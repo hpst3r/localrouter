@@ -84,6 +84,19 @@ type PolicyConfig struct {
 	SafetyMargin     float64  `yaml:"safety_margin"`
 	InflightEstimate float64  `yaml:"inflight_estimate"`
 	MaxFailovers     int      `yaml:"max_failovers"`
+	// Breaker is the opt-in upstream reachability breaker; absent or
+	// threshold 0 disables it.
+	Breaker BreakerConfig `yaml:"breaker"`
+}
+
+// BreakerConfig configures the per-account reachability breaker. Threshold
+// consecutive unreachable attempts open the breaker for Base, doubling on
+// each re-open up to Max. Threshold 0 (the default) disables it; Base and Max
+// default to 5s and 60s only when it is enabled.
+type BreakerConfig struct {
+	Threshold int      `yaml:"threshold"`
+	Base      Duration `yaml:"base"`
+	Max       Duration `yaml:"max"`
 }
 
 type ControlConfig struct {
@@ -466,6 +479,14 @@ func (c *Config) applyDefaults(baseDir string) {
 	if c.Policy.MaxFailovers == 0 {
 		c.Policy.MaxFailovers = 2
 	}
+	if c.Policy.Breaker.Threshold > 0 {
+		if c.Policy.Breaker.Base == 0 {
+			c.Policy.Breaker.Base = Duration(5 * time.Second)
+		}
+		if c.Policy.Breaker.Max == 0 {
+			c.Policy.Breaker.Max = Duration(60 * time.Second)
+		}
+	}
 	if c.Timeouts.Header == 0 {
 		c.Timeouts.Header = Duration(10 * time.Second)
 	}
@@ -623,6 +644,11 @@ func (c *Config) Validate() error {
 	}
 	if c.Policy.InflightEstimate < 0 || c.Policy.InflightEstimate >= 1 {
 		errs = append(errs, errors.New("policy.inflight_estimate must be in [0,1)"))
+	}
+	if br := c.Policy.Breaker; br.Threshold < 0 || br.Base < 0 || br.Max < 0 {
+		errs = append(errs, errors.New("policy.breaker threshold, base and max must not be negative"))
+	} else if br.Max > 0 && br.Max < br.Base {
+		errs = append(errs, errors.New("policy.breaker.max must not be less than policy.breaker.base"))
 	}
 	if c.Limits.MaxConcurrent < 0 {
 		errs = append(errs, errors.New("limits.max_concurrent must not be negative (0 = unlimited)"))

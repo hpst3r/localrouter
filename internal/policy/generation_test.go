@@ -23,6 +23,7 @@ func mustView(t *testing.T, p *Policy, accounts []core.Account, opts Options) *P
 	if v == nil {
 		t.Fatal("WithConfig returned nil view")
 	}
+	v.Activate() // installed, like the app's reload
 	return v
 }
 

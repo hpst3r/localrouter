@@ -223,6 +223,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		InflightEstimate: cfg.Policy.InflightEstimate,
 		Clock:            clock,
 		Logger:           logger,
+		Breaker:          breakerOptions(cfg.Policy.Breaker),
 	})
 	lim, err := connlim.New(cfg.Limits.MaxConcurrent, cfg.Limits.MaxConcurrentPerClient)
 	if err != nil {
@@ -257,6 +258,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		_ = led.Close()
 		return nil, err
 	}
+	generation.policy.Activate()
 	a.current.Store(generation)
 	a.Discovery.SetTargets(acctMap, generation.routes)
 	a.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
