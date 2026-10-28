@@ -43,10 +43,16 @@ func Eligible(provider string) bool {
 // Fetch performs one GET {account.BaseURL}/models exactly as a discovery poll
 // does (credential headers, bounds, redirects, id validation), using opts'
 // HTTPClient, Timeout, MaxBodyBytes and MaxIDs (zero values select the
-// defaults; a nil HTTPClient builds a fresh NewHTTPClient). It returns the
-// sorted, unique valid ids and the dropped count, or a non-empty error class.
-// It never returns the URL, the body or the credential.
+// defaults; a nil HTTPClient builds a fresh NewHTTPClient whose idle
+// connections are closed before Fetch returns, so callers fetching repeatedly
+// should pass their own). It returns the sorted, unique valid ids and the
+// dropped count, or a non-empty error class. It never returns the URL, the
+// body or the credential.
 func Fetch(ctx context.Context, creds core.CredentialSource, account core.Account, opts Options) (ids []string, dropped int, errClass string) {
+	if opts.HTTPClient == nil {
+		opts.HTTPClient = NewHTTPClient()
+		defer opts.HTTPClient.CloseIdleConnections()
+	}
 	l, class := fetchListing(ctx, creds, opts.withDefaults(), account)
 	return l.ids, l.dropped, class
 }

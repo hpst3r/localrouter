@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -541,4 +542,88 @@ func waitFor(t *testing.T, cond func() bool) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+// Amendment R2.1: for provider ollama a bare expected name matches a listed
+// name:latest and vice versa; other providers still need the exact id.
+func TestMCFixR21OllamaLatestTag(t *testing.T) {
+	u := newUpstream(t)
+	u.set("ol", `{"data":[{"id":"qwen3:latest"},{"id":"llama3"},{"id":"org/gemma:8b"}]}`)
+	routes := []core.Route{
+		{Name: "bare", Models: []string{"qwen3"}, Interactive: []string{"ol"}},
+		{Name: "tagged", Models: []string{"llama3:latest"}, Interactive: []string{"ol"}},
+		{Name: "other-tag", Models: []string{"org/gemma"}, Interactive: []string{"ol"}},
+	}
+	res := probe(accountMap(u.account("ol", core.ProviderOllama, "ol")), routes)
+	want := map[string]string{"bare": StatusOK, "tagged": StatusOK, "other-tag": StatusMissing}
+	for _, v := range res.Verdicts {
+		if v.Status != want[v.Route] {
+			t.Errorf("ollama verdict %+v, want %s", v, want[v.Route])
+		}
+	}
+	res = probe(accountMap(u.account("ol", core.ProviderOpenAICompat, "ol")), routes)
+	if res.Summary != (Summary{Missing: 3}) {
+		t.Fatalf("openai_compat summary %+v, want 3 missing", res.Summary)
+	}
+}
+
+// Amendment R2.3: Probe with no HTTPClient closes the idle connections of the
+// client it built.
+func TestMCFixR23ProbeClosesIdleConnections(t *testing.T) {
+	closed := make(chan struct{}, 1)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, singleModelListing("m"))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateClosed {
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+	acct := core.Account{ID: "a", Provider: core.ProviderOpenAICompat, BaseURL: srv.URL + "/v1"}
+	if v := onlyVerdict(t, probe(accountMap(acct), []core.Route{{Name: "r", Models: []string{"m"}, Interactive: []string{"a"}}})); v.Status != StatusOK {
+		t.Fatalf("verdict %+v", v)
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("connection left open after Probe")
+	}
+}
+
+// Amendment R2.2: a reload that switches a (route, account) pair between one
+// and several expected ids still logs the return to ok, exactly once.
+func TestMCFixR22LogStateSurvivesKeyFormChange(t *testing.T) {
+	u := newUpstream(t)
+	u.set("lab", `{"data":[{"id":"m-b"},{"id":"m-c"}]}`)
+	logs := &syncBuffer{}
+	c := NewChecker(fakeCreds{}, nil, time.Minute, slog.New(slog.NewTextHandler(logs, nil)), Options{})
+	defer c.Close()
+	accts := accountMap(u.account("lab", core.ProviderOpenAICompat, "lab"))
+	ctx := context.Background()
+	step := func(name string, rt core.Route, wantInfo, wantWarn int) {
+		t.Helper()
+		c.SetTargets(accts, []core.Route{rt})
+		c.Check(ctx)
+		got := logs.take()
+		if i, w := strings.Count(got, "level=INFO"), strings.Count(got, "level=WARN"); i != wantInfo || w != wantWarn {
+			t.Fatalf("%s: log %q, want %d info and %d warn lines", name, got, wantInfo, wantWarn)
+		}
+	}
+	single := func(m string) core.Route {
+		return core.Route{Name: "r", Models: []string{"m-a", "m-b"}, UpstreamModel: m, Interactive: []string{"lab"}}
+	}
+	step("multi, m-a missing", core.Route{Name: "r", Models: []string{"m-a", "m-b"}, Interactive: []string{"lab"}}, 0, 1)
+	step("fixed to single m-b", single("m-b"), 1, 0)
+	step("single m-b unchanged", single("m-b"), 0, 0)
+	step("single m-x missing", single("m-x"), 0, 1)
+	step("back to multi, all ok", core.Route{Name: "r", Models: []string{"m-b", "m-c"}, Interactive: []string{"lab"}}, 1, 0)
+	step("multi unchanged", core.Route{Name: "r", Models: []string{"m-b", "m-c"}, Interactive: []string{"lab"}}, 0, 0)
+	step("single m-a missing", single("m-a"), 0, 1)
+	u.set("lab", `{"data":[{"id":"m-a"},{"id":"m-b"}]}`)
+	step("multi including m-a, all ok", core.Route{Name: "r", Models: []string{"m-a", "m-b"}, Interactive: []string{"lab"}}, 1, 0)
 }

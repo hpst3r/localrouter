@@ -559,7 +559,7 @@ model_check:
   and `ineligible` keep the last known state, so an outage does not repeat or clear the
   warning. State is tracked per (route, account) when that pair expects a single id, so a
   reload that fixes `upstream_model` logs the return to `ok`. Otherwise it is tracked per
-  expected id. A cancelled check (shutdown) is neither published nor logged.
+  expected id (see R2.2). A cancelled check (shutdown) is neither published nor logged.
 
 ### Acceptance tests (backend model check)
 
@@ -637,6 +637,27 @@ These override the rules above where they differ.
   is normalized to absent, so a reload that switches among those forms is accepted without
   `restart required`. Changing to or from an enabled interval, or between two enabled
   intervals, stays restart-only. (`TestMCFixMC2DisabledModelCheckFormsNotRestartOnly`)
+
+### Amendment R2 (final-review decisions)
+
+These override the rules above where they differ.
+
+- R2.1 Ollama `:latest`. For provider `ollama`, which resolves an untagged name to
+  `name:latest`, an expected bare id `name` (no `:` after the last `/`) is `ok` when the
+  listing has `name:latest`, and an expected `name:latest` is `ok` when it has `name`. Any
+  other tag still needs an exact match (`qwen3` against `qwen3:8b` stays `missing` with the
+  suggestion). Other providers are unchanged. (`TestMCFixR21OllamaLatestTag`)
+- R2.2 Log state across key-form changes. Logging state is kept per (route, account,
+  expected id). When a reload switches a pair from several expected ids to one, the single
+  verdict inherits the pair's previous `missing`/`single_model` state. When the pair expected
+  a single id before and none of its current ids has state, the first verdict inherits it.
+  A fix that also changes the key form therefore still logs the return to `ok`, exactly once.
+  (`TestMCFixR22LogStateSurvivesKeyFormChange`)
+- R2.3 `discovery.Fetch` with a nil `Options.HTTPClient` builds a `NewHTTPClient` and closes
+  its idle connections before returning, so no keep-alive connection outlives the call.
+  `modelcheck.Probe` likewise closes the idle connections of a default client it builds
+  (one client for all of its fetches); the checker closes its client on `Close`.
+  (`TestFetchNilClientClosesIdleConnections`, `TestMCFixR23ProbeClosesIdleConnections`)
 
 ### Phase 2 (not implemented)
 

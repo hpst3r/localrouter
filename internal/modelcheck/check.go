@@ -118,7 +118,7 @@ func Evaluate(exps []Expectation, listings map[string]Listing) []Verdict {
 			v.Status, v.ErrorClass = StatusUnchecked, ErrClassPending
 		case l.ErrorClass != "":
 			v.Status, v.ErrorClass = StatusUnchecked, l.ErrorClass
-		case slices.Contains(l.IDs, e.Expected):
+		case listed(e.Provider, e.Expected, l.IDs):
 			v.Status = StatusOK
 		case l.Dropped > 0:
 			v.Status, v.ErrorClass = StatusUnchecked, ErrClassTruncated
@@ -132,6 +132,22 @@ func Evaluate(exps []Expectation, listings map[string]Listing) []Verdict {
 		out = append(out, v)
 	}
 	return out
+}
+
+// listed reports whether ids lists expected. For provider ollama, which
+// resolves an untagged name to name:latest, a bare name (no ":" after the last
+// "/") and its name:latest form are the same id.
+func listed(provider, expected string, ids []string) bool {
+	if slices.Contains(ids, expected) {
+		return true
+	}
+	if provider != core.ProviderOllama {
+		return false
+	}
+	if base, ok := strings.CutSuffix(expected, ":latest"); ok && stripSuffix(base) == base {
+		return slices.Contains(ids, base)
+	}
+	return stripSuffix(expected) == expected && slices.Contains(ids, expected+":latest")
 }
 
 // Suggest returns at most MaxSuggestions listed ids close to expected: first
@@ -280,8 +296,13 @@ func fetchAll(ctx context.Context, creds core.CredentialSource, accounts map[str
 }
 
 // Probe runs one offline-wiring check: it fetches each eligible account's
-// listing once (bounded concurrency) and evaluates every static route.
+// listing once (bounded concurrency) and evaluates every static route. A
+// default HTTP client it builds has its idle connections closed on return.
 func Probe(ctx context.Context, creds core.CredentialSource, accounts map[string]core.Account, routes []core.Route, opts Options) Result {
+	if opts.Fetch.HTTPClient == nil {
+		opts.Fetch.HTTPClient = discovery.NewHTTPClient()
+		defer opts.Fetch.HTTPClient.CloseIdleConnections()
+	}
 	opts = opts.withDefaults()
 	exps := Expectations(accounts, routes)
 	ids := eligibleAccounts(exps)

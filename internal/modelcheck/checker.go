@@ -45,7 +45,7 @@ type Checker struct {
 
 	checkMu sync.Mutex             // serializes Check
 	cache   map[string]cachedFetch // own fetches by account; guarded by checkMu
-	state   map[string]string      // last logged state per verdict key; checkMu
+	state   map[string]pairState   // last logged state per (route, account); checkMu
 }
 
 type cachedFetch struct {
@@ -62,7 +62,7 @@ func NewChecker(creds core.CredentialSource, shared SharedListings, interval tim
 		logger = slog.Default()
 	}
 	c := &Checker{creds: creds, shared: shared, interval: interval, opts: opts.withDefaults(), log: logger,
-		wake: make(chan struct{}, 1), cache: map[string]cachedFetch{}, state: map[string]string{},
+		wake: make(chan struct{}, 1), cache: map[string]cachedFetch{}, state: map[string]pairState{},
 		result: Result{Accounts: []AccountResult{}, Verdicts: []Verdict{}}}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	return c
@@ -218,26 +218,41 @@ func (c *Checker) check(ctx context.Context, refetch bool) Result {
 
 // logChanges logs one warn line per verdict change into missing or
 // single_model and one info line per return to ok. Unchecked and ineligible
-// verdicts keep the last known state. State is tracked per (route, account)
-// when that pair expects a single id, so fixing upstream_model on reload logs
-// the return to ok; otherwise per expected id.
+// verdicts keep the last known state. State is tracked per (route, account,
+// expected id). A pair that now expects a single id but expected several
+// before inherits the pair's previous bad state; a pair that expected a single
+// id before carries its state to its first verdict when no current expected id
+// has state. So changing upstream_model (or switching between one and several
+// expected ids) on reload still logs the return to ok, once.
 func (c *Checker) logChanges(vs []Verdict) {
-	perPair := map[string]int{}
+	next := map[string]pairState{}
+	known := map[string]bool{} // pairs with state for a current expected id
 	for _, v := range vs {
-		perPair[v.Route+"\x00"+v.Account]++
-	}
-	live := map[string]bool{}
-	for _, v := range vs {
-		key := v.Route + "\x00" + v.Account
-		if perPair[key] > 1 {
-			key += "\x00" + v.Expected
+		pair := v.Route + "\x00" + v.Account
+		ps := next[pair]
+		ps.n++
+		next[pair] = ps
+		if _, ok := c.state[pair].st[v.Expected]; ok {
+			known[pair] = true
 		}
-		live[key] = true
+	}
+	carried := map[string]bool{}
+	for _, v := range vs {
+		pair := v.Route + "\x00" + v.Account
+		old, ps := c.state[pair], next[pair]
+		if ps.st == nil {
+			ps.st = map[string]string{}
+			next[pair] = ps
+		}
+		prev := old.st[v.Expected]
+		if !carried[pair] && (ps.n == 1 && old.n > 1 || old.n == 1 && !known[pair]) {
+			carried[pair] = true
+			prev = badState(old.st)
+		}
 		st := v.Status
 		if v.SingleModel {
 			st = "single_model"
 		}
-		prev := c.state[key]
 		switch st {
 		case StatusOK:
 			if prev == StatusMissing || prev == "single_model" {
@@ -254,15 +269,36 @@ func (c *Checker) logChanges(vs []Verdict) {
 					"loaded", v.Loaded)
 			}
 		default:
+			if prev != "" {
+				ps.st[v.Expected] = prev
+			}
 			continue
 		}
-		c.state[key] = st
+		ps.st[v.Expected] = st
 	}
-	for key := range c.state {
-		if !live[key] {
-			delete(c.state, key)
+	c.state = next
+}
+
+// pairState is the logged state of one (route, account) pair: its verdict
+// count at the last check and the state per expected id.
+type pairState struct {
+	n  int
+	st map[string]string
+}
+
+// badState returns a missing or single_model state among a pair's states
+// (missing first), or "".
+func badState(states map[string]string) string {
+	var out string
+	for _, st := range states {
+		if st == StatusMissing {
+			return st
+		}
+		if st == "single_model" {
+			out = st
 		}
 	}
+	return out
 }
 
 // Diagnostics is the diagnostics "model_check" block: the interval and the
