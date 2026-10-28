@@ -94,6 +94,8 @@ type diagnosticsDoc struct {
 	// ModelCheck is the backend model check block, present only when the
 	// check is enabled (Deps.ModelCheck non-nil).
 	ModelCheck any `json:"model_check,omitempty"`
+	// Pools is present only when some route has a balance block.
+	Pools []diagPool `json:"pools,omitempty"`
 }
 
 type storageHealth struct {
@@ -146,6 +148,7 @@ func (s *Server) diagnostics(w http.ResponseWriter, r *http.Request) {
 	if s.deps.ModelCheck != nil {
 		doc.ModelCheck = s.deps.ModelCheck.Diagnostics()
 	}
+	doc.Pools = s.pools()
 	writeJSON(w, http.StatusOK, doc)
 }
 

@@ -410,6 +410,9 @@ type RouteConfig struct {
 	// an absent key but still counts as present.
 	discoverIntervalNull bool
 	discoverMatchNull    bool
+	// Balance, when present, pools the route's candidates (see BalanceConfig).
+	// Absent keeps the legacy ordered first-admissible selection.
+	Balance *BalanceConfig `yaml:"balance"`
 }
 
 // Model-discovery interval bounds and default.
@@ -806,7 +809,9 @@ func (c *Config) Validate() error {
 		}
 		errs = append(errs, validateUpstreams(r, provider)...)
 		errs = append(errs, validateDiscovery(r, provider)...)
+		errs = append(errs, validateBalance(r, c.Accounts)...)
 	}
+	errs = append(errs, validateBalanceRoutes(c.Routes)...)
 	if c.ClaudeLogs.Enabled {
 		if c.ClaudeLogs.Account == "" {
 			errs = append(errs, errors.New("claude_logs.account is required when claude_logs.enabled"))
@@ -1079,6 +1084,7 @@ func (c *Config) CoreRoutes() []core.Route {
 				cr.DiscoverMatch = append([]string(nil), r.DiscoverMatch...)
 			}
 		}
+		r.Balance.project(&cr)
 		out = append(out, cr)
 	}
 	return out

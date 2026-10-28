@@ -142,9 +142,28 @@ func runCheck(args []string, out io.Writer) error {
 	if !*probe {
 		fmt.Fprintf(out, "config OK: %d clients, %d accounts, %d routes; data_dir=%s\n",
 			len(cfg.Clients), len(cfg.Accounts), len(cfg.Routes), cfg.DataDir)
+		for _, line := range poolInfo(cfg) {
+			fmt.Fprintln(out, line)
+		}
 		return nil
 	}
 	return probeModels(cfg, out, *strict, *asJSON)
+}
+
+// poolInfo returns one informational line per pooled route with more members
+// than a request can try (policy.max_failovers + 1 attempts). It never fails
+// the check: such a pool is valid, it just cannot fail over to every member.
+func poolInfo(cfg *config.Config) []string {
+	var out []string
+	attempts := cfg.Policy.MaxFailovers + 1
+	for _, r := range cfg.Routes {
+		if r.Balance == nil || len(r.Balance.Members) <= attempts {
+			continue
+		}
+		out = append(out, fmt.Sprintf("info: route %s pool has %d members but at most %d attempts per request (policy.max_failovers)",
+			r.Name, len(r.Balance.Members), attempts))
+	}
+	return out
 }
 
 func cmdKeygen(args []string) error {

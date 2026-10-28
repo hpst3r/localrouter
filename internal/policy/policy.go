@@ -35,6 +35,10 @@ type Options struct {
 	// Breaker configures the reachability breaker; the zero value disables
 	// it. It is a reloadable knob.
 	Breaker BreakerOptions
+	// MaxInflight caps each listed account's open leases on every route,
+	// pooled or not (routes[].balance members max_inflight; see AccountCaps).
+	// Absent or 0 means uncapped. It is a reloadable knob.
+	MaxInflight map[string]int
 }
 
 // ErrTopologyChanged reports that a new generation's accounts differ from the
@@ -73,6 +77,9 @@ type Policy struct {
 	// reference across views so an outstanding lease's Release finds its
 	// counter in any generation.
 	state map[string]*accountState
+	// aff is the pooled-route session-affinity table, guarded by mu and
+	// shared by reference across views like state.
+	aff *affinity
 	// brOpts holds the breaker knobs of the activated generation (see
 	// Activate), shared by reference across views like state.
 	brOpts *atomic.Pointer[BreakerOptions]
@@ -101,6 +108,7 @@ func New(accounts []core.Account, quota core.QuotaSource, opts Options) *Policy 
 		quota:  quota,
 		mu:     &sync.Mutex{},
 		state:  make(map[string]*accountState, len(c.accounts)),
+		aff:    newAffinity(),
 		brOpts: &atomic.Pointer[BreakerOptions]{},
 	}
 	p.cur.Store(c)
@@ -119,7 +127,7 @@ func New(accounts []core.Account, quota core.QuotaSource, opts Options) *Policy 
 //
 // Clock and Logger are process identity pinned by New and are carried over
 // unchanged; the reloadable knobs are StaleAfter, SafetyMargin and
-// InflightEstimate and Breaker. Inputs are validated and cloned, so the caller may freely
+// InflightEstimate, Breaker and MaxInflight. Inputs are validated and cloned, so the caller may freely
 // reuse or mutate its slices and maps afterwards. The view's Breaker knobs take
 // effect, for every view, only once the view is activated (see Activate).
 //
@@ -139,7 +147,7 @@ func (p *Policy) WithConfig(accounts []core.Account, opts Options) (*Policy, err
 	opts.Logger = base.opts.Logger
 	opts = normalizeOptions(opts)
 
-	v := &Policy{quota: p.quota, mu: p.mu, state: p.state, brOpts: p.brOpts}
+	v := &Policy{quota: p.quota, mu: p.mu, state: p.state, aff: p.aff, brOpts: p.brOpts}
 	v.cur.Store(buildCfg(accounts, opts))
 	return v, nil
 }
@@ -230,11 +238,19 @@ type selection struct {
 	unreachable []string
 	retryAt     time.Time
 	others      int
+	// saturated lists the candidates at their Options.MaxInflight cap.
+	saturated []string
 }
 
 // onlyBreaker reports a denial in which every rejection was the breaker.
 func (s selection) onlyBreaker() bool {
-	return !s.dec.Allow && len(s.unreachable) > 0 && s.others == 0
+	return !s.dec.Allow && len(s.unreachable) > 0 && len(s.saturated) == 0 && s.others == 0
+}
+
+// onlySaturated reports a denial in which every rejection was the
+// max_inflight cap or the breaker, at least one of them the cap.
+func (s selection) onlySaturated() bool {
+	return !s.dec.Allow && len(s.saturated) > 0 && s.others == 0
 }
 
 func (p *Policy) selectLocked(c *cfg, class core.Class, candidates []string, exclude map[string]bool) selection {
@@ -263,6 +279,11 @@ func (p *Policy) selectLocked(c *cfg, class core.Class, candidates []string, exc
 		if ok, why := p.admitLocked(c, acct, class, sel.now); !ok {
 			reasons = append(reasons, id+": "+why)
 			sel.others++
+			continue
+		}
+		if why, full := c.saturated(id, p.state[id].inflight, 0); full {
+			reasons = append(reasons, why)
+			sel.saturated = append(sel.saturated, id)
 			continue
 		}
 		reason := "admitted " + id
@@ -447,6 +468,15 @@ func buildCfg(accounts []core.Account, opts Options) *cfg {
 		}
 		m[a.ID] = a
 	}
+	if opts.MaxInflight != nil {
+		caps := make(map[string]int, len(opts.MaxInflight))
+		for id, n := range opts.MaxInflight {
+			if n > 0 {
+				caps[id] = n
+			}
+		}
+		opts.MaxInflight = caps
+	}
 	return &cfg{accounts: m, opts: opts}
 }
 
@@ -495,6 +525,11 @@ func validateOptions(opts Options) error {
 	}
 	if opts.InflightEstimate < 0 || opts.InflightEstimate >= 1 {
 		return fmt.Errorf("%w: inflight estimate %v out of range [0,1)", ErrInvalidConfig, opts.InflightEstimate)
+	}
+	for id, n := range opts.MaxInflight {
+		if n < 0 {
+			return fmt.Errorf("%w: account %s: max_inflight %d must not be negative", ErrInvalidConfig, id, n)
+		}
 	}
 	return validateBreaker(opts.Breaker)
 }

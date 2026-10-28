@@ -70,7 +70,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 		}
 	}()
 	for {
-		l, dec, unreachable, retryIn := p.acquire(req.class, req.candidates, exclude)
+		l, dec, unreachable, retryIn, saturated := p.acquireFor(req, exclude)
 		var lease core.Lease
 		if l != nil {
 			cur = &onceLease{Lease: l}
@@ -92,6 +92,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 				p.log.Info("policy denied", "client", req.client.Name, "class", req.class, "model", req.model,
 					"reason", dec.Reason, "denial", denialBreakerOpen)
 				writeUnreachable(w, unreachable, retryIn)
+			case len(saturated) > 0:
+				// Every candidate at max_inflight (or breaker-open), pooled or not.
+				p.log.Info("policy denied", "client", req.client.Name, "class", req.class, "model", req.model,
+					"reason", dec.Reason, "denial", denialPoolSaturated)
+				writePoolSaturated(w, saturated)
 			default:
 				p.log.Info("policy denied", "client", req.client.Name, "class", req.class, "model", req.model, "reason", dec.Reason)
 				w.Header().Set("Retry-After", denyRetryAfter)
@@ -157,6 +162,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			account:   account.ID,
 			provider:  account.Provider,
 			class:     req.class,
+			pool:      poolPickOf(lease),
 		}
 
 		cred, err := p.deps.Creds.Credential(ctx, acctID)

@@ -475,6 +475,20 @@ type Route struct {
 	DiscoverInterval time.Duration
 	// DiscoverMatch are path.Match globs a discovered id must pass; nil = all.
 	DiscoverMatch []string
+	// BalanceStrategy, when non-empty, turns the route's candidates into a
+	// pool of equal peers (routes[].balance): every candidate is a member and
+	// the policy picks among them by strategy instead of first-admissible.
+	// "" is a legacy ordered route. The only strategy is "least_inflight".
+	BalanceStrategy string
+	// BalanceIdentity is the operator's declaration of the pooled model and
+	// quant (diagnostics only).
+	BalanceIdentity string
+	// BalanceStickyTTL is the session-affinity TTL; 0 disables affinity.
+	BalanceStickyTTL time.Duration
+	// BalanceWeight maps every member to its weight (1-100).
+	BalanceWeight map[string]int
+	// BalanceMaxInflight maps every member to its in-flight cap; 0 = uncapped.
+	BalanceMaxInflight map[string]int
 }
 
 // ClientInflight is one client's concurrency usage. Limit 0 means unlimited.

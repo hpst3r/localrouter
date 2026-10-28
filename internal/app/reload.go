@@ -245,7 +245,7 @@ func (a *App) makeGeneration(c *config.Config, number uint64) (*runtimeGeneratio
 	for _, acct := range accounts {
 		acctMap[acct.ID] = acct
 	}
-	pol, err := a.Policy.WithConfig(accounts, policy.Options{StaleAfter: c.Policy.StaleAfter.D(), SafetyMargin: c.Policy.SafetyMargin, InflightEstimate: c.Policy.InflightEstimate, Clock: a.reloadClock, Logger: a.Logger, Breaker: breakerOptions(c.Policy.Breaker)})
+	pol, err := a.Policy.WithConfig(accounts, policy.Options{StaleAfter: c.Policy.StaleAfter.D(), SafetyMargin: c.Policy.SafetyMargin, InflightEstimate: c.Policy.InflightEstimate, Clock: a.reloadClock, Logger: a.Logger, Breaker: breakerOptions(c.Policy.Breaker), MaxInflight: policy.AccountCaps(c.CoreRoutes())})
 	if err != nil {
 		return nil, "policy invalid", err
 	}

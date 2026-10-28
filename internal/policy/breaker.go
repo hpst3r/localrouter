@@ -230,8 +230,9 @@ func (p *Policy) Breaker(accountID string) (state string, consecutiveFailures in
 // reachability breaker, unreachable lists those accounts (in candidate order)
 // and retryIn is the time until the earliest of them half-opens (zero or
 // negative when one is already half-open with a probe in flight). Otherwise
-// unreachable is nil, and a mixed denial still names the breaker accounts in
-// the decision reason.
+// unreachable is nil, and a mixed denial (including one where a candidate is
+// at its Options.MaxInflight cap) still names the breaker accounts in the
+// decision reason.
 func (p *Policy) AcquireWithBreaker(class core.Class, candidates []string, exclude map[string]bool) (l core.Lease, dec core.Decision, unreachable []string, retryIn time.Duration) {
 	c := p.cur.Load()
 	p.mu.Lock()

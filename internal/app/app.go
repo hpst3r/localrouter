@@ -228,6 +228,7 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		Clock:            clock,
 		Logger:           logger,
 		Breaker:          breakerOptions(cfg.Policy.Breaker),
+		MaxInflight:      policy.AccountCaps(cfg.CoreRoutes()),
 	})
 	lim, err := connlim.New(cfg.Limits.MaxConcurrent, cfg.Limits.MaxConcurrentPerClient)
 	if err != nil {

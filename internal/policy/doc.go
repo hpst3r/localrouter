@@ -46,4 +46,23 @@
 // view.Activate() when it installs a reloaded generation. Leases also
 // implement Reached(), which the proxy calls once response headers arrive so
 // a half-open probe closes the breaker before a long stream ends.
+//
+// A pooled route (core.Route.BalanceStrategy != "", routes[].balance) uses
+// AcquireBalanced instead: among members that pass the breaker, admission and
+// their BalanceMaxInflight cap it picks the lowest (inflight+1)/weight (ties
+// to candidate order), or a live X-LocalRouter-Session binding kept in a
+// 4,096-entry LRU shared across views. A denial carries a PoolDeny* kind;
+// DryRunBalanced evaluates without side effects and AffinityEntries counts
+// bindings for diagnostics:
+//
+//	lease, dec, denial, accounts, retryIn := p.AcquireBalanced(class, candidates, exclude, route, session)
+//	pick, inflight, maxInflight := lease.(*policy.PoolLease).Pick()
+//
+// Options.MaxInflight (built with AccountCaps(routes)) makes a member's
+// max_inflight a per-account cap enforced on every route: Acquire, DryRun
+// and AcquireWithBreaker skip a capped account at its cap, and AcquireCapped
+// is AcquireWithBreaker for unpooled routes that reports a cap-only denial
+// as PoolDenySaturated:
+//
+//	lease, dec, denial, accounts, retryIn := p.AcquireCapped(class, candidates, exclude)
 package policy

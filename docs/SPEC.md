@@ -988,6 +988,237 @@ where they differ):
   upstream response-header timeout (default 180 s; indefinitely if it is
   disabled) fires, which can exceed `max`. The timeout then counts as `timeout` and re-opens the breaker.
 
+## Pooled backends (`routes[].balance`)
+
+Opt-in, per route: treat the route's candidates as a pool of equal
+self-hosted replicas of one model (e.g. llama-server boxes) and spread
+requests over them, instead of the ordered "first admissible wins" list.
+Without a `balance` block nothing changes.
+
+```yaml
+routes:
+  - name: qwen-local
+    models: [qwen3.5:9b]
+    upstream_model: unsloth/Qwen3.5-9B-GGUF:Q4_K_M
+    interactive: [lab-6800xt, lab-p100]   # order = tie-break preference
+    background:  [lab-p100, lab-6800xt]   # per-class consent unchanged
+    balance:
+      strategy: least_inflight            # required; the only value
+      identity: "Qwen3.5-9B Q4_K_M"       # required: operator's model+quant declaration
+      sticky_ttl: 15m                     # optional; 0/absent = no session affinity
+      members:                            # keys must equal interactive ∪ background
+        lab-6800xt: {weight: 2, max_inflight: 4}   # max_inflight = llama-server -np; 0/absent = uncapped
+        lab-p100:   {weight: 1, max_inflight: 2}   # weight absent = 1
+```
+
+Validation (load, `localrouter check`, reload; every rule has a failing-config
+test):
+
+1. `members` keys equal `interactive ∪ background` exactly (no missing, no
+   extra key). Every candidate of a pooled route is a member: there are no
+   non-member fallback tiers, so a local-only pool stays local-only.
+2. Every member is an `openai_compat` or `ollama` account, and all members
+   share one `provider` and one `cost_basis` (`codex`, `openrouter` and
+   `claude` are rejected).
+3. When the route has `upstreams`, every member's descriptor has identical
+   `protocols` and `input_modalities` (as sets), `tools`, `json_schema` and
+   `stream`; only `upstream_model` may differ. The capability filter then keeps
+   all members or none, so in-pool failover is capability-safe.
+4. `strategy` is `least_inflight`; `identity` is non-empty after trimming, at
+   most 128 bytes and printable; `weight` is an integer in [1, 100];
+   `max_inflight` is ≥ 0; `sticky_ttl` is 0 or in [30s, 24h].
+5. One member is allowed (useful for the cap alone).
+6. `verify` is rejected: "verify is not supported yet". Identity
+   verification (`verify: warn|enforce`, modelcheck verdicts, llama.cpp
+   `meta` fingerprints) is slice 5 and not implemented; rejecting the key now
+   keeps adding it later from being a silent behavior change.
+
+The block reloads in place with `routes[]` (strict parsing makes it a one-way
+upgrade). Adding an account (a new GPU box) stays restart-only; re-pooling
+existing accounts does not. `core.Route` carries the block as
+`BalanceStrategy`, `BalanceIdentity`, `BalanceStickyTTL`, `BalanceWeight` and
+`BalanceMaxInflight` (weights resolved, maps deep-copied).
+
+Selection. The proxy calls the policy's `AcquireBalanced` only for a route
+with `BalanceStrategy != ""`; every other route keeps the unchanged `Acquire`
+path. Under the admission mutex, for each candidate of the request's class
+list (after the Codex/chat and capability filters):
+
+- excluded by an earlier attempt of this request → skipped (`excluded`);
+- held by the reachability breaker → skipped (`breaker`), exactly as in
+  "Reachability breaker";
+- refused by admission (quota, cooldown, stale reserve) → skipped (`policy`);
+- `max_inflight > 0` and its open leases ≥ `max_inflight` → skipped
+  (`saturated`, reason `<id>: saturated (<n>/<cap> in flight)`).
+
+Among the eligible members the pick is the lowest `(inflight + 1) / weight`,
+ties to the class list's order (an idle pool sends everything to the first
+listed member, the warm one). In-flight counts are the policy's shared lease
+counters, so leases from earlier reload generations still count. The lease is
+created atomically with the pick; a half-open member's lease becomes its
+breaker probe exactly as with `Acquire`. The decision reason is
+`admitted <id> (pool least_inflight|sticky[; skipped <id>: <why>; ...])`.
+
+Session affinity (soft). With `sticky_ttl > 0` and an `X-LocalRouter-Session`
+header (truncated like the ledger `session`), the key `route name + NUL +
+session` binds to the picked member with a sliding TTL. A live binding wins
+when its member is eligible and, if uncapped, has at most 2 more open leases
+than the least-loaded eligible member; otherwise the strategy picks and the
+binding moves (spill/rebind). Affinity never overrides health, capacity,
+capability or membership. The table is a 4,096-entry LRU guarded by the
+admission mutex and shared across reload generations; it stores route name,
+session label and account id only. No header means no binding.
+
+Refusal before any attempt (no ledger row, no `routing_attempt_completed`
+event, one `policy denied` log line):
+
+| Exclusion kinds across the class list | Response |
+|---|---|
+| all `breaker` | 503 `upstream_unavailable`, `Retry-After` = earliest half-open (breaker contract, unchanged) |
+| `saturated`, or `saturated` + `breaker` | 429 `pool_saturated`, `Retry-After: 1`, message `localrouter: pool saturated (every member at max_inflight): <ids>`; the log line carries `denial=pool_saturated` |
+| any `policy` or `excluded` | the existing 429 `quota_reserve` with every member's reason |
+
+After at least one attempt the existing rule applies unchanged (relay the
+buffered failure or 502). Failover reuses the request loop: a failed member is
+excluded and the next `AcquireBalanced` picks among the rest, at most
+`policy.max_failovers + 1` attempts across the pool; nothing outside the
+route is ever tried. With no breaker, a dead member costs one failed attempt
+per request that picks it.
+
+Accounting needs no schema change: each attempt's row has `account_id` =
+member, `route` = route name, `upstream_model` = the member's backend id.
+`group=route` analytics shows the alias, `group=account&filter.route=<name>`
+the members. Pooled attempt events add `pool_pick` (`least_inflight` or
+`sticky`), `member_inflight` (the member's open leases at pick time including
+this one) and `member_cap` (0 = uncapped), after the existing attributes;
+unpooled events are unchanged. `POST /control/v1/admit` on a pooled route uses
+`DryRunBalanced` (same scan, honoring a live binding for the request's
+`X-LocalRouter-Session`), which creates no lease, no binding and no probe.
+`GET /control/v1/diagnostics` gains, only when some route has `balance`,
+
+```json
+"pools": [{"route": "qwen-local", "strategy": "least_inflight", "identity": "Qwen3.5-9B Q4_K_M",
+  "sticky_ttl_s": 900, "sticky_entries": 3,
+  "members": [{"account": "lab-6800xt", "weight": 2, "max_inflight": 4, "inflight": 1, "breaker": "closed"}]}]
+```
+
+(`breaker` omitted when the breaker is disabled; never URLs or keys).
+
+Acceptance tests (ids follow the design's P-numbering):
+
+- P1 flags off: with no `balance` anywhere, statuses/bodies, ledger rows,
+  attempt events, policy-denied lines, `/control/v1/status`, diagnostics and
+  admit dry runs match a golden rendered from the pre-pool base
+  (`TestP1FlagsOffGolden`); an unpooled route projects no balance fields
+  (`TestP2NoBalanceProjectsNothing`); a policy without `AcquireBalanced`
+  serves a pooled route on the ordered path
+  (`TestP1LegacyPolicyKeepsPooledRouteOrdered`).
+- P2 validation, one failing config per rule (`TestP2BalanceValidation`,
+  `TestP2BalanceValidLoadsAndProjects`, `TestP2DifferingUpstreamModelPasses`,
+  `TestP2SingleMemberAndBackgroundFallback`, `TestP2OllamaPoolAllowed`).
+- P3 weights 1/1 split 4 open leases 2/2, weights 2/1 split 6 as 4/2
+  (`TestP3SpreadByWeight`).
+- P4 an idle pool sends 10 sequential requests to the class list's first
+  member; background uses the background order
+  (`TestP4TieBreakFollowsClassListOrder`).
+- P5 caps 1+1 with two requests held: the third is 429 `pool_saturated`,
+  `Retry-After: 1`, no third backend connection, no ledger row, no event
+  (`TestP5PoolSaturatedIs429`); denial-kind precedence
+  (`TestP5SaturationDenies`, `TestP5DenialKinds`).
+- P6 200 concurrent requests with caps 2+2 under `-race` never exceed 2 per
+  backend (`TestP6CapRace`, `TestP6PoolCapRaceThroughProxy`).
+- P7 an open member gets no traffic until half-open, then exactly one probe;
+  on success it rejoins (`TestP7BreakerSkipAndSingleProbe`).
+- P8 all members open: 503 with the breaker's `Retry-After`, the cloud account
+  on another route is never contacted (`TestP8PoolAllOpenFailsClosed`);
+  saturated + breaker is 429 `pool_saturated`
+  (`TestP8SaturatedPlusBreakerIs429`).
+- P9 member A 502 before body, B serves: two rows chained by `failover_of`,
+  same `route`, A's event `failover_eligible` (`TestP9InPoolFailover`).
+- P10 three failing members with `max_failovers: 1`: exactly 2 attempts, the
+  buffered 502 is relayed (`TestP10PoolAttemptCap`).
+- P11 sticky: stays on the bound member, spills and rebinds when saturated,
+  reverts after the TTL, yields to load beyond +2, no header no binding, LRU
+  bounded at 4,096 (`TestP11Sticky`, `TestP11StickyYieldsToLoad`,
+  `TestP11NoHeaderNoBindingAndLRUBound`).
+- P12 dry run reports the pick with no lease, binding or probe
+  (`TestP12DryRunBalancedHasNoSideEffects`, `TestP12AdmitPooledDryRun`).
+- P13 reload: caps count old leases, the binding survives, a removed member is
+  never picked and its open lease releases without underflow, adding an
+  account stays restart-only (`TestP13ReloadSharesLeasesAndAffinity`,
+  `TestP13PoolReloadEndToEnd`).
+- P14-P16 identity verification (warn, enforce, fingerprint): slice 5, not
+  implemented.
+- P17 `group=route` totals equal the sum of `group=account&filter.route=` over
+  members; unpriced member rows keep `cost_usd` NULL
+  (`TestP17PoolAccountingEndToEnd`).
+- P18 identical text+image descriptors: an image request may use either
+  member; a tools request on `tools: false` members is 400
+  `capability_unsupported` with no member contacted
+  (`TestP18PoolCapabilityFilter`).
+- P19 pooled events carry `pool_pick`/`member_inflight`/`member_cap`,
+  unpooled events do not (`TestP19PoolEventAttributes`); the `pools` block
+  exists only with a pooled route and has no URLs or keys
+  (`TestP19DiagnosticsPools`, `TestP19DiagnosticsWithoutPoolsOmitsBlock`).
+
+Amendment R1 (review findings PL-1..PL-3 and two scope gaps; supersedes the
+text above where they differ):
+
+- R1.1 `max_inflight` is a per-ACCOUNT cap: llama-server `-np` slots belong
+  to the server, not the alias. If an account has a non-zero `max_inflight`
+  in any balance block, every balance block that lists it must give the same
+  value (config error naming both routes). The cap is enforced for that
+  account on every route, including unpooled ones (`policy.Options.MaxInflight`,
+  built by `policy.AccountCaps(routes)`; checked inside the admission mutex):
+  an unpooled route skips a candidate at its cap like a saturated pool member
+  (reason `<id>: saturated (<n>/<cap> in flight)`), and when every candidate
+  is excluded only by the cap, or by the cap and the breaker, the answer is
+  429 `pool_saturated` + `Retry-After: 1` exactly as on a pooled route (the
+  proxy admits unpooled routes through `AcquireCapped`). With no balance block
+  anywhere nothing changes (P1 golden byte-identical).
+- R1.2 When any route has a balance block, route names must be unique (config
+  error). Without balance blocks, validation is unchanged.
+- R1.3 The duplicated sentence in the `internal/proxy` package comment is
+  removed.
+- R1.4 `localrouter check` prints, for each pooled route whose member count
+  exceeds `policy.max_failovers + 1`, `info: route R pool has N members but at
+  most M attempts per request (policy.max_failovers)`. It is informational:
+  the exit code is unchanged.
+- R1.5 docs/ROUTING-OBSERVABILITY.md documents `pool_pick`,
+  `member_inflight`, `member_cap` and `denial=pool_saturated`; the closed-key
+  event contract test covers a pooled route.
+- R1.6 Acceptance tests: config rules (`TestR1CrossRouteBalanceRules`); cap
+  derivation, unpooled skip and denial kinds, pooled routes honoring the
+  account cap, reload and validation (`TestR1AccountCaps`,
+  `TestR1UnpooledRouteHonorsAccountCap`, `TestR1PoolUsesAccountCap`,
+  `TestR1MaxInflightReloadAndValidation`); 200 concurrent requests split
+  between a pooled and an unpooled route sharing a capped account never exceed
+  its cap under `-race` (`TestR1SharedCapRace`,
+  `TestR1SharedCapRaceThroughProxy`); an unpooled route at the cap answers 429
+  `pool_saturated` with no backend contact, row or event
+  (`TestR1UnpooledRouteAtCapIs429`); the check info line
+  (`TestR1CheckPoolInfo`); pooled event contract
+  (`TestRoutingObservabilityPooledEventContract`).
+
+Amendment R2 (final-review findings FPL-1..FPL-3, FIN-L2; supersedes the text
+above where they differ):
+
+- R2.1 (FIN-L2) `balance` cannot be combined with `discover_models` on the same
+  route (config error): a pool declares one model and quant (`identity`), while
+  a discovering route serves whatever ids its members list
+  (`TestP2BalanceValidation/R2_discover_models_with_balance`).
+- R2.2 (FPL-1) A reload that changes a `max_inflight` applies to requests that
+  start after it. A request already in flight keeps its generation's cap for
+  its own failover attempts, so the overshoot is bounded by the old cap and
+  lasts one request lifetime.
+- R2.3 (FPL-2) On an unpooled ordered route, a candidate at its cap is skipped
+  like any inadmissible candidate, so the request can go to a LATER candidate
+  of that route, including a paid cloud account listed after a capped local
+  one. List only local accounts on a route that must stay local.
+- R2.4 (FPL-3) A half-open account whose cap is still filled by leases admitted
+  before the breaker opened cannot be probed until they drain; until then it
+  is refused as saturated (429 `pool_saturated`, `Retry-After: 1`), not 503.
+
 ## Concurrency limits and inbound timeouts
 
 `limits.max_concurrent` (global) and `limits.max_concurrent_per_client`

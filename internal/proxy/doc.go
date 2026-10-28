@@ -15,6 +15,13 @@
 // only because of the breaker, the answer is 503 upstream_unavailable. A
 // lease implementing Reached() is told as soon as the headers of an answer
 // that is not request-scoped arrive, before the body is relayed.
+// A pooled route (core.Route.BalanceStrategy set) is admitted through a
+// policy implementing AcquireBalanced; when every member is at max_inflight
+// (or breaker-open) the answer is 429 pool_saturated with Retry-After 1, and
+// pooled attempt events add pool_pick, member_inflight and member_cap. A
+// member's max_inflight caps that account on every route: an unpooled route
+// is admitted through AcquireCapped when the policy implements it, and a
+// denial only by caps (or caps and the breaker) is answered the same way.
 //
 // Public API wired by cmd/localrouter:
 //
