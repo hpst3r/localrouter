@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -370,7 +371,28 @@ type RouteConfig struct {
 	// unknown keys are rejected. Absent/empty preserves the legacy
 	// unconstrained route.
 	Upstreams map[string]UpstreamSpec `yaml:"upstreams"`
+	// DiscoverModels opts the route into model discovery from its candidates'
+	// GET {base_url}/models listings. DiscoverInterval (default 5m, within
+	// [30s, 24h]) and DiscoverMatch (path.Match globs; absent = all ids) are
+	// valid only on a discovering route; nil means the key was absent or
+	// null (Load records a null value in the unexported flags below).
+	DiscoverModels   bool      `yaml:"discover_models"`
+	DiscoverInterval *Duration `yaml:"discover_interval"`
+	DiscoverMatch    []string  `yaml:"discover_match"`
+
+	// discoverIntervalNull / discoverMatchNull record a key present with a
+	// YAML null value (`key: ~` or a bare `key:`), which decodes to nil like
+	// an absent key but still counts as present.
+	discoverIntervalNull bool
+	discoverMatchNull    bool
 }
+
+// Model-discovery interval bounds and default.
+const (
+	DefaultDiscoverInterval = 5 * time.Minute
+	MinDiscoverInterval     = 30 * time.Second
+	MaxDiscoverInterval     = 24 * time.Hour
+)
 
 // UpstreamSpec is one candidate account's capability descriptor inside
 // routes[].upstreams. It is a config mirror of core.UpstreamSpec.
@@ -417,6 +439,9 @@ func Load(path string) (*Config, error) {
 	dec := yaml.NewDecoder(strings.NewReader(string(b)))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if err := c.markNullDiscoveryKeys(b); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	c.applyDefaults(filepath.Dir(absOr(path)))
@@ -735,7 +760,7 @@ func (c *Config) Validate() error {
 	}
 	models := map[string]string{}
 	for _, r := range c.Routes {
-		if r.Name == "" || len(r.Models) == 0 {
+		if r.Name == "" || len(r.Models) == 0 && !r.DiscoverModels {
 			errs = append(errs, fmt.Errorf("route %q: name and models required", r.Name))
 		}
 		for _, m := range r.Models {
@@ -755,6 +780,7 @@ func (c *Config) Validate() error {
 			}
 		}
 		errs = append(errs, validateUpstreams(r, provider)...)
+		errs = append(errs, validateDiscovery(r, provider)...)
 	}
 	if c.ClaudeLogs.Enabled {
 		if c.ClaudeLogs.Account == "" {
@@ -856,6 +882,118 @@ func validateUpstreams(r RouteConfig, provider map[string]string) []error {
 	return errs
 }
 
+// markNullDiscoveryKeys records, per route, a discover_interval or
+// discover_match key present with a YAML null value. Decoding maps null to
+// nil, which would otherwise read as an absent key.
+func (c *Config) markNullDiscoveryKeys(b []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return err
+	}
+	root := deref(&doc)
+	if root.Kind == yaml.DocumentNode && len(root.Content) == 1 {
+		root = deref(root.Content[0])
+	}
+	routes := mappingValue(root, "routes")
+	if routes == nil || routes.Kind != yaml.SequenceNode {
+		return nil
+	}
+	for i, item := range routes.Content {
+		if i >= len(c.Routes) {
+			break
+		}
+		item = deref(item)
+		if v := mappingValue(item, "discover_interval"); v != nil && isNull(v) {
+			c.Routes[i].discoverIntervalNull = true
+		}
+		if v := mappingValue(item, "discover_match"); v != nil && isNull(v) {
+			c.Routes[i].discoverMatchNull = true
+		}
+	}
+	return nil
+}
+
+// deref follows a YAML alias to its anchored node.
+func deref(n *yaml.Node) *yaml.Node {
+	for n != nil && n.Kind == yaml.AliasNode {
+		n = n.Alias
+	}
+	return n
+}
+
+// mappingValue returns the (alias-resolved) value of key in mapping n, or nil.
+func mappingValue(n *yaml.Node, key string) *yaml.Node {
+	if n == nil || n.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value == key {
+			return deref(n.Content[i+1])
+		}
+	}
+	return nil
+}
+
+func isNull(n *yaml.Node) bool {
+	return n.Kind == yaml.ScalarNode && n.ShortTag() == "!!null"
+}
+
+// validateDiscovery enforces the model-discovery rules for one route: a
+// discovering route may only use openai_compat/ollama candidates and never
+// rewrites the model (discovered ids are forwarded unchanged), and the interval
+// and match keys are accepted only on a discovering route. A route without
+// discover_models and without either key yields no error, so legacy configs
+// validate exactly as before.
+func validateDiscovery(r RouteConfig, provider map[string]string) []error {
+	var errs []error
+	if !r.DiscoverModels {
+		if r.DiscoverInterval != nil || r.discoverIntervalNull {
+			errs = append(errs, fmt.Errorf("route %s: discover_interval requires discover_models: true", r.Name))
+		}
+		if r.DiscoverMatch != nil || r.discoverMatchNull {
+			errs = append(errs, fmt.Errorf("route %s: discover_match requires discover_models: true", r.Name))
+		}
+		return errs
+	}
+	seen := map[string]bool{}
+	for _, id := range append(append([]string{}, r.Interactive...), r.Background...) {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if p, ok := provider[id]; ok && p != core.ProviderOpenAICompat && p != core.ProviderOllama {
+			errs = append(errs, fmt.Errorf("route %s: discover_models requires openai_compat or ollama candidates; account %q is %s", r.Name, id, p))
+		}
+	}
+	if r.UpstreamModel != "" {
+		errs = append(errs, fmt.Errorf("route %s: discover_models forwards discovered ids unchanged; upstream_model must be empty", r.Name))
+	}
+	for id, spec := range r.Upstreams {
+		if strings.TrimSpace(spec.UpstreamModel) != "" {
+			errs = append(errs, fmt.Errorf("route %s: discover_models forwards discovered ids unchanged; upstreams[%s].upstream_model must be empty", r.Name, id))
+		}
+	}
+	if r.discoverIntervalNull {
+		errs = append(errs, fmt.Errorf("route %s: discover_interval must be a duration when present, not null", r.Name))
+	}
+	if r.DiscoverInterval != nil {
+		if d := r.DiscoverInterval.D(); d < MinDiscoverInterval || d > MaxDiscoverInterval {
+			errs = append(errs, fmt.Errorf("route %s: discover_interval must be within [30s, 24h]", r.Name))
+		}
+	}
+	if r.discoverMatchNull || r.DiscoverMatch != nil && len(r.DiscoverMatch) == 0 {
+		errs = append(errs, fmt.Errorf("route %s: discover_match must list at least one pattern when present", r.Name))
+	}
+	for _, pat := range r.DiscoverMatch {
+		if strings.TrimSpace(pat) == "" {
+			errs = append(errs, fmt.Errorf("route %s: discover_match patterns must be non-empty", r.Name))
+		} else if _, err := path.Match(pat, ""); errors.Is(err, path.ErrBadPattern) {
+			errs = append(errs, fmt.Errorf("route %s: discover_match pattern %q is invalid", r.Name, pat))
+		}
+	}
+	return errs
+}
+
 // CoreAccounts converts account config into core.Account values.
 func (c *Config) CoreAccounts() []core.Account {
 	out := make([]core.Account, 0, len(c.Accounts))
@@ -895,14 +1033,25 @@ func (c *Config) CoreRoutes() []core.Route {
 				}
 			}
 		}
-		out = append(out, core.Route{
+		cr := core.Route{
 			Name:          r.Name,
 			Models:        append([]string(nil), r.Models...),
 			UpstreamModel: r.UpstreamModel,
 			Interactive:   append([]string(nil), r.Interactive...),
 			Background:    append([]string(nil), bg...),
 			Upstreams:     ups,
-		})
+		}
+		if r.DiscoverModels {
+			cr.DiscoverModels = true
+			cr.DiscoverInterval = DefaultDiscoverInterval
+			if r.DiscoverInterval != nil {
+				cr.DiscoverInterval = r.DiscoverInterval.D()
+			}
+			if len(r.DiscoverMatch) > 0 {
+				cr.DiscoverMatch = append([]string(nil), r.DiscoverMatch...)
+			}
+		}
+		out = append(out, cr)
 	}
 	return out
 }

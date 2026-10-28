@@ -185,6 +185,288 @@ for the attempt is the serving candidate's `upstream_model`, else the route's
 `PricingModel` selects that backend's price on constrained routes. An unpriced
 backend stays unpriced: it never falls back to a potentially unrelated alias.
 
+## Model discovery (`routes[].discover_models`)
+
+A route MAY opt into discovering its model names from its upstream accounts'
+`GET {base_url}/models` listings, instead of (or in addition to) listing them by
+hand. It is additive and opt-in: a route without `discover_models: true` is
+byte-identical in config validation, routing, `/v1/models` output and
+diagnostics to a build without this feature.
+
+```yaml
+routes:
+  - name: llama-lab
+    discover_models: true            # NEW, optional, default false
+    discover_interval: 5m            # optional; default 5m; min 30s, max 24h
+    discover_match: ["unsloth/*"]    # optional path.Match globs; absent = all ids
+    models: []                       # optional when discover_models is true
+    interactive: [llama-lab]
+    background:  [llama-lab]
+```
+
+### Validation (`localrouter check`, startup and reload)
+
+1. `discover_models: true` requires every candidate account in
+   `interactive ∪ background` to have provider `openai_compat` or `ollama`.
+   Any other provider (`codex`, `claude`, `openrouter`) is a config error.
+2. `discover_models: true` with a non-empty route `upstream_model`, or with any
+   `upstreams[<id>].upstream_model`, is a config error: discovered ids are
+   always forwarded unchanged.
+3. `models` may be empty or absent when `discover_models` is true (it is still
+   required otherwise, exactly as today). Static `models` on a discovering
+   route keep today's semantics.
+4. `discover_interval` and `discover_match` are rejected on a route without
+   `discover_models: true`. `discover_interval` uses the existing duration
+   syntax and must be within [30s, 24h]. Each `discover_match` pattern must be
+   non-empty and valid for `path.Match` (checked with `path.ErrBadPattern`).
+5. All three keys are reloadable in place with the rest of `routes[]`. The
+   upgrade is one-way, like `upstreams`: strict parsing means an older binary
+   rejects a config that uses them.
+
+### Discovery (shared state, polled per account)
+
+- Discovered listings are runtime state shared across generations (like quota
+  observations), keyed by **account id**, never rebuilt on reload. The set of
+  accounts polled, and each account's interval, follows the current
+  generation: an account is polled while at least one discovering route lists
+  it as a candidate, at the smallest `discover_interval` among those routes.
+  An accepted reload re-targets polling without discarding listings already
+  held; an account no longer referenced stops being polled and its listing is
+  dropped.
+- Polling starts in the background with `App.Start` and stops with
+  `App.Close`/shutdown. The first poll does not block startup or `/readyz`.
+- Request: `GET {account.base_url}/models` with the account's credential
+  (`core.CredentialSource`, the same bearer the proxy sends), no redirects
+  followed, 5 s overall timeout, response body capped at 1 MiB.
+- Parse: an OpenAI-style object `{"data":[{"id":"..."},...]}`. Extra fields
+  (llama.cpp router `status`, `architecture`, ...) are ignored. An id is kept
+  only if it is 1-256 bytes, valid UTF-8, and contains no whitespace or control
+  characters. At most 1,000 ids are kept per account (the rest are dropped and
+  counted). Duplicates collapse.
+- A failed poll (transport error, non-2xx, oversized or malformed body) keeps
+  the account's last successful listing unchanged and records only a fixed
+  error class (`transport`, `status`, `too_large`, `malformed`, `credential`),
+  never the URL, body, or credential.
+
+### Resolution
+
+For a request naming model `m`:
+
+1. A static `models` entry on any route wins, exactly as today (no change in
+   behavior, candidates or rewriting).
+2. Otherwise, discovering routes are tried in config order. A route matches if
+   `m` passes its `discover_match` (or it has none) and at least one of its
+   candidate accounts currently lists `m`. The first matching route serves the
+   request, with its interactive/background candidate lists **narrowed to the
+   accounts that list `m`**, order preserved. Discovery never adds a candidate
+   outside the route's own lists, so a local-only route stays fail-closed.
+3. If no route matches and at least one route discovers, the proxy triggers an
+   on-demand refresh of all discovering accounts, single-flight and rate-limited
+   to at most once per 30 s, waits at most 3 s for it, then retries step 2 once.
+   If it still does not resolve, the response is today's 404 `model_not_found`.
+4. Everything after route selection (Codex filtering, capability `upstreams`
+   filtering, admission, failover, ledger) is unchanged and operates on the
+   narrowed candidate list. The forwarded body keeps `m` unchanged.
+5. A discovered id that equals another discovering route's discovered id is
+   served by the earlier route; the later route's claim is reported once per
+   change in diagnostics, not per request.
+
+### Surfaces
+
+- `GET /v1/models` lists static models plus every currently resolvable
+  discovered id (after `discover_match`, deduplicated, sorted), all with
+  `owned_by: "localrouter"`. The response shape is unchanged.
+- The control API's route lookup (`check_admission` and anything else using
+  `findRoute`) resolves discovered ids with the same rules as the proxy, minus
+  the on-demand refresh.
+- `GET /control/v1/diagnostics` gains a `discovery` block only when at least one
+  route discovers: per account `{account, routes, last_success_at,
+  last_attempt_at, model_count, dropped, error_class?}` and per route
+  `{route, models, shadowed?}`. No URLs, keys or bodies. With no discovering
+  route, the diagnostics document is byte-identical to today's.
+- The ledger records the client-facing model as today; pricing lookups are
+  unchanged (a discovered model without a price is unpriced).
+
+### Acceptance tests (discovery)
+
+- D1 Flags-off: a config with no discovering route produces the same
+  `/v1/models` body, routing decisions and diagnostics document as before
+  (golden comparison against the pre-change behavior).
+- D2 Validation: each rule in "Validation" has a failing-config test.
+- D3 A llama.cpp router-mode `/models` fixture (two ids with `status` and
+  `architecture` fields) makes both ids appear in `/v1/models` and route to
+  the account; the forwarded body's `model` is byte-identical to the client's.
+- D4 Two accounts on one discovering route, each listing a different model:
+  each model is served only by the account that lists it; with both listing
+  the same model, failover stays within those two in configured order.
+- D5 A discovering route whose only candidate is down never fails over to an
+  account outside the route (fail-closed), and an unknown model never falls
+  through to a non-discovering route.
+- D6 Static wins: a model listed statically on route A and discovered on route B
+  is served by A with A's rewrite rules.
+- D7 Poll failure keeps the last good listing; a later success replaces it.
+- D8 Hostile listings: >1 MiB body, >1,000 ids, ids with whitespace/control
+  bytes/invalid UTF-8/>256 bytes, a redirect, a non-JSON body, a slow server
+  exceeding 5 s; none crash, hang, leak the body or URL into logs, or exceed
+  the bounds.
+- D9 On-demand refresh: a model that appears upstream after the last poll
+  resolves on the first request (within the 3 s wait); 100 concurrent misses
+  cause at most one upstream `/models` call per 30 s window.
+- D10 Reload: adding, removing, or re-intervaling a discovering route re-targets
+  polling without losing listings for accounts still referenced; no goroutine
+  leak after Close (checked with a goroutine-count or leak test).
+- D11 `check_admission` for a discovered id resolves the same route and
+  narrowed candidates as the proxy.
+- D12 Diagnostics: the `discovery` block appears only with a discovering route
+  and never contains URLs, keys or upstream bodies.
+
+### Implementation notes (discovery)
+
+- Fields: `core.Route` gains `DiscoverModels bool`, `DiscoverInterval
+  time.Duration` (5m default applied by `config.CoreRoutes`) and
+  `DiscoverMatch []string` (nil = all ids). `config.RouteConfig` carries
+  `discover_interval` as `*Duration` and `discover_match` as a slice so
+  presence on a non-discovering route is detectable. An explicit empty
+  `discover_match: []` is rejected (it would otherwise read as "all ids").
+- Package `internal/discovery`: `New(creds, Options) *Manager` is App-level and
+  shared by every generation; `SetTargets(accounts, routes)` re-targets it after
+  each published generation (startup and every accepted reload); `Start(ctx)`
+  runs on `App.Start`; `Close` runs on `App.Close` and at the end of
+  `App.Shutdown`. `(*Manager).Resolver(routes)` returns the per-generation
+  `*Resolver`, or nil when no route discovers; the app then leaves
+  `proxy.Deps.Discovery` and `control.Deps.Discovery` unset, which is what keeps
+  the flags-off surfaces byte-identical (D1 goldens in `internal/proxy/testdata`
+  and `internal/app/testdata`).
+- `proxy.Discovery` (`Resolve`, `Models`, `Refresh`) and `control.Discovery`
+  (`Resolve`, `Diagnostics() any`) are consumer-defined interfaces satisfied by
+  `*discovery.Resolver`. Static models are looked up first in both packages and
+  never reach the resolver.
+- Polling: the background loop checks for due accounts every second (real
+  time) and schedules by the injectable `core.Clock`; a re-intervaled account's
+  next poll is `last_attempt + new interval`. Polls are single-flight per
+  account. The on-demand refresh is single-flight per manager, spaced by at
+  least 30 s from the previous refresh start, polls every current target with
+  the manager's own context (a request's cancellation only ends its own wait,
+  at most 3 s), and is a no-op after `Close`.
+- The `/models` request copies `core.Credential.Headers` verbatim, exactly as
+  the proxy does for inference. A credential error is class `credential`; no
+  `Invalidate` is issued on a 401 (it is class `status`).
+- `dropped` counts ids rejected by validation plus distinct ids over the
+  1,000 cap, from the last successful poll. `last_success_at` /
+  `last_attempt_at` are UTC, or `null` before the first one.
+- A route whose candidates list `m` only on one class's list still matches; the
+  other class then sees an empty candidate list and is denied by policy, never
+  served from outside the route. (Superseded by Amendment 1 item 1: that
+  class now gets 404 `model_not_found` without a policy decision.)
+- Shadowing (rule 5) is reported in diagnostics only: a route's `shadowed`
+  lists ids its candidates list that a static entry or an earlier discovering
+  route serves. It is computed per diagnostics request, not logged.
+  (Superseded by Amendment 1 item 2; see below.)
+- A failed poll logs one `model discovery poll failed` line (account and
+  `error_class` only) per error-class change, and one `recovered` line when it
+  succeeds again.
+
+Implementation notes for Amendment 1:
+
+- `Resolve(model)` returns `(route, ok, ambiguous)` in `proxy.Discovery`,
+  `control.Discovery` and `*discovery.Resolver`. Route selection is
+  class-agnostic (a route claims `m` if any candidate lists it); the proxy and
+  `findRoute` then apply item 1 to the request's class. `check_admission`
+  answers 404 `no route for model "m"` for a class-empty route and 404
+  `model "m" is claimed by more than one discovering route` for an ambiguous
+  id, without a policy dry run.
+- The on-demand refresh runs only on a true miss (no route claims `m`); an
+  ambiguous or class-empty id is answered without one. `Refresh(ctx, model)`
+  returns at once unless some discovering route's `discover_match` admits
+  `model` (item 3), and otherwise returns as soon as `Resolve(model)` reports
+  `ok`, re-checked each time any account's poll finishes (item 4).
+- Diagnostics: each route's `models` lists the ids it alone serves and
+  `ambiguous` (omitted when empty) the ids it claims together with another
+  discovering route; static ids appear in neither. `model_count` is the
+  account's full listing size before `discover_match`.
+- Backoff (item 5) applies to every failed poll, background or on-demand; a
+  re-interval keeps the current backoff (`last_attempt + min(backoff,
+  interval)`).
+- `discover_match` uses `path.Match`: `*` does not cross `/`, so write
+  `unsloth/*` or `*/*`, not `*`.
+- Null keys (item 8) are detected by `config.Load` with a second YAML node
+  pass, because yaml.v3 decodes null to nil without calling unmarshalers.
+- With no target the manager runs no goroutine (item 9); `Start` only records
+  the context, and `SetTargets` starts or (via the loop's exit check) stops
+  the loop.
+
+### Amendment 1 (post-review decisions)
+
+These supersede the sections above where they differ. Acceptance tests D13-D20 are added.
+
+1. **Class-empty narrowing is a miss.** If the matched discovering route's candidate list for the
+   request's class is empty after narrowing (only accounts in the other class list `m`), the
+   proxy answers 404 `model_not_found`, exactly like an unknown model. No policy decision is
+   made and no lease is taken. `check_admission` reports the same "no route" outcome for that
+   class. (D13)
+2. **Ambiguous discovered ids are refused, not shadowed.** This replaces Resolution rule 5. If two
+   or more discovering routes would serve `m` (each has a candidate listing it and passes its
+   `discover_match`), no route serves it: the proxy answers 404 `model_not_found` with the
+   message `localrouter: model is claimed by more than one discovering route`, and the id is
+   omitted from `/v1/models`. Diagnostics lists it per route under `ambiguous` (route names
+   only). The operator resolves it with `discover_match` or by listing it statically (static
+   still wins). Rationale: rule 5 let a cloud route silently take over a local-only route's model
+   when the cloud upstream started listing the same id. The per-route `shadowed` field is
+   removed (static-vs-discovered collisions need no report, because static always wins by
+   design). (D14)
+3. **No refresh for ids no route could admit.** The on-demand refresh (Resolution rule 3) runs
+   only if at least one discovering route's `discover_match` admits `m` (or that route has no
+   `discover_match`). Otherwise the 404 is immediate. (D15)
+4. **Refresh waiters wake per account.** A waiting request re-checks resolution each time any
+   account's poll finishes, and returns as soon as `m` resolves, instead of waiting for every
+   account in the refresh. The 3 s bound and the cancellation rules are unchanged. (D16, the
+   review PoC `TestReviewRefreshWaitsForSlowestAccount`)
+5. **Failed polls retry with backoff.** After a failed poll, the account's next scheduled poll is
+   30 s later, doubling on each consecutive failure, capped at the account's interval. A success
+   resets to the normal interval. (D17)
+6. **Bounded response headers.** The discovery transport sets `MaxResponseHeaderBytes` to 64 KiB;
+   an overflow is error class `transport`. (review PoC `TestReviewHugeResponseHeadersAccepted`)
+7. **Stricter ids.** An id is kept only if every rune satisfies `unicode.IsGraphic` and is not a
+   space (this rejects Cf format characters such as U+200B, U+202E, U+FEFF and U+2060, in
+   addition to the existing rules). (review PoC `TestReviewInvisibleFormatCharsInIDs`)
+8. **Null and blank config values.** A key that is present with a YAML null value
+   (`discover_interval: ~`, `discover_match:` with nothing after it) counts as present: it is
+   rejected on a non-discovering route (rule 4), and on a discovering route a null or empty
+   `discover_match` is a config error, as is a null `discover_interval`. A `discover_match`
+   pattern that is empty after whitespace trimming is a config error. (review PoC
+   `TestReviewDiscoverNullKeysAccepted`, D18)
+9. **No idle discovery goroutine.** With no discovering route, `App.Start` starts no discovery
+   goroutine. The loop starts when `SetTargets` first receives a target and stops when targets
+   become empty or on Close. The goroutine count of a flags-off App after Start equals the
+   pre-change count. (D19)
+10. **Documented semantics.** `discover_match` uses `path.Match`, so `*` does not cross `/`: write
+    `unsloth/*` or `*/*`, not `*`. State this in the SPEC and `config.example.yaml`.
+    Diagnostics `model_count` is the account's full listing size before any `discover_match`
+    filtering. Listing JSON is parsed with `encoding/json` semantics (case-insensitive keys,
+    last duplicate wins); this is accepted because an id is only a lookup key. (D20: the docs
+    example has a test that `unsloth/*` matches `unsloth/Qwen3.5-9B-GGUF:Q4_K_M` and `*` does
+    not.)
+
+### Amendment R2 (final-review decisions)
+
+These supersede the sections above where they differ.
+
+1. **A re-pointed account starts over.** When `SetTargets` receives an already-polled account whose
+   `provider` or `base_url` differs (the fields that decide which listing a poll fetches; the
+   credential is looked up by account id), the account is treated exactly as a newly referenced
+   one: its listing, ids, `last_success_at`, `last_attempt_at`, error class and backoff are
+   dropped, and it is polled on the next loop pass. A poll of the old value still in flight is
+   tagged with the entry it started on and its result is discarded. A change to any other field
+   (for example `reserve`) keeps the listing and schedule. Today every account field except
+   `reserve` is restart-only, so this guards the manager contract rather than a live reload
+   path. (FMC-1; `TestFMC1BaseURLChangeDropsStaleListing`,
+   `TestFMC1InFlightPollAcrossBaseURLChangeDiscarded`)
+2. **Publication order on reload.** A reload publishes the new generation before it calls
+   `Discovery.SetTargets`. For that moment the new generation's resolver reads the previous
+   target set: an account added by the reload misses until the retarget (and may spend one
+   on-demand refresh on the old targets). This is accepted: resolution only narrows a route's own
+   candidate lists, so no traffic is sent outside the route's configured accounts. No code change.
+
 ## Workload classes
 
 `interactive` and `background`. Each client key maps to one class.
