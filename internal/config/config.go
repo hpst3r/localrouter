@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -44,6 +45,46 @@ type Config struct {
 	Routes     []RouteConfig    `yaml:"routes"`
 	ClaudeLogs ClaudeLogsConfig `yaml:"claude_logs"`
 	HermesLogs HermesLogsConfig `yaml:"hermes_logs"`
+	// ModelCheck is the optional backend model drift check. Nil (absent) or a
+	// zero interval disables it, leaving startup and diagnostics unchanged.
+	ModelCheck *ModelCheckConfig `yaml:"model_check"`
+	// Decisions bounds typed-decision request bodies (/v1/systemone,
+	// /v1/decisions). It is read only by decision routes; zero values take
+	// the defaults (see DecisionsConfig).
+	Decisions DecisionsConfig `yaml:"decisions"`
+}
+
+// ModelCheckConfig enables the periodic backend model check (docs/SPEC.md,
+// "Backend model check"). Interval 0 disables it; otherwise it must be within
+// [MinModelCheckInterval, MaxModelCheckInterval]. It is restart-only.
+type ModelCheckConfig struct {
+	Interval Duration `yaml:"interval"`
+}
+
+// Backend model check interval bounds.
+const (
+	MinModelCheckInterval = 30 * time.Second
+	MaxModelCheckInterval = 24 * time.Hour
+)
+
+// ModelCheckInterval returns the configured check interval, or 0 when the
+// check is disabled.
+func (c *Config) ModelCheckInterval() time.Duration {
+	if c.ModelCheck == nil {
+		return 0
+	}
+	return c.ModelCheck.Interval.D()
+}
+
+// DecisionsConfig bounds the strict typed-decision classifier. A zero field
+// takes its default; negative values are rejected. The body size limit stays
+// the global proxy limit.
+type DecisionsConfig struct {
+	MaxQuestions         int `yaml:"max_questions"`           // default 64
+	MaxQuestionNameBytes int `yaml:"max_question_name_bytes"` // default 128
+	MaxChoiceOptions     int `yaml:"max_choice_options"`      // default 255
+	MaxScoreLevels       int `yaml:"max_score_levels"`        // default 10
+	MaxNesting           int `yaml:"max_nesting"`             // default 64
 }
 
 // ClaudeLogsConfig controls ingestion of Claude Code transcript token usage.
@@ -83,6 +124,19 @@ type PolicyConfig struct {
 	SafetyMargin     float64  `yaml:"safety_margin"`
 	InflightEstimate float64  `yaml:"inflight_estimate"`
 	MaxFailovers     int      `yaml:"max_failovers"`
+	// Breaker is the opt-in upstream reachability breaker; absent or
+	// threshold 0 disables it.
+	Breaker BreakerConfig `yaml:"breaker"`
+}
+
+// BreakerConfig configures the per-account reachability breaker. Threshold
+// consecutive unreachable attempts open the breaker for Base, doubling on
+// each re-open up to Max. Threshold 0 (the default) disables it; Base and Max
+// default to 5s and 60s only when it is enabled.
+type BreakerConfig struct {
+	Threshold int      `yaml:"threshold"`
+	Base      Duration `yaml:"base"`
+	Max       Duration `yaml:"max"`
 }
 
 type ControlConfig struct {
@@ -357,7 +411,31 @@ type RouteConfig struct {
 	// unknown keys are rejected. Absent/empty preserves the legacy
 	// unconstrained route.
 	Upstreams map[string]UpstreamSpec `yaml:"upstreams"`
+	// DiscoverModels opts the route into model discovery from its candidates'
+	// GET {base_url}/models listings. DiscoverInterval (default 5m, within
+	// [30s, 24h]) and DiscoverMatch (path.Match globs; absent = all ids) are
+	// valid only on a discovering route; nil means the key was absent or
+	// null (Load records a null value in the unexported flags below).
+	DiscoverModels   bool      `yaml:"discover_models"`
+	DiscoverInterval *Duration `yaml:"discover_interval"`
+	DiscoverMatch    []string  `yaml:"discover_match"`
+
+	// discoverIntervalNull / discoverMatchNull record a key present with a
+	// YAML null value (`key: ~` or a bare `key:`), which decodes to nil like
+	// an absent key but still counts as present.
+	discoverIntervalNull bool
+	discoverMatchNull    bool
+	// Balance, when present, pools the route's candidates (see BalanceConfig).
+	// Absent keeps the legacy ordered first-admissible selection.
+	Balance *BalanceConfig `yaml:"balance"`
 }
+
+// Model-discovery interval bounds and default.
+const (
+	DefaultDiscoverInterval = 5 * time.Minute
+	MinDiscoverInterval     = 30 * time.Second
+	MaxDiscoverInterval     = 24 * time.Hour
+)
 
 // UpstreamSpec is one candidate account's capability descriptor inside
 // routes[].upstreams. It is a config mirror of core.UpstreamSpec.
@@ -378,6 +456,13 @@ type UpstreamSpec struct {
 	Tools      bool `yaml:"tools"`
 	JSONSchema bool `yaml:"json_schema"`
 	Stream     bool `yaml:"stream"`
+	// QuestionTypes is required on a typed-decision descriptor (protocols
+	// [systemone] or [decisions]): a non-empty subset of {noul, choice,
+	// score}. It is rejected on every other descriptor.
+	QuestionTypes []string `yaml:"question_types"`
+	// AllowAlias accepts a moving model alias (~…, *-latest, *-preview) as the
+	// route's pinned decision model. Every candidate must set it.
+	AllowAlias bool `yaml:"allow_alias"`
 }
 
 // Duration parses Go duration strings in YAML.
@@ -404,6 +489,9 @@ func Load(path string) (*Config, error) {
 	dec := yaml.NewDecoder(strings.NewReader(string(b)))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if err := c.markNullDiscoveryKeys(b); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	c.applyDefaults(filepath.Dir(absOr(path)))
@@ -440,6 +528,14 @@ func (c *Config) applyDefaults(baseDir string) {
 	}
 	if c.Policy.MaxFailovers == 0 {
 		c.Policy.MaxFailovers = 2
+	}
+	if c.Policy.Breaker.Threshold > 0 {
+		if c.Policy.Breaker.Base == 0 {
+			c.Policy.Breaker.Base = Duration(5 * time.Second)
+		}
+		if c.Policy.Breaker.Max == 0 {
+			c.Policy.Breaker.Max = Duration(60 * time.Second)
+		}
 	}
 	if c.Timeouts.Header == 0 {
 		c.Timeouts.Header = Duration(10 * time.Second)
@@ -491,6 +587,7 @@ func (c *Config) applyDefaults(baseDir string) {
 	if c.HermesLogs.ScanInterval == 0 {
 		c.HermesLogs.ScanInterval = Duration(time.Minute)
 	}
+	c.Decisions.applyDefaults()
 	for i := range c.Accounts {
 		a := &c.Accounts[i]
 		a.APIKeyFile = expand(a.APIKeyFile, baseDir)
@@ -598,6 +695,11 @@ func (c *Config) Validate() error {
 	}
 	if c.Policy.InflightEstimate < 0 || c.Policy.InflightEstimate >= 1 {
 		errs = append(errs, errors.New("policy.inflight_estimate must be in [0,1)"))
+	}
+	if br := c.Policy.Breaker; br.Threshold < 0 || br.Base < 0 || br.Max < 0 {
+		errs = append(errs, errors.New("policy.breaker threshold, base and max must not be negative"))
+	} else if br.Max > 0 && br.Max < br.Base {
+		errs = append(errs, errors.New("policy.breaker.max must not be less than policy.breaker.base"))
 	}
 	if c.Limits.MaxConcurrent < 0 {
 		errs = append(errs, errors.New("limits.max_concurrent must not be negative (0 = unlimited)"))
@@ -707,9 +809,14 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("account %s: cost_basis must be api_equivalent or metered", a.ID))
 		}
 	}
+	errs = append(errs, c.Decisions.validate()...)
+	baseURL := map[string]string{}
+	for _, a := range c.Accounts {
+		baseURL[a.ID] = a.BaseURL
+	}
 	models := map[string]string{}
 	for _, r := range c.Routes {
-		if r.Name == "" || len(r.Models) == 0 {
+		if r.Name == "" || len(r.Models) == 0 && !r.DiscoverModels {
 			errs = append(errs, fmt.Errorf("route %q: name and models required", r.Name))
 		}
 		for _, m := range r.Models {
@@ -728,8 +835,15 @@ func (c *Config) Validate() error {
 				errs = append(errs, fmt.Errorf("route %s: account %q is a quota-only claude account and cannot serve inference", r.Name, id))
 			}
 		}
-		errs = append(errs, validateUpstreams(r, provider)...)
+		if decisionRoute(r) {
+			errs = append(errs, validateDecisionRoute(r, provider, baseURL)...)
+		} else {
+			errs = append(errs, validateUpstreams(r, provider)...)
+		}
+		errs = append(errs, validateDiscovery(r, provider)...)
+		errs = append(errs, validateBalance(r, c.Accounts)...)
 	}
+	errs = append(errs, validateBalanceRoutes(c.Routes)...)
 	if c.ClaudeLogs.Enabled {
 		if c.ClaudeLogs.Account == "" {
 			errs = append(errs, errors.New("claude_logs.account is required when claude_logs.enabled"))
@@ -739,6 +853,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Budgets != nil {
 		errs = append(errs, c.Budgets.validate(seenC, accts)...)
+	}
+	if iv := c.ModelCheckInterval(); iv != 0 && (iv < MinModelCheckInterval || iv > MaxModelCheckInterval) {
+		errs = append(errs, fmt.Errorf("model_check.interval must be 0 (disabled) or within [%s, %s]", MinModelCheckInterval, MaxModelCheckInterval))
 	}
 	return errors.Join(errs...)
 }
@@ -789,6 +906,9 @@ func validateUpstreams(r RouteConfig, provider map[string]string) []error {
 		}
 	}
 	for id, spec := range r.Upstreams {
+		if len(spec.QuestionTypes) > 0 || spec.AllowAlias {
+			errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: question_types and allow_alias apply only to decision descriptors (protocols [systemone] or [decisions])", r.Name, id))
+		}
 		if len(spec.Protocols) == 0 {
 			errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: protocols must be a non-empty subset of chat,responses", r.Name, id))
 		} else {
@@ -830,6 +950,118 @@ func validateUpstreams(r RouteConfig, provider map[string]string) []error {
 	return errs
 }
 
+// markNullDiscoveryKeys records, per route, a discover_interval or
+// discover_match key present with a YAML null value. Decoding maps null to
+// nil, which would otherwise read as an absent key.
+func (c *Config) markNullDiscoveryKeys(b []byte) error {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return err
+	}
+	root := deref(&doc)
+	if root.Kind == yaml.DocumentNode && len(root.Content) == 1 {
+		root = deref(root.Content[0])
+	}
+	routes := mappingValue(root, "routes")
+	if routes == nil || routes.Kind != yaml.SequenceNode {
+		return nil
+	}
+	for i, item := range routes.Content {
+		if i >= len(c.Routes) {
+			break
+		}
+		item = deref(item)
+		if v := mappingValue(item, "discover_interval"); v != nil && isNull(v) {
+			c.Routes[i].discoverIntervalNull = true
+		}
+		if v := mappingValue(item, "discover_match"); v != nil && isNull(v) {
+			c.Routes[i].discoverMatchNull = true
+		}
+	}
+	return nil
+}
+
+// deref follows a YAML alias to its anchored node.
+func deref(n *yaml.Node) *yaml.Node {
+	for n != nil && n.Kind == yaml.AliasNode {
+		n = n.Alias
+	}
+	return n
+}
+
+// mappingValue returns the (alias-resolved) value of key in mapping n, or nil.
+func mappingValue(n *yaml.Node, key string) *yaml.Node {
+	if n == nil || n.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value == key {
+			return deref(n.Content[i+1])
+		}
+	}
+	return nil
+}
+
+func isNull(n *yaml.Node) bool {
+	return n.Kind == yaml.ScalarNode && n.ShortTag() == "!!null"
+}
+
+// validateDiscovery enforces the model-discovery rules for one route: a
+// discovering route may only use openai_compat/ollama candidates and never
+// rewrites the model (discovered ids are forwarded unchanged), and the interval
+// and match keys are accepted only on a discovering route. A route without
+// discover_models and without either key yields no error, so legacy configs
+// validate exactly as before.
+func validateDiscovery(r RouteConfig, provider map[string]string) []error {
+	var errs []error
+	if !r.DiscoverModels {
+		if r.DiscoverInterval != nil || r.discoverIntervalNull {
+			errs = append(errs, fmt.Errorf("route %s: discover_interval requires discover_models: true", r.Name))
+		}
+		if r.DiscoverMatch != nil || r.discoverMatchNull {
+			errs = append(errs, fmt.Errorf("route %s: discover_match requires discover_models: true", r.Name))
+		}
+		return errs
+	}
+	seen := map[string]bool{}
+	for _, id := range append(append([]string{}, r.Interactive...), r.Background...) {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if p, ok := provider[id]; ok && p != core.ProviderOpenAICompat && p != core.ProviderOllama {
+			errs = append(errs, fmt.Errorf("route %s: discover_models requires openai_compat or ollama candidates; account %q is %s", r.Name, id, p))
+		}
+	}
+	if r.UpstreamModel != "" {
+		errs = append(errs, fmt.Errorf("route %s: discover_models forwards discovered ids unchanged; upstream_model must be empty", r.Name))
+	}
+	for id, spec := range r.Upstreams {
+		if strings.TrimSpace(spec.UpstreamModel) != "" {
+			errs = append(errs, fmt.Errorf("route %s: discover_models forwards discovered ids unchanged; upstreams[%s].upstream_model must be empty", r.Name, id))
+		}
+	}
+	if r.discoverIntervalNull {
+		errs = append(errs, fmt.Errorf("route %s: discover_interval must be a duration when present, not null", r.Name))
+	}
+	if r.DiscoverInterval != nil {
+		if d := r.DiscoverInterval.D(); d < MinDiscoverInterval || d > MaxDiscoverInterval {
+			errs = append(errs, fmt.Errorf("route %s: discover_interval must be within [30s, 24h]", r.Name))
+		}
+	}
+	if r.discoverMatchNull || r.DiscoverMatch != nil && len(r.DiscoverMatch) == 0 {
+		errs = append(errs, fmt.Errorf("route %s: discover_match must list at least one pattern when present", r.Name))
+	}
+	for _, pat := range r.DiscoverMatch {
+		if strings.TrimSpace(pat) == "" {
+			errs = append(errs, fmt.Errorf("route %s: discover_match patterns must be non-empty", r.Name))
+		} else if _, err := path.Match(pat, ""); errors.Is(err, path.ErrBadPattern) {
+			errs = append(errs, fmt.Errorf("route %s: discover_match pattern %q is invalid", r.Name, pat))
+		}
+	}
+	return errs
+}
+
 // CoreAccounts converts account config into core.Account values.
 func (c *Config) CoreAccounts() []core.Account {
 	out := make([]core.Account, 0, len(c.Accounts))
@@ -866,17 +1098,31 @@ func (c *Config) CoreRoutes() []core.Route {
 					Tools:           s.Tools,
 					JSONSchema:      s.JSONSchema,
 					Stream:          s.Stream,
+					QuestionTypes:   copyTrimmed(s.QuestionTypes),
+					AllowAlias:      s.AllowAlias,
 				}
 			}
 		}
-		out = append(out, core.Route{
+		cr := core.Route{
 			Name:          r.Name,
 			Models:        append([]string(nil), r.Models...),
-			UpstreamModel: r.UpstreamModel,
+			UpstreamModel: decisionRouteUpstreamModel(r),
 			Interactive:   append([]string(nil), r.Interactive...),
 			Background:    append([]string(nil), bg...),
 			Upstreams:     ups,
-		})
+		}
+		if r.DiscoverModels {
+			cr.DiscoverModels = true
+			cr.DiscoverInterval = DefaultDiscoverInterval
+			if r.DiscoverInterval != nil {
+				cr.DiscoverInterval = r.DiscoverInterval.D()
+			}
+			if len(r.DiscoverMatch) > 0 {
+				cr.DiscoverMatch = append([]string(nil), r.DiscoverMatch...)
+			}
+		}
+		r.Balance.project(&cr)
+		out = append(out, cr)
 	}
 	return out
 }

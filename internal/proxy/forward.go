@@ -27,7 +27,7 @@ const (
 )
 
 // forwardedHeaders are the only client request headers sent upstream.
-var forwardedHeaders = []string{"Content-Type", "Accept", "OpenAI-Beta", "session_id", "conversation_id", "x-request-id"}
+var forwardedHeaders = []string{"Content-Type", "Accept", "OpenAI-Beta", "session_id", "conversation_id", "x-request-id", "X-Codex-Turn-State"}
 
 // hopHeaders are stripped from upstream responses.
 var hopHeaders = []string{
@@ -70,7 +70,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 		}
 	}()
 	for {
-		l, dec := p.deps.Policy.Acquire(req.class, req.candidates, exclude)
+		l, dec, unreachable, retryIn, saturated := p.acquireFor(req, exclude)
 		var lease core.Lease
 		if l != nil {
 			cur = &onceLease{Lease: l}
@@ -85,6 +85,18 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 				relayFailure(w, pending)
 			case lastErr != "":
 				writeError(w, http.StatusBadGateway, "localrouter: "+lastErr, "upstream_error")
+			case len(unreachable) > 0:
+				// Every candidate is held open by the reachability breaker:
+				// a policy denial (no ledger row, no attempt event) answered
+				// as provider-unavailable, never 429.
+				p.log.Info("policy denied", "client", req.client.Name, "class", req.class, "model", req.model,
+					"reason", dec.Reason, "denial", denialBreakerOpen)
+				writeUnreachable(w, unreachable, retryIn)
+			case len(saturated) > 0:
+				// Every candidate at max_inflight (or breaker-open), pooled or not.
+				p.log.Info("policy denied", "client", req.client.Name, "class", req.class, "model", req.model,
+					"reason", dec.Reason, "denial", denialPoolSaturated)
+				writePoolSaturated(w, saturated)
 			default:
 				p.log.Info("policy denied", "client", req.client.Name, "class", req.class, "model", req.model, "reason", dec.Reason)
 				w.Header().Set("Retry-After", denyRetryAfter)
@@ -150,6 +162,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			account:   account.ID,
 			provider:  account.Provider,
 			class:     req.class,
+			pool:      poolPickOf(lease),
 		}
 
 		cred, err := p.deps.Creds.Credential(ctx, acctID)
@@ -225,7 +238,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			}
 			msg := sanitizeErr(err)
 			p.log.Warn("upstream transport error", "account", acctID, "model", req.model, "err", msg)
-			lease.Release(core.Outcome{})
+			lease.Release(core.Outcome{Unreachable: unreachableClass(err)})
 			rec.Error = "upstream transport error: " + msg
 			rec = p.recordBudget(ctx, rec)
 			ev.outcome = outcomeTransportError
@@ -238,6 +251,12 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		status := resp.StatusCode
 
 		scoped, final, idledOut := p.classify(account, status, resp, cancelUp)
+		if isDecisionEndpoint(req.endpoint) && !idledOut && decisionFinal(status) {
+			scoped, final = true, true
+		}
+		if !scoped {
+			markReached(lease)
+		}
 		if idledOut {
 			// The error body stalled: keep what was read, and fail over or
 			// relay it.
@@ -475,6 +494,9 @@ func (p *Proxy) noResponse(w http.ResponseWriter, canFailover bool, msg string) 
 // injection or Codex normalisation can leak between attempts.
 func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cred core.Credential) (*http.Response, error) {
 	u := strings.TrimRight(account.BaseURL, "/") + req.endpoint
+	if req.endpoint == endpointDecisions {
+		u = decisionsURL(account.BaseURL)
+	}
 	// Only an actual override rewrites the body: a resolved model equal to the
 	// client model is semantically the same request, so it is left byte-identical
 	// (the legacy no-rewrite fast path). The rewrite target is the leased
@@ -487,8 +509,9 @@ func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cr
 	if err != nil {
 		return nil, err
 	}
+	var sessionID string // Codex only; see sessionIDFromCacheKey
 	if account.Provider == core.ProviderCodex {
-		body = codexBody(body)
+		body, sessionID = codexBody(body)
 	}
 	up, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
@@ -501,8 +524,16 @@ func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cr
 			up.Header[h] = append([]string(nil), v...)
 		}
 	}
+	if isDecisionEndpoint(req.endpoint) {
+		forwardDecisionHeaders(up.Header, req.header)
+	}
 	if up.Header.Get("Content-Type") == "" {
 		up.Header.Set("Content-Type", "application/json")
+	}
+	// A client-supplied session_id always wins. The key is set directly so it
+	// goes out with the literal lowercase name the Codex backend uses.
+	if sessionID != "" && !hasHeaderFold(req.header, "session_id") {
+		up.Header["session_id"] = []string{sessionID}
 	}
 	for k, v := range cred.Headers {
 		up.Header[k] = append([]string(nil), v...)
@@ -530,11 +561,7 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	}
 
 	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_ = rc.Flush()
-
 	capture := newUsageCapture(resp.Header.Get("Content-Type"))
-	rec.Streamed = capture.sse
 	// markFirstOutput takes TTFT, at most once, as soon as the capture has
 	// seen the first output event — before those bytes reach the client.
 	markFirstOutput := func() {
@@ -546,6 +573,27 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 			rec.TTFTMS, rec.FirstTokenReasoning = &ms, reasoning
 		}
 	}
+
+	// An upstream without a Content-Type (the Codex backend's streams) has its
+	// body sniffed by the capture. The status line waits for that decision so
+	// an event stream is relayed as text/event-stream; the bytes read meanwhile
+	// (bounded by maxSniffBytes plus one chunk, and in time by the idle
+	// timeout) are held and then relayed unchanged. An upstream Content-Type
+	// is never overridden.
+	var held []byte
+	headerSent := false
+	sendHeader := func() {
+		headerSent = true
+		if capture.sse && resp.Header.Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "text/event-stream")
+		}
+		w.WriteHeader(resp.StatusCode)
+		_ = rc.Flush()
+	}
+	if capture.Decided() {
+		sendHeader()
+	}
+
 	buf := make([]byte, streamChunkSize)
 	var (
 		written  int64
@@ -553,6 +601,29 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 		idledOut bool
 		readErr  error
 	)
+	// relay writes b to the client, sending the held status line and bytes
+	// first once the capture has decided (or end decides for it). It reports
+	// false if the client write failed.
+	relay := func(b []byte) bool {
+		if !headerSent {
+			if !capture.Decided() {
+				held = append(held, b...)
+				return true
+			}
+			sendHeader()
+			b, held = append(held, b...), nil
+		}
+		if len(b) == 0 {
+			return true
+		}
+		wn, werr := w.Write(b)
+		written += int64(wn)
+		if werr != nil {
+			return false
+		}
+		_ = rc.Flush()
+		return true
+	}
 	for {
 		if timer != nil {
 			timer.Reset(p.opts.StreamIdleTimeout)
@@ -564,13 +635,19 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 		if n > 0 {
 			_, _ = capture.Write(buf[:n])
 			markFirstOutput()
-			wn, werr := w.Write(buf[:n])
-			written += int64(wn)
-			if werr != nil {
+			if !relay(buf[:n]) {
 				aborted = true
 				break
 			}
-			_ = rc.Flush()
+		}
+		if err != nil && !headerSent {
+			// The body ended (or failed) while still undecided: settle the
+			// mode from what arrived and relay it.
+			capture.settle()
+			if !relay(nil) {
+				aborted = true
+				break
+			}
 		}
 		if err == io.EOF {
 			break
@@ -589,6 +666,9 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	}
 
 	usage, known := capture.Result()
+	// Result settled any undecided sniff, so the mode is final only now: an
+	// untyped (Codex) body may have been identified as SSE during the loop.
+	rec.Streamed = capture.sse
 	// Result flushed any final event not terminated by a blank line; it may
 	// be the first output.
 	markFirstOutput()
@@ -800,6 +880,17 @@ func relayFailure(w http.ResponseWriter, f *failure) {
 	copyHeaders(w.Header(), f.header)
 	w.WriteHeader(f.status)
 	_, _ = w.Write(f.body)
+}
+
+// hasHeaderFold reports whether h has a key equal to name ignoring case,
+// canonical or not.
+func hasHeaderFold(h http.Header, name string) bool {
+	for k := range h {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func copyHeaders(dst, src http.Header) {

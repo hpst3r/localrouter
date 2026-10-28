@@ -32,7 +32,11 @@
 //	                            percentiles; same params and errors as analytics;
 //	                            503 unless Deps.Ledger implements core.PerfLedger
 //	POST /control/v1/admit   -> dry-run admission {class, model} or {class, account}
-//	                            (exactly one of model/account); never creates a lease
+//	                            (exactly one of model/account); never creates a lease.
+//	                            A pooled route (routes[].balance) uses the policy's
+//	                            DryRunBalanced with the X-LocalRouter-Session header.
+//	GET  /control/v1/diagnostics -> readiness, storage, inflight, reload, accounts;
+//	                            a "pools" block only when some route has balance
 //	POST /control/v1/ingest  -> agent push of claude usage records and quota
 //	                            snapshots (core.IngestRequest); always needs a
 //	                            client key with Ingest (401 no/bad key, 403 not

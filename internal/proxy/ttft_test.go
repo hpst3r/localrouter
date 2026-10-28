@@ -32,12 +32,23 @@ type ttftStep struct {
 // the clock after the last step, just before the upstream returns.
 func relayTTFT(t *testing.T, path, contentType string, steps []ttftStep, tail time.Duration) (core.RequestRecord, string) {
 	t.Helper()
+	return relayTTFTAs(t, core.ProviderOpenAICompat, path, contentType, steps, tail)
+}
+
+// relayTTFTAs is relayTTFT from a provider of the given kind; an empty
+// contentType sends the body without one, as the Codex backend does.
+func relayTTFTAs(t *testing.T, provider, path, contentType string, steps []ttftStep, tail time.Duration) (core.RequestRecord, string) {
+	t.Helper()
 	h := newHarness(t)
 	clk := &stepClock{t: testNow}
 	h.clock = clk
 	ack := make(chan struct{})
-	h.upstream("a", core.ProviderOpenAICompat, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", contentType)
+	h.upstream("a", provider, func(w http.ResponseWriter, r *http.Request) {
+		if contentType == "" {
+			noContentType(w)
+		} else {
+			w.Header().Set("Content-Type", contentType)
+		}
 		for _, s := range steps {
 			clk.Add(s.adv)
 			_, _ = io.WriteString(w, s.data)

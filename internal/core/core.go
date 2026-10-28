@@ -176,6 +176,13 @@ type Outcome struct {
 	// evidence). The policy must not put the account into cooldown for it,
 	// so one client cannot lock every other client out of an account.
 	RequestScoped bool
+	// Unreachable is non-empty when the attempt got no upstream response
+	// headers for an account-level reason (DNS, dial, TLS handshake, reset
+	// before headers, response-header timeout); the value is a fixed,
+	// sanitized error class ("dns", "dial", "tls", "reset", "timeout",
+	// "transport"). Empty for client cancellation and pre-send failures. The
+	// reachability breaker (policy.breaker) counts it.
+	Unreachable string
 }
 
 // Input bounds shared by every ledger writer (proxy, ingest, local
@@ -538,6 +545,14 @@ type UpstreamSpec struct {
 	// Stream reports whether the candidate supports streaming. false =
 	// unsupported.
 	Stream bool
+	// QuestionTypes is, on a typed-decision descriptor (Protocols is exactly
+	// ["systemone"] or ["decisions"]), the non-empty subset of {"noul",
+	// "choice", "score"} the candidate answers. nil on every other descriptor.
+	QuestionTypes []string
+	// AllowAlias, on a typed-decision descriptor, accepts a moving model alias
+	// (e.g. "~typesafe/jev-latest") as UpstreamModel. Config requires it on
+	// every candidate of the route when the shared model is an alias.
+	AllowAlias bool
 }
 
 // Route maps a model name to ordered candidate accounts per class, the
@@ -554,6 +569,29 @@ type Route struct {
 	// background, and unknown keys are rejected. A nil/empty map means the
 	// route is unconstrained (legacy permissive behaviour).
 	Upstreams map[string]UpstreamSpec
+	// DiscoverModels opts the route into serving model ids discovered from its
+	// candidates' GET {base_url}/models listings (see docs/SPEC.md, "Model
+	// discovery"). false keeps the static-only legacy behaviour.
+	DiscoverModels bool
+	// DiscoverInterval is the polling interval for this route's candidates;
+	// set (default 5m) only when DiscoverModels is true.
+	DiscoverInterval time.Duration
+	// DiscoverMatch are path.Match globs a discovered id must pass; nil = all.
+	DiscoverMatch []string
+	// BalanceStrategy, when non-empty, turns the route's candidates into a
+	// pool of equal peers (routes[].balance): every candidate is a member and
+	// the policy picks among them by strategy instead of first-admissible.
+	// "" is a legacy ordered route. The only strategy is "least_inflight".
+	BalanceStrategy string
+	// BalanceIdentity is the operator's declaration of the pooled model and
+	// quant (diagnostics only).
+	BalanceIdentity string
+	// BalanceStickyTTL is the session-affinity TTL; 0 disables affinity.
+	BalanceStickyTTL time.Duration
+	// BalanceWeight maps every member to its weight (1-100).
+	BalanceWeight map[string]int
+	// BalanceMaxInflight maps every member to its in-flight cap; 0 = uncapped.
+	BalanceMaxInflight map[string]int
 }
 
 // ClientInflight is one client's concurrency usage. Limit 0 means unlimited.

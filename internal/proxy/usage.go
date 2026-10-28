@@ -141,6 +141,11 @@ func deref(p *int64) int64 {
 type usageCapture struct {
 	sse bool
 
+	// sniffing is set while the mode of a response without a Content-Type is
+	// undecided; pending holds its bytes so far (at most maxSniffBytes).
+	sniffing bool
+	pending  []byte
+
 	// SSE state.
 	line     []byte // partial line carried between writes
 	skipLine bool   // current line exceeded the cap; drop until newline
@@ -277,12 +282,86 @@ func mayEndResponse(event string, data []byte) bool {
 		bytes.Contains(data, []byte("response.failed"))
 }
 
+// maxSniffBytes bounds the bytes buffered while sniffing a response without a
+// Content-Type; a body still undecided past it is treated as JSON.
+const maxSniffBytes = 64 << 10
+
+// sseFieldPrefixes are the line starts that mark an untyped body as SSE.
+var sseFieldPrefixes = [][]byte{[]byte("event:"), []byte("data:"), []byte("id:"), []byte("retry:"), []byte(":")}
+
+// newUsageCapture returns a capture for a response with the given
+// Content-Type: text/event-stream is SSE and any other value is JSON. An
+// empty Content-Type (the Codex backend sends none on its streams) is decided
+// from the body; see sniffSSE.
 func newUsageCapture(contentType string) *usageCapture {
-	return &usageCapture{sse: strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "text/event-stream")}
+	ct := strings.ToLower(strings.TrimSpace(contentType))
+	return &usageCapture{sse: strings.HasPrefix(ct, "text/event-stream"), sniffing: ct == ""}
+}
+
+// utf8BOM is the byte order mark the SSE spec allows before a stream.
+var utf8BOM = []byte("\xEF\xBB\xBF")
+
+// sniffSSE decides the mode of an untyped body from its first non-whitespace
+// bytes after any leading UTF-8 BOM: an SSE field or comment start means SSE,
+// anything else (including "{") JSON. decided is false while b could still
+// become either.
+func sniffSSE(b []byte) (sse, decided bool) {
+	if len(b) < len(utf8BOM) && bytes.HasPrefix(utf8BOM, b) {
+		return false, false
+	}
+	rest := bytes.TrimLeft(bytes.TrimPrefix(b, utf8BOM), " \t\r\n")
+	if len(rest) == 0 {
+		return false, false
+	}
+	if rest[0] == '{' {
+		return false, true
+	}
+	partial := false
+	for _, pre := range sseFieldPrefixes {
+		if bytes.HasPrefix(rest, pre) {
+			return true, true
+		}
+		if len(rest) < len(pre) && bytes.HasPrefix(pre, rest) {
+			partial = true
+		}
+	}
+	return false, !partial
+}
+
+// decide ends sniffing in the given mode and replays the buffered bytes, less
+// a leading BOM when SSE (the relayed bytes are not affected).
+func (c *usageCapture) decide(sse bool) {
+	c.sniffing, c.sse = false, sse
+	pending := c.pending
+	c.pending = nil
+	if sse {
+		pending = bytes.TrimPrefix(pending, utf8BOM)
+	}
+	_, _ = c.Write(pending)
+}
+
+// Decided reports whether the body's mode (SSE or JSON) is known. It is false
+// only while an untyped body is still being sniffed.
+func (c *usageCapture) Decided() bool { return !c.sniffing }
+
+// settle ends any undecided sniff at end of body, as JSON unless the bytes
+// already identify SSE. It is idempotent.
+func (c *usageCapture) settle() {
+	if c.sniffing {
+		sse, _ := sniffSSE(c.pending)
+		c.decide(sse)
+	}
 }
 
 // Write feeds response bytes. It never fails.
 func (c *usageCapture) Write(p []byte) (int, error) {
+	if c.sniffing {
+		c.pending = append(c.pending, p...)
+		if sse, ok := sniffSSE(c.pending); ok || len(c.pending) > maxSniffBytes {
+			c.decide(sse)
+		}
+		return len(p), nil
+	}
 	if !c.sse {
 		if !c.jsonOver {
 			if c.body.Len()+len(p) > maxJSONBytes {
@@ -436,6 +515,7 @@ func (c *usageCapture) flush() {
 // event; for JSON bodies it is the top-level usage object. Usage says nothing
 // about whether the stream finished; see Completed.
 func (c *usageCapture) Result() (core.Usage, bool) {
+	c.settle()
 	if c.sse {
 		c.flush()
 		if c.bad {
@@ -483,8 +563,13 @@ func (c *usageCapture) FirstOutput() (seen bool, reasoning bool) {
 // response object for Responses (which never sends [DONE]). A chat chunk with
 // finish_reason is not a terminal, and neither protocol accepts the other's.
 // endpoint is the upstream path, "/chat/completions" or "/responses"; a
-// stream on any other endpoint is never complete.
+// stream on any other endpoint is never complete. A decision endpoint
+// ("/systemone", "/decisions") has no stream terminal: it is complete exactly
+// when the answer is a non-stream (JSON) body, with or without a Content-Type.
 func (c *usageCapture) Completed(endpoint string) bool {
+	if isDecisionEndpoint(endpoint) {
+		return !c.sse
+	}
 	if !c.sse {
 		return true
 	}

@@ -1,0 +1,373 @@
+[
+ {
+  "model": "gpt-5.6-sol",
+  "class": "interactive",
+  "endpoint": "/v1/responses",
+  "status": 200,
+  "route": "gpt",
+  "candidates": [
+   [
+    "codex-primary",
+    "codex-secondary"
+   ]
+  ],
+  "account": "codex-primary",
+  "forwarded": "gpt-5.6-sol"
+ },
+ {
+  "model": "gpt-5.6-sol",
+  "class": "interactive",
+  "endpoint": "/v1/chat/completions",
+  "status": 400,
+  "err_type": "invalid_request_error"
+ },
+ {
+  "model": "gpt-5.6-sol",
+  "class": "background",
+  "endpoint": "/v1/responses",
+  "status": 200,
+  "route": "gpt",
+  "candidates": [
+   [
+    "codex-secondary",
+    "codex-primary"
+   ]
+  ],
+  "account": "codex-secondary",
+  "forwarded": "gpt-5.6-sol"
+ },
+ {
+  "model": "gpt-5.6-sol",
+  "class": "background",
+  "endpoint": "/v1/chat/completions",
+  "status": 400,
+  "err_type": "invalid_request_error"
+ },
+ {
+  "model": "gpt-5.6-luna",
+  "class": "interactive",
+  "endpoint": "/v1/responses",
+  "status": 200,
+  "route": "gpt",
+  "candidates": [
+   [
+    "codex-primary",
+    "codex-secondary"
+   ]
+  ],
+  "account": "codex-primary",
+  "forwarded": "gpt-5.6-luna"
+ },
+ {
+  "model": "gpt-5.6-luna",
+  "class": "interactive",
+  "endpoint": "/v1/chat/completions",
+  "status": 400,
+  "err_type": "invalid_request_error"
+ },
+ {
+  "model": "gpt-5.6-luna",
+  "class": "background",
+  "endpoint": "/v1/responses",
+  "status": 200,
+  "route": "gpt",
+  "candidates": [
+   [
+    "codex-secondary",
+    "codex-primary"
+   ]
+  ],
+  "account": "codex-secondary",
+  "forwarded": "gpt-5.6-luna"
+ },
+ {
+  "model": "gpt-5.6-luna",
+  "class": "background",
+  "endpoint": "/v1/chat/completions",
+  "status": 400,
+  "err_type": "invalid_request_error"
+ },
+ {
+  "model": "deepseek-v4.1-flash",
+  "class": "interactive",
+  "endpoint": "/v1/responses",
+  "status": 200,
+  "route": "ollama",
+  "candidates": [
+   [
+    "ollama-cloud"
+   ]
+  ],
+  "account": "ollama-cloud",
+  "forwarded": "deepseek-v4.1-flash"
+ },
+ {
+  "model": "deepseek-v4.1-flash",
+  "class": "interactive",
+  "endpoint": "/v1/chat/completions",
+  "status": 200,
+  "route": "ollama",
+  "candidates": [
+   [
+    "ollama-cloud"
+   ]
+  ],
+  "account": "ollama-cloud",
+  "forwarded": "deepseek-v4.1-flash"
+ },
+ {
+  "model": "deepseek-v4.1-flash",
+  "class": "background",
+  "endpoint": "/v1/responses",
+  "status": 200,
+  "route": "ollama",
+  "candidates": [
+   [
+    "ollama-cloud"
+   ]
+  ],
+  "account": "ollama-cloud",
+  "forwarded": "deepseek-v4.1-flash"
+ },
+ {
+  "model": "deepseek-v4.1-flash",
+  "class": "background",
+  "endpoint": "/v1/chat/completions",
+  "status": 200,
+  "route": "ollama",
+  "candidates": [
+   [
+    "ollama-cloud"
+   ]
+  ],
+  "account": "ollama-cloud",
+  "forwarded": "deepseek-v4.1-flash"
+ },
+ {
+  "model": "kimi-k3",
+  "class": "interactive",
+  "endpoint": "/v1/responses",
+  "status": 200,
+  "route": "ollama",
+  "candidates": [
+   [
+    "ollama-cloud"
+   ]
+  ],
+  "account": "ollama-cloud",
+  "forwarded": "kimi-k3"
+ },
+ {
+  "model": "kimi-k3",
+  "class": "interactive",
+  "endpoint": "/v1/chat/completions",
+  "status": 200,
+  "route": "ollama",
+  "candidates": [
+   [
+    "ollama-cloud"
+   ]
+  ],
+  "account": "ollama-cloud",
+  "forwarded": "kimi-k3"
+ },
+ {
+  "model": "kimi-k3",
+  "class": "background",
+  "endpoint": "/v1/responses",
+  "status": 200,
+  "route": "ollama",
+  "candidates": [
+   [
+    "ollama-cloud"
+   ]
+  ],
+  "account": "ollama-cloud",
+  "forwarded": "kimi-k3"
+ },
+ {
+  "model": "kimi-k3",
+  "class": "background",
+  "endpoint": "/v1/chat/completions",
+  "status": 200,
+  "route": "ollama",
+  "candidates": [
+   [
+    "ollama-cloud"
+   ]
+  ],
+  "account": "ollama-cloud",
+  "forwarded": "kimi-k3"
+ },
+ {
+  "model": "alias-model",
+  "class": "interactive",
+  "endpoint": "/v1/responses",
+  "status": 200,
+  "route": "alias",
+  "candidates": [
+   [
+    "compat-a",
+    "ollama-cloud"
+   ]
+  ],
+  "account": "compat-a",
+  "forwarded": "backend-alias"
+ },
+ {
+  "model": "alias-model",
+  "class": "interactive",
+  "endpoint": "/v1/chat/completions",
+  "status": 200,
+  "route": "alias",
+  "candidates": [
+   [
+    "compat-a",
+    "ollama-cloud"
+   ]
+  ],
+  "account": "compat-a",
+  "forwarded": "backend-alias"
+ },
+ {
+  "model": "alias-model",
+  "class": "background",
+  "endpoint": "/v1/responses",
+  "status": 200,
+  "route": "alias",
+  "candidates": [
+   [
+    "compat-a"
+   ]
+  ],
+  "account": "compat-a",
+  "forwarded": "backend-alias"
+ },
+ {
+  "model": "alias-model",
+  "class": "background",
+  "endpoint": "/v1/chat/completions",
+  "status": 200,
+  "route": "alias",
+  "candidates": [
+   [
+    "compat-a"
+   ]
+  ],
+  "account": "compat-a",
+  "forwarded": "backend-alias"
+ },
+ {
+  "model": "cap-model",
+  "class": "interactive",
+  "endpoint": "/v1/responses",
+  "status": 200,
+  "route": "cap",
+  "candidates": [
+   [
+    "compat-a",
+    "compat-b"
+   ]
+  ],
+  "account": "compat-a",
+  "forwarded": "cap-a"
+ },
+ {
+  "model": "cap-model",
+  "class": "interactive",
+  "endpoint": "/v1/chat/completions",
+  "status": 200,
+  "route": "cap",
+  "candidates": [
+   [
+    "compat-b"
+   ]
+  ],
+  "account": "compat-b",
+  "forwarded": "cap-model"
+ },
+ {
+  "model": "cap-model",
+  "class": "background",
+  "endpoint": "/v1/responses",
+  "status": 200,
+  "route": "cap",
+  "candidates": [
+   [
+    "compat-b"
+   ]
+  ],
+  "account": "compat-b",
+  "forwarded": "cap-model"
+ },
+ {
+  "model": "cap-model",
+  "class": "background",
+  "endpoint": "/v1/chat/completions",
+  "status": 200,
+  "route": "cap",
+  "candidates": [
+   [
+    "compat-b"
+   ]
+  ],
+  "account": "compat-b",
+  "forwarded": "cap-model"
+ },
+ {
+  "model": "unknown-model",
+  "class": "interactive",
+  "endpoint": "/v1/responses",
+  "status": 404,
+  "err_type": "model_not_found"
+ },
+ {
+  "model": "unknown-model",
+  "class": "interactive",
+  "endpoint": "/v1/chat/completions",
+  "status": 404,
+  "err_type": "model_not_found"
+ },
+ {
+  "model": "unknown-model",
+  "class": "background",
+  "endpoint": "/v1/responses",
+  "status": 404,
+  "err_type": "model_not_found"
+ },
+ {
+  "model": "unknown-model",
+  "class": "background",
+  "endpoint": "/v1/chat/completions",
+  "status": 404,
+  "err_type": "model_not_found"
+ },
+ {
+  "model": "unsloth/qwen3",
+  "class": "interactive",
+  "endpoint": "/v1/responses",
+  "status": 404,
+  "err_type": "model_not_found"
+ },
+ {
+  "model": "unsloth/qwen3",
+  "class": "interactive",
+  "endpoint": "/v1/chat/completions",
+  "status": 404,
+  "err_type": "model_not_found"
+ },
+ {
+  "model": "unsloth/qwen3",
+  "class": "background",
+  "endpoint": "/v1/responses",
+  "status": 404,
+  "err_type": "model_not_found"
+ },
+ {
+  "model": "unsloth/qwen3",
+  "class": "background",
+  "endpoint": "/v1/chat/completions",
+  "status": 404,
+  "err_type": "model_not_found"
+ }
+]
