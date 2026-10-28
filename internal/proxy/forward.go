@@ -70,7 +70,7 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 		}
 	}()
 	for {
-		l, dec := p.deps.Policy.Acquire(req.class, req.candidates, exclude)
+		l, dec, unreachable, retryIn := p.acquire(req.class, req.candidates, exclude)
 		var lease core.Lease
 		if l != nil {
 			cur = &onceLease{Lease: l}
@@ -85,6 +85,13 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, req *request) {
 				relayFailure(w, pending)
 			case lastErr != "":
 				writeError(w, http.StatusBadGateway, "localrouter: "+lastErr, "upstream_error")
+			case len(unreachable) > 0:
+				// Every candidate is held open by the reachability breaker:
+				// a policy denial (no ledger row, no attempt event) answered
+				// as provider-unavailable, never 429.
+				p.log.Info("policy denied", "client", req.client.Name, "class", req.class, "model", req.model,
+					"reason", dec.Reason, "denial", denialBreakerOpen)
+				writeUnreachable(w, unreachable, retryIn)
 			default:
 				p.log.Info("policy denied", "client", req.client.Name, "class", req.class, "model", req.model, "reason", dec.Reason)
 				w.Header().Set("Retry-After", denyRetryAfter)
@@ -225,7 +232,7 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 			}
 			msg := sanitizeErr(err)
 			p.log.Warn("upstream transport error", "account", acctID, "model", req.model, "err", msg)
-			lease.Release(core.Outcome{})
+			lease.Release(core.Outcome{Unreachable: unreachableClass(err)})
 			rec.Error = "upstream transport error: " + msg
 			rec = p.recordBudget(ctx, rec)
 			ev.outcome = outcomeTransportError
@@ -238,6 +245,9 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		status := resp.StatusCode
 
 		scoped, final, idledOut := p.classify(account, status, resp, cancelUp)
+		if !scoped {
+			markReached(lease)
+		}
 		if idledOut {
 			// The error body stalled: keep what was read, and fail over or
 			// relay it.

@@ -12,6 +12,15 @@ policy:
   safety_margin: 0.02     # extra headroom background must leave above the reserve
   inflight_estimate: 0.01 # assumed fraction consumed per in-flight request
   max_failovers: 2
+  # Optional reachability breaker (off unless threshold > 0): after `threshold`
+  # consecutive attempts that got no upstream response (DNS, connect, TLS,
+  # reset, header timeout) an account is skipped for `base`, then one probe is
+  # let through; each failed probe doubles the wait up to `max`. Requests
+  # whose only candidates are skipped get 503 upstream_unavailable.
+  # breaker:
+  #   threshold: 3
+  #   base: 5s
+  #   max: 60s
 
 # Concurrency limits and inbound timeouts are optional; the values below are
 # the defaults. Both reject negative values at load; 0 means unlimited / use
