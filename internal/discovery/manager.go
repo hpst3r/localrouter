@@ -156,7 +156,8 @@ func New(creds core.CredentialSource, opts Options) *Manager {
 // as a candidate, at the smallest DiscoverInterval among those routes.
 // Listings of accounts still referenced are kept; an account no longer
 // referenced stops being polled and its listing is dropped. Newly referenced
-// accounts are polled on the next loop pass. After Start, the background loop
+// accounts, and accounts whose provider or base_url changed (which start over
+// as new), are polled on the next loop pass. After Start, the background loop
 // exists only while there is a target: the first target starts it and an
 // empty target set ends it.
 func (m *Manager) SetTargets(accounts map[string]core.Account, routes []core.Route) {
@@ -185,7 +186,9 @@ func (m *Manager) SetTargets(accounts map[string]core.Account, routes []core.Rou
 			iv = 5 * time.Minute
 		}
 		e, ok := m.targets[id]
-		if !ok {
+		if !ok || !sameSource(e.account, accounts[id]) {
+			// A fresh entry drops the old listing and schedule and is due at
+			// once; a poll still in flight on the old entry discards its result.
 			m.targets[id] = &entry{account: accounts[id], interval: iv}
 			continue
 		}
@@ -203,6 +206,13 @@ func (m *Manager) SetTargets(accounts map[string]core.Account, routes []core.Rou
 	case m.wake <- struct{}{}:
 	default:
 	}
+}
+
+// sameSource reports whether two values of one account fetch the same listing:
+// the fields fetch and the credential lookup use. Other fields (reserve, cost
+// basis, quota source) do not affect the listing.
+func sameSource(a, b core.Account) bool {
+	return a.ID == b.ID && a.Provider == b.Provider && a.BaseURL == b.BaseURL
 }
 
 // Start enables background polling until ctx is cancelled or Close is called.
@@ -350,8 +360,9 @@ func (m *Manager) poll(ctx context.Context, id string) {
 	e.inflight = nil
 	close(m.polled)
 	m.polled = make(chan struct{})
-	// Discard the result if the account was dropped (or re-added as a new
-	// entry) by a reload meanwhile, or the manager is closing.
+	// Discard the result if the account was dropped, or replaced by a new
+	// entry (re-added, or provider/base_url changed), by a reload meanwhile:
+	// the entry pointer is the poll's epoch. Also discard when closing.
 	if m.targets[id] != e || m.closed || ctx.Err() != nil && class != "" {
 		m.mu.Unlock()
 		return

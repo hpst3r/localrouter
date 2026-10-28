@@ -447,6 +447,26 @@ These supersede the sections above where they differ. Acceptance tests D13-D20 a
     example has a test that `unsloth/*` matches `unsloth/Qwen3.5-9B-GGUF:Q4_K_M` and `*` does
     not.)
 
+### Amendment R2 (final-review decisions)
+
+These supersede the sections above where they differ.
+
+1. **A re-pointed account starts over.** When `SetTargets` receives an already-polled account whose
+   `provider` or `base_url` differs (the fields that decide which listing a poll fetches; the
+   credential is looked up by account id), the account is treated exactly as a newly referenced
+   one: its listing, ids, `last_success_at`, `last_attempt_at`, error class and backoff are
+   dropped, and it is polled on the next loop pass. A poll of the old value still in flight is
+   tagged with the entry it started on and its result is discarded. A change to any other field
+   (for example `reserve`) keeps the listing and schedule. Today every account field except
+   `reserve` is restart-only, so this guards the manager contract rather than a live reload
+   path. (FMC-1; `TestFMC1BaseURLChangeDropsStaleListing`,
+   `TestFMC1InFlightPollAcrossBaseURLChangeDiscarded`)
+2. **Publication order on reload.** A reload publishes the new generation before it calls
+   `Discovery.SetTargets`. For that moment the new generation's resolver reads the previous
+   target set: an account added by the reload misses until the retarget (and may spend one
+   on-demand refresh on the old targets). This is accepted: resolution only narrows a route's own
+   candidate lists, so no traffic is sent outside the route's configured accounts. No code change.
+
 ## Workload classes
 
 `interactive` and `background`. Each client key maps to one class.
