@@ -81,6 +81,9 @@ func validateBalance(r RouteConfig, accounts []AccountConfig) []error {
 	case !printable(id):
 		add("identity must be printable UTF-8")
 	}
+	if r.DiscoverModels {
+		add("cannot be combined with discover_models: a pool declares one model and quant (identity), while a discovering route serves whatever its members list")
+	}
 	if b.Verify != nil {
 		add("verify is not supported yet (identity verification is a later slice); remove the key")
 	}

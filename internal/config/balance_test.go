@@ -134,6 +134,7 @@ func TestP2BalanceValidation(t *testing.T) {
 		{"empty identity", route("[g1]", `{strategy: least_inflight, identity: "   ", members: {g1: {}}}`), "identity is required"},
 		{"long identity", route("[g1]", `{strategy: least_inflight, identity: "`+strings.Repeat("x", 129)+`", members: {g1: {}}}`), "identity must be at most 128 bytes"},
 		{"unprintable identity", route("[g1]", `{strategy: least_inflight, identity: "a\tb", members: {g1: {}}}`), "identity must be printable"},
+		{"R2 discover_models with balance", "\nroutes:\n  - name: pool\n    discover_models: true\n    interactive: [g1, g2]\n    balance: {strategy: least_inflight, identity: x, members: {g1: {}, g2: {}}}\n", "cannot be combined with discover_models"},
 		{"verify not supported", route("[g1]", `{strategy: least_inflight, identity: x, verify: warn, members: {g1: {}}}`), "verify is not supported yet"},
 		{"sticky_ttl 10s", route("[g1]", `{strategy: least_inflight, identity: x, sticky_ttl: 10s, members: {g1: {}}}`), "sticky_ttl 10s must be 0 or in [30s, 24h]"},
 		{"sticky_ttl 25h", route("[g1]", `{strategy: least_inflight, identity: x, sticky_ttl: 25h, members: {g1: {}}}`), "sticky_ttl 25h0m0s must be 0 or in [30s, 24h]"},

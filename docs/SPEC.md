@@ -1200,6 +1200,25 @@ text above where they differ):
   (`TestR1CheckPoolInfo`); pooled event contract
   (`TestRoutingObservabilityPooledEventContract`).
 
+Amendment R2 (final-review findings FPL-1..FPL-3, FIN-L2; supersedes the text
+above where they differ):
+
+- R2.1 (FIN-L2) `balance` cannot be combined with `discover_models` on the same
+  route (config error): a pool declares one model and quant (`identity`), while
+  a discovering route serves whatever ids its members list
+  (`TestP2BalanceValidation/R2_discover_models_with_balance`).
+- R2.2 (FPL-1) A reload that changes a `max_inflight` applies to requests that
+  start after it. A request already in flight keeps its generation's cap for
+  its own failover attempts, so the overshoot is bounded by the old cap and
+  lasts one request lifetime.
+- R2.3 (FPL-2) On an unpooled ordered route, a candidate at its cap is skipped
+  like any inadmissible candidate, so the request can go to a LATER candidate
+  of that route, including a paid cloud account listed after a capped local
+  one. List only local accounts on a route that must stay local.
+- R2.4 (FPL-3) A half-open account whose cap is still filled by leases admitted
+  before the breaker opened cannot be probed until they drain; until then it
+  is refused as saturated (429 `pool_saturated`, `Retry-After: 1`), not 503.
+
 ## Concurrency limits and inbound timeouts
 
 `limits.max_concurrent` (global) and `limits.max_concurrent_per_client`
