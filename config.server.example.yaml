@@ -24,6 +24,15 @@ policy:
   safety_margin: 0.02
   inflight_estimate: 0.01
   max_failovers: 2
+  # Optional reachability breaker (off unless threshold > 0): after `threshold`
+  # consecutive attempts that got no upstream response (DNS, connect, TLS,
+  # reset, header timeout) an account is skipped for `base`, then one probe is
+  # let through; each failed probe doubles the wait up to `max`. Requests
+  # whose only candidates are skipped get 503 upstream_unavailable.
+  # breaker:
+  #   threshold: 3
+  #   base: 5s
+  #   max: 60s
 
 limits:                             # optional; 0 = unlimited, negatives rejected
   max_concurrent: 64                # global cap on active inference requests

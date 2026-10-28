@@ -236,6 +236,43 @@ type accountStatus struct {
 	// freshness. Provider figures, independent of ledger cost estimates.
 	Credits *creditsStatus `json:"credits,omitempty"`
 	Key     *keyStatus     `json:"key,omitempty"`
+	// Breaker is the account's reachability breaker; present only when
+	// policy.breaker is enabled.
+	Breaker *breakerStatus `json:"breaker,omitempty"`
+}
+
+// breakerStatus is one account's reachability breaker. State is "closed",
+// "open" or "half_open"; OpenUntil (the end of the open period, after which
+// one probe may be admitted) is omitted when closed.
+type breakerStatus struct {
+	State               string     `json:"state"`
+	ConsecutiveFailures int        `json:"consecutive_failures"`
+	OpenUntil           *time.Time `json:"open_until,omitempty"`
+}
+
+// breakerSource is implemented by policies with a reachability breaker
+// (internal/policy.Policy); enabled is false when the breaker is disabled.
+type breakerSource interface {
+	Breaker(accountID string) (state string, consecutiveFailures int, openUntil time.Time, enabled bool)
+}
+
+// breakerView reports the account's breaker, or nil when the policy has no
+// enabled breaker.
+func (s *Server) breakerView(id string) *breakerStatus {
+	bs, ok := s.deps.Policy.(breakerSource)
+	if !ok {
+		return nil
+	}
+	state, fails, until, enabled := bs.Breaker(id)
+	if !enabled {
+		return nil
+	}
+	out := &breakerStatus{State: state, ConsecutiveFailures: fails}
+	if !until.IsZero() {
+		t := until.UTC()
+		out.OpenUntil = &t
+	}
+	return out
 }
 
 // creditsStatus is the account-level prepaid balance. Amounts are null while
@@ -353,7 +390,8 @@ func (s *Server) accountStatus(a core.Account, now time.Time) accountStatus {
 	if a.Provider == core.ProviderOpenRouter {
 		st.Credits, st.Key = s.creditsView(snap.Credits, now), s.keyView(snap.Key, now)
 	}
-	st.Healthy = !coolingDown && st.Error == nil
+	st.Breaker = s.breakerView(a.ID)
+	st.Healthy = !coolingDown && st.Error == nil && (st.Breaker == nil || st.Breaker.State == "closed")
 	return st
 }
 

@@ -176,6 +176,13 @@ type Outcome struct {
 	// evidence). The policy must not put the account into cooldown for it,
 	// so one client cannot lock every other client out of an account.
 	RequestScoped bool
+	// Unreachable is non-empty when the attempt got no upstream response
+	// headers for an account-level reason (DNS, dial, TLS handshake, reset
+	// before headers, response-header timeout); the value is a fixed,
+	// sanitized error class ("dns", "dial", "tls", "reset", "timeout",
+	// "transport"). Empty for client cancellation and pre-send failures. The
+	// reachability breaker (policy.breaker) counts it.
+	Unreachable string
 }
 
 // Input bounds shared by every ledger writer (proxy, ingest, local
