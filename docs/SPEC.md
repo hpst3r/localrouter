@@ -461,6 +461,32 @@ they differ):
     when closed, is ignored for a pre-open lease, and is a no-op after
     Release (`TestBRFixBR2ReachedRules`).
 
+Amendment R2 (final-review findings FBR-1..FBR-4; supersedes the text above
+where they differ):
+
+- R2.1 `Acquire`, `AcquireWithBreaker`, `DryRun` and `Status` load the
+  current breaker knobs once per call, under the policy lock, and use that
+  one snapshot for both selection and lease creation. A reload activated
+  between the two cannot make a lease admitted under disabled knobs the
+  probe of an account that is still open
+  (`TestFBR1AcquireUsesOneKnobSnapshot`).
+- R2.2 When the current knobs disable the breaker and the lazy clear finds a
+  tripped (`open`/`half_open`) account, the Info `upstream breaker closed`
+  line is logged with `reason=disabled`, so every open line has a matching
+  close. Clearing a `closed` account logs nothing; the probe close line is
+  unchanged (`TestFBR2DisabledClearLogsClose`).
+- R2.3 A send error that never reached the network is not counted: a
+  `*url.Error` from URL parsing (malformed `base_url`), for a URL net/http
+  will not send (scheme other than `http`/`https`, no host), or for a
+  request it refuses to build (invalid method or header) classifies as ""
+  (`TestFBR3PreTransportURLErrorsDoNotCount`).
+- R2.4 Operator note: exactly one probe is in flight per account, and a
+  probe resolves only when response headers arrive or the attempt fails. A
+  half-open probe to an upstream that accepts TCP but never answers
+  therefore keeps the account blocked (`503`, "probe in flight") until the
+  upstream response-header timeout (default 180 s; indefinitely if it is
+  disabled) fires, which can exceed `max`. The timeout then counts as `timeout` and re-opens the breaker.
+
 ## Concurrency limits and inbound timeouts
 
 `limits.max_concurrent` (global) and `limits.max_concurrent_per_client`

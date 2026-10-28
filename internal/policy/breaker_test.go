@@ -471,3 +471,69 @@ func TestBRFixBR2ReachedRules(t *testing.T) {
 		t.Fatalf("state=%s after Reached on a released probe, want half_open", state)
 	}
 }
+
+// FBR-1 (R2.1): one Acquire uses one snapshot of the breaker knobs for both
+// selection and lease creation. A reload that enables the breaker between the
+// two (Activate does not take p.mu) must not make a lease admitted under the
+// disabled knobs the probe of an account that is still open.
+func TestFBR1AcquireUsesOneKnobSnapshot(t *testing.T) {
+	accts := []core.Account{acct("a", 0)}
+	h := breakerHarness(1, 5*time.Second, time.Minute)
+	h.attempt(t, "a", dead) // open; epoch 1
+	off := mustView(t, h.p, accts, Options{Clock: h.clock})
+	on := mustView(t, h.p, accts, Options{Clock: h.clock, Breaker: BreakerOptions{Threshold: 1, Base: 5 * time.Second, Max: time.Minute}})
+	off.Activate()
+	// Acquire through the disabled view, with the enabling reload landing
+	// between selection and lease creation.
+	off.mu.Lock()
+	sel := off.selectLocked(off.cur.Load(), core.ClassInteractive, []string{"a"}, nil)
+	if !sel.dec.Allow {
+		off.mu.Unlock()
+		t.Fatalf("disabled breaker refused: %s", sel.dec.Reason)
+	}
+	on.Activate()
+	l := off.leaseLocked(sel.id, sel.br)
+	probe := h.p.state["a"].br.probe
+	off.mu.Unlock()
+	if l.probe || probe {
+		t.Fatalf("lease admitted under disabled knobs became the probe (lease %v, state %v)", l.probe, probe)
+	}
+	if state, _, _, _ := on.Breaker("a"); state != BreakerOpen {
+		t.Fatalf("state %q, want open", state)
+	}
+	l.Release(answered) // stale lease: ignored while open
+	h.clock.Advance(5 * time.Second)
+	p, d := on.Acquire(core.ClassInteractive, []string{"a"}, nil)
+	if !d.Allow || !p.(*lease).probe {
+		t.Fatalf("half-open account did not admit its probe: %s", d.Reason)
+	}
+	p.Release(answered)
+	if state, _, _, _ := on.Breaker("a"); state != BreakerClosed {
+		t.Fatalf("state %q after a successful probe, want closed", state)
+	}
+}
+
+// FBR-2 (R2.2): a disabled breaker that clears a tripped account logs the
+// close, so every open line has a matching close.
+func TestFBR2DisabledClearLogsClose(t *testing.T) {
+	var buf bytes.Buffer
+	lg := slog.New(slog.NewTextHandler(&buf, nil))
+	clock := &fakeClock{now: t0}
+	accts := []core.Account{acct("a", 0)}
+	p := New(accts, newFakeQuota(), Options{Clock: clock, Logger: lg, Breaker: BreakerOptions{Threshold: 1}})
+	l, _ := p.Acquire(core.ClassInteractive, []string{"a"}, nil)
+	l.Release(dead)
+	off := mustView(t, p, accts, Options{Clock: clock, Logger: lg})
+	for range 2 { // only the clear of a tripped account logs
+		l, d := off.Acquire(core.ClassInteractive, []string{"a"}, nil)
+		if !d.Allow {
+			t.Fatalf("disabled breaker refused: %s", d.Reason)
+		}
+		l.Release(answered)
+	}
+	logs := buf.String()
+	if n := strings.Count(logs, "upstream breaker closed"); n != 1 ||
+		!strings.Contains(logs, `level=INFO msg="upstream breaker closed" account=a error_class=dns reason=disabled`) {
+		t.Fatalf("want one disabled close line, got %d:\n%s", n, logs)
+	}
+}

@@ -86,12 +86,13 @@ func breakerBlocks(br BreakerOptions, b *breakerState, now time.Time) (bool, str
 // arrived and the answer is not request-scoped); neither is a neutral end.
 // Only the current epoch's probe lease resolves a tripped breaker; any other
 // lease changes b only while it is closed. A disabled breaker clears b,
-// keeping the epoch. It reports whether the breaker opened (or re-opened) or
-// closed. p.mu must be held.
+// keeping the epoch (closing it if it was tripped). It reports whether the
+// breaker opened (or re-opened) or closed. p.mu must be held.
 func breakerObserve(br BreakerOptions, b *breakerState, l *lease, unreachable string, reached bool, now time.Time) (opened, closed bool) {
 	if !br.enabled() {
+		closed = b.tripped
 		*b = breakerState{epoch: b.epoch}
-		return false, false
+		return false, closed
 	}
 	switch {
 	case l.probe && b.tripped && b.probe && l.epoch == b.epoch:
@@ -138,6 +139,7 @@ type breakerEvent struct {
 	class          string // error class: of this failure, or the last one on close
 	fails          int
 	until          time.Time
+	reason         string // why it closed, when not a probe ("disabled")
 }
 
 // observeLocked applies lease l's observation (see breakerObserve) to its
@@ -151,7 +153,11 @@ func (p *Policy) observeLocked(l *lease, unreachable string, reached bool, now t
 	l.reached = reached
 	b := &p.state[l.id].br
 	ev := breakerEvent{class: b.class}
-	ev.opened, ev.closed = breakerObserve(p.breakerOpts(), b, l, unreachable, reached, now)
+	br := p.breakerOpts()
+	ev.opened, ev.closed = breakerObserve(br, b, l, unreachable, reached, now)
+	if ev.closed && !br.enabled() {
+		ev.reason = "disabled"
+	}
 	if ev.opened {
 		ev.class, ev.fails, ev.until = b.class, b.fails, b.until
 	}
@@ -164,6 +170,8 @@ func (e breakerEvent) log(lg *slog.Logger, id string) {
 	case e.opened:
 		lg.Warn("upstream breaker open", "account", id, "error_class", e.class,
 			"consecutive_failures", e.fails, "until", e.until)
+	case e.closed && e.reason != "":
+		lg.Info("upstream breaker closed", "account", id, "error_class", e.class, "reason", e.reason)
 	case e.closed:
 		lg.Info("upstream breaker closed", "account", id, "error_class", e.class)
 	}
@@ -236,7 +244,7 @@ func (p *Policy) AcquireWithBreaker(class core.Class, candidates []string, exclu
 		}
 		return nil, sel.dec, nil, 0
 	}
-	return p.leaseLocked(sel.id), sel.dec, nil, 0
+	return p.leaseLocked(sel.id, sel.br), sel.dec, nil, 0
 }
 
 // validateBreaker rejects negative breaker knobs and a cap below the base.
