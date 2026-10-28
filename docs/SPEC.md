@@ -384,6 +384,42 @@ responses stay JSON-encodable.
   buffer the entire stream (scan incrementally; keep ≤ 4 MiB per event).
   Non-stream JSON capture is bounded to 16 MiB; oversized bodies are still
   relayed, but their usage and cost are left unknown.
+- Mode: an upstream `Content-Type` starting with `text/event-stream` is SSE and
+  any other non-empty value is JSON; the body never overrides it. A response
+  with NO `Content-Type` (absent, or present but empty; the Codex backend
+  sends none on its streams) is sniffed: after an optional leading UTF-8 BOM
+  and leading whitespace, `{` means JSON and an SSE field or comment start
+  (`event:`, `data:`, `id:`, `retry:`, `:`) means SSE. The sniff buffers up
+  to 64 KiB plus at most one read chunk; a body still undecided past that, or
+  at end of body, is JSON (unless its bytes already identify SSE).
+- Relay header rule: when the upstream sent no `Content-Type` (absent or
+  empty) and the sniff decided SSE, the client response carries
+  `Content-Type: text/event-stream`. The status line is held until the sniff
+  decides (bounded by the sniff cap above and by the stream idle timeout; end
+  of body or a read error also decides), and the bytes read meanwhile are
+  then relayed unchanged. A sniffed JSON body is relayed byte-for-byte with no
+  `Content-Type` added. A non-empty upstream `Content-Type` is never
+  overridden.
+- Amendment R2 (final-review findings FCX-1..FCX-4):
+  - R2.1 A leading UTF-8 BOM (`EF BB BF`, allowed by the SSE spec) is skipped
+    by the sniff and by the SSE usage parser; the relayed bytes keep it.
+  - R2.2 An empty `Content-Type` header is treated exactly like an absent one
+    (sniffed, and relayed as `text/event-stream` when SSE).
+  - R2.3 The sniff holds up to 64 KiB plus at most one read chunk (≤ 32 KiB)
+    before it gives up and decides JSON.
+  - R2.4 Intended behavior change: sniffing applies to an untyped response
+    from ANY provider, not only Codex. An untyped body sniffed as SSE is held
+    to its protocol's SSE terminal rule (e.g. `[DONE]` or `response.completed`),
+    so such a stream without its terminal is now recorded as unterminated,
+    where before it counted as complete JSON with unknown usage.
+- Codex prompt-cache affinity: the Codex backend reuses its prompt cache only
+  for requests carrying a `session_id` header. For a Codex attempt whose
+  client sent no `session_id` (any case), LocalRouter sends `session_id` (that
+  literal lowercase name) set to the body's `prompt_cache_key` when that is a
+  non-empty JSON string of at most 256 printable ASCII bytes; anything else
+  synthesizes nothing (never truncated). A client `session_id` always wins,
+  and non-Codex attempts (including other candidates of the same request) never
+  get one. `X-Codex-Turn-State` is forwarded upstream and relayed back.
 
 ## Auth
 
@@ -695,6 +731,48 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
   are bounded with `core.TruncateLabel`.
 - A ledger error with `Permanent() == true` drops the row (`Stats.Dropped`)
   and rebases it; other errors leave state unchanged for retry.
+- One-time backfill of self-routed usage the proxy failed to meter:
+  `localrouter hermeslog backfill-self --model M [--model M ...] --account ID
+  --after RFC3339 --before RFC3339 [--apply [--accept-partial-sessions]]
+  [-config PATH]` (requires `hermes_logs.enabled` and a configured account).
+  It considers only the rows the regular scan skips as self-routed whose
+  model is one of `--model`, selects them by the window rules of Amendment R1
+  below, and records each as ONE row for its full cumulative counters,
+  attributed to `--account` and that account's provider, with the same
+  plausibility checks and labels as the scan. Without `--apply` it is a dry
+  run that prints the selection (selected, review and excluded rows with
+  reasons) with estimated cost and writes nothing. The collector state file
+  is neither read nor written.
+- Backfill Amendment R1 (review findings CX-1, CX-2):
+  - R1.1 IDs: a backfill row's ID is `hermes-backfill:k1:` + a hash of the
+    row KEY only (profile, session, model, billing provider, base URL, billing
+    mode, task); counters and `last_seen` are not part of it. Each key is
+    backfilled at most once, ever: a key already in the ledger is reported
+    `present` and never re-recorded, even if its counters grew since (e.g. the
+    session resumed and the proxy metered the new calls). Rows written by the
+    first backfill (`hermes-backfill:` IDs without `k1:`, which hashed the
+    counters) also count as present when client, session, model, agent and
+    task match. This replaces the earlier "a rerun records nothing new" rule,
+    which held only for an identical cutoff and unchanged counters.
+  - R1.2 Window: `--after` and `--before` are both required, `--after` <
+    `--before` (else a usage error). A row is selected only if its whole
+    activity lies inside [after, before): `session_model_usage.first_seen`
+    ≥ after (Hermes sets `first_seen` once when it inserts the row and never
+    updates it; `last_seen` is updated on every call) and `last_seen` <
+    before. A row without `first_seen` (NULL, an older schema without the
+    column, or a `first_seen` later than `last_seen`, which is inconsistent and
+    treated as unknown; Amendment R2, FCX-5) whose `last_seen` is in [after, before) is listed under `review`
+    with a warning that calls in the same session before `--after` are
+    included; `--apply` records review rows only with
+    `--accept-partial-sessions`. Rows with no `last_seen`, `last_seen` ≥
+    before, `first_seen` < after, or (no `first_seen` and) `last_seen` < after
+    are excluded with that reason and never recorded.
+  - R1.3 Proxy cross-check: not implemented. The proxy stores `session` from
+    `X-LocalRouter-Session` only; Hermes does not send that header (its
+    LocalRouter providers set only `X-LocalRouter-Agent`), so proxied rows'
+    session label is not Hermes' session id and no mapping is invented. Double
+    counting against proxy-metered calls is bounded by R1.1 and R1.2: choose
+    `--after` as the time the proxy stopped metering.
 
 ### Ledger changes
 

@@ -30,6 +30,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"math"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -168,15 +169,44 @@ func (c *Collector) ScanOnce(ctx context.Context) (Stats, error) {
 	return st, errors.Join(errs...)
 }
 
+// usageQuery selects every usage row; %s is the first_seen expression.
 const usageQuery = `
 SELECT u.session_id, u.model, u.billing_provider, u.billing_base_url, u.billing_mode, u.task,
        u.api_call_count, u.input_tokens, u.output_tokens, u.cache_read_tokens,
-       u.cache_write_tokens, u.reasoning_tokens, COALESCE(u.last_seen, 0),
+       u.cache_write_tokens, u.reasoning_tokens, COALESCE(u.last_seen, 0), %s,
        COALESCE(s.parent_session_id, ''), COALESCE(s.git_repo_root, ''), COALESCE(s.cwd, ''),
        COALESCE(s.source, '')
 FROM session_model_usage u LEFT JOIN sessions s ON s.id = u.session_id`
 
-func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats) error {
+// usageRow is one session_model_usage row joined with its session.
+type usageRow struct {
+	sess, model, prov, baseURL, mode, task, parent, repo, cwd, source string
+	cur                                                               counters
+	// firstSeen is set once when Hermes inserts the row and never updated
+	// (hermes_state_usage.py _MODEL_USAGE_UPSERT_SQL); lastSeen is updated
+	// on every call. Either is 0 when absent.
+	firstSeen, lastSeen float64
+}
+
+// unixTime converts a Hermes REAL unix time; absent or implausible values
+// (<= 0, NaN, beyond maxUnixSeconds) give the zero time.
+func unixTime(v float64) time.Time {
+	if !(v > 0 && v <= maxUnixSeconds) {
+		return time.Time{}
+	}
+	sec, frac := math.Modf(v)
+	return time.Unix(int64(sec), int64(frac*1e9)).UTC()
+}
+
+// key identifies the row's counters across scans.
+func (u usageRow) key(profile string) string {
+	return strings.Join([]string{profile, u.sess, u.model, u.prov, u.baseURL, u.mode, u.task}, "\x1f")
+}
+
+// readUsage calls fn for every usage row in the Hermes database at path,
+// which is opened read-only. A database without session_model_usage (older
+// Hermes schema) has no rows.
+func readUsage(ctx context.Context, path string, fn func(usageRow)) error {
 	// Read-only; never create or modify anything under the Hermes home.
 	dsn := "file:" + (&url.URL{Path: path}).EscapedPath() + "?mode=ro&_pragma=busy_timeout(5000)&_pragma=query_only(1)"
 	db, err := sql.Open("sqlite", dsn)
@@ -192,11 +222,32 @@ func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats)
 	if n == 0 {
 		return nil // older Hermes schema: nothing to import
 	}
-	rows, err := db.QueryContext(ctx, usageQuery)
+	// first_seen is missing from some older Hermes schemas.
+	firstSeen := "0"
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('session_model_usage') WHERE name='first_seen'`).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		firstSeen = "COALESCE(u.first_seen, 0)"
+	}
+	rows, err := db.QueryContext(ctx, fmt.Sprintf(usageQuery, firstSeen))
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
+	for rows.Next() {
+		var u usageRow
+		if err := rows.Scan(&u.sess, &u.model, &u.prov, &u.baseURL, &u.mode, &u.task,
+			&u.cur.Calls, &u.cur.Input, &u.cur.Output, &u.cur.CacheRead, &u.cur.CacheWrite, &u.cur.Reasoning,
+			&u.lastSeen, &u.firstSeen, &u.parent, &u.repo, &u.cwd, &u.source); err != nil {
+			return err
+		}
+		fn(u)
+	}
+	return rows.Err()
+}
+
+func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats) error {
 	type pending struct {
 		key string
 		cur counters
@@ -204,47 +255,38 @@ func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats)
 	}
 	var todo []pending
 	skipped := 0
-	for rows.Next() {
-		var (
-			sess, model, prov, baseURL, mode, task, parent, repo, cwd, source string
-			cur                                                               counters
-			lastSeen                                                          float64
-		)
-		if err := rows.Scan(&sess, &model, &prov, &baseURL, &mode, &task,
-			&cur.Calls, &cur.Input, &cur.Output, &cur.CacheRead, &cur.CacheWrite, &cur.Reasoning,
-			&lastSeen, &parent, &repo, &cwd, &source); err != nil {
-			return err
-		}
+	err := readUsage(ctx, path, func(u usageRow) {
+		cur := u.cur
 		st.Rows++
-		if c.isSelf(baseURL) {
+		if c.isSelf(u.baseURL) {
 			st.SkippedSelf++
-			continue
+			return
 		}
-		key := strings.Join([]string{profile, sess, model, prov, baseURL, mode, task}, "\x1f")
+		key := u.key(profile)
 		prev, had := c.seen[key]
 		if prev.less(cur) || !prev.inRange() {
 			// Counters went backwards (session rewritten/reset), or the last
 			// values seen were implausible: rebase without recording.
 			c.seen[key] = cur
-			continue
+			return
 		}
 		d := cur.sub(prev)
 		if d.zero() {
-			continue
+			return
 		}
-		rec := c.record(key, profile, sess, model, prov, task, parent, repo, cwd, lastSeen, cur, d)
-		if why := c.implausible(cur, rec, lastSeen); why != "" {
+		rec := c.record(key, profile, u.sess, u.model, u.prov, u.task, u.parent, u.repo, u.cwd, u.lastSeen, cur, d)
+		if why := c.implausible(cur, rec, u.lastSeen); why != "" {
 			// Rebase so the row is not re-reported every scan; only later
 			// increases from plausible counters are recorded.
 			c.seen[key] = cur
 			st.SkippedInvalid++
 			skipped++
 			c.opts.Logger.Debug("hermeslog: skipping implausible row", "profile", profile, "reason", why, "known", had)
-			continue
+			return
 		}
 		todo = append(todo, pending{key: key, cur: cur, rec: rec})
-	}
-	if err := rows.Err(); err != nil {
+	})
+	if err != nil {
 		return err
 	}
 	if skipped > 0 {
@@ -271,10 +313,9 @@ func (c *Collector) scanDB(ctx context.Context, profile, path string, st *Stats)
 func (c *Collector) record(key, profile, sess, model, prov, task, parent, repo, cwd string, lastSeen float64, cur, d counters) core.RequestRecord {
 	idSrc := fmt.Sprintf("%s\x1f%d/%d/%d/%d/%d/%d", key, cur.Calls, cur.Input, cur.Output, cur.CacheRead, cur.CacheWrite, cur.Reasoning)
 	sum := sha256.Sum256([]byte(idSrc))
-	ts := c.opts.Clock.Now().UTC()
-	if lastSeen > 0 && lastSeen <= maxUnixSeconds {
-		sec, frac := math.Modf(lastSeen)
-		ts = time.Unix(int64(sec), int64(frac*1e9)).UTC()
+	ts := unixTime(lastSeen)
+	if ts.IsZero() {
+		ts = c.opts.Clock.Now().UTC()
 	}
 	agent := "main"
 	if parent != "" {
@@ -372,6 +413,23 @@ func (c *Collector) account(prov, model string) string {
 		prov = "anthropic"
 	}
 	return c.opts.Accounts[prov]
+}
+
+// SelfHosts lists host:port spellings of a router listening on listen as
+// clients might write them in a base URL, for Options.SelfHosts. It matches
+// the serve path's wiring in internal/app.
+func SelfHosts(listen string) []string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return nil
+	}
+	out := []string{net.JoinHostPort(host, port)}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() || host == "" || host == "0.0.0.0" || host == "::" {
+		for _, h := range []string{"127.0.0.1", "localhost", "::1"} {
+			out = append(out, net.JoinHostPort(h, port))
+		}
+	}
+	return out
 }
 
 func (c *Collector) isSelf(baseURL string) bool {
