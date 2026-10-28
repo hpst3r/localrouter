@@ -8,7 +8,20 @@
 // reaches the client, and records one core.RequestRecord per attempt.
 // OpenRouter failures caused by the request itself (moderation 403, a 402
 // while funds are known, a non-exhaustion 429) are reported to policy as
-// request-scoped so they never cool the account down.
+// request-scoped so they never cool the account down. A send that got no
+// response headers (DNS, dial, TLS, reset, header timeout) is reported as
+// core.Outcome.Unreachable for the reachability breaker; when a policy
+// implementing AcquireWithBreaker (internal/policy) refuses every candidate
+// only because of the breaker, the answer is 503 upstream_unavailable. A
+// lease implementing Reached() is told as soon as the headers of an answer
+// that is not request-scoped arrive, before the body is relayed.
+// A pooled route (core.Route.BalanceStrategy set) is admitted through a
+// policy implementing AcquireBalanced; when every member is at max_inflight
+// (or breaker-open) the answer is 429 pool_saturated with Retry-After 1, and
+// pooled attempt events add pool_pick, member_inflight and member_cap. A
+// member's max_inflight caps that account on every route: an unpooled route
+// is admitted through AcquireCapped when the policy implements it, and a
+// denial only by caps (or caps and the breaker) is answered the same way.
 //
 // Public API wired by cmd/localrouter:
 //

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hpst3r/localrouter/internal/core"
+	"github.com/hpst3r/localrouter/internal/policy"
 )
 
 // obsEventName is the stable value of the "event" attribute on every
@@ -35,6 +36,10 @@ var obsAllowedKeys = map[string]bool{
 	"status": true, "outcome": true, "auth_retry": true, "failover_eligible": true,
 	"latency_ms": true,
 }
+
+// obsPooledKeys are the additional attributes of an attempt on a pooled route
+// (routes[].balance), and only there.
+var obsPooledKeys = map[string]bool{"pool_pick": true, "member_inflight": true, "member_cap": true}
 
 // obsEnvelopeKeys are added by slog itself to every record; they are not part
 // of the event payload and are skipped by the contract check.
@@ -248,6 +253,50 @@ func assertEventHygiene(t *testing.T, evs []map[string]any, forbidden []string) 
 				}
 			}
 		}
+	}
+}
+
+// assertPooledEventHygiene is assertEventHygiene for pooled-route events:
+// each must also carry every obsPooledKeys attribute, and nothing else beyond
+// the contract.
+func assertPooledEventHygiene(t *testing.T, evs []map[string]any, forbidden []string) {
+	t.Helper()
+	base := make([]map[string]any, len(evs))
+	for i, ev := range evs {
+		base[i] = map[string]any{}
+		for k, v := range ev {
+			if !obsPooledKeys[k] {
+				base[i][k] = v
+			}
+		}
+		for k := range obsPooledKeys {
+			if _, ok := ev[k]; !ok {
+				t.Fatalf("pooled event %d lacks %q: %v", i, k, ev)
+			}
+		}
+	}
+	assertEventHygiene(t, base, forbidden)
+}
+
+// TestRoutingObservabilityPooledEventContract: a pooled attempt's event is the
+// closed contract plus pool_pick, member_inflight and member_cap, carries no
+// route name, model, identity or session label, and adds no proxy clock read.
+func TestRoutingObservabilityPooledEventContract(t *testing.T) {
+	h, clk := newObsHarness(t)
+	h.upstream("a", core.ProviderOpenAICompat, okJSON)
+	h.upstream("b", core.ProviderOpenAICompat, okJSON)
+	h.routes = []core.Route{{Name: "pool-route-sentinel", Models: []string{"gpt-x"}, Interactive: []string{"a", "b"},
+		BalanceStrategy: "least_inflight", BalanceIdentity: "identity-sentinel", BalanceStickyTTL: time.Minute,
+		BalanceWeight: map[string]int{"a": 1, "b": 1}, BalanceMaxInflight: map[string]int{"a": 2}}}
+	breakerPolicyFor(h, &stepClock{t: testNow}, policy.BreakerOptions{})
+	h.start()
+
+	resp := h.post("/v1/responses", clientKey, respBody, map[string]string{"X-LocalRouter-Session": "session-sentinel"})
+	resp.Body.Close()
+	_, evs := settle(t, h, clk, 1, 2)
+	assertPooledEventHygiene(t, evs, []string{"pool-route-sentinel", "gpt-x", "identity-sentinel", "session-sentinel"})
+	if ev := evs[0]; ev["pool_pick"] != "least_inflight" || ev["member_inflight"] != float64(1) || ev["member_cap"] != float64(2) {
+		t.Fatalf("pooled attributes: %v", ev)
 	}
 }
 

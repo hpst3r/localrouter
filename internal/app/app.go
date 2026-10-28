@@ -21,9 +21,11 @@ import (
 	"github.com/hpst3r/localrouter/internal/config"
 	"github.com/hpst3r/localrouter/internal/connlim"
 	"github.com/hpst3r/localrouter/internal/core"
+	"github.com/hpst3r/localrouter/internal/discovery"
 	"github.com/hpst3r/localrouter/internal/hermeslog"
 	"github.com/hpst3r/localrouter/internal/httpguard"
 	"github.com/hpst3r/localrouter/internal/ledger"
+	"github.com/hpst3r/localrouter/internal/modelcheck"
 	"github.com/hpst3r/localrouter/internal/policy"
 	"github.com/hpst3r/localrouter/internal/quota"
 )
@@ -58,6 +60,13 @@ type App struct {
 	ClaudeLog *claudelog.Collector
 	// HermesLog is nil unless hermes_logs.enabled.
 	HermesLog *hermeslog.Collector
+	// Discovery holds the discovered model listings, shared by every
+	// generation and re-targeted on each accepted reload. Always non-nil; it
+	// polls nothing while no route discovers.
+	Discovery *discovery.Manager
+	// ModelCheck is the backend model drift checker, re-targeted with
+	// Discovery. Nil unless model_check.interval is set.
+	ModelCheck *modelcheck.Checker
 
 	// Limiter is the shared inference concurrency controller. It bounds active
 	// requests at the proxy and is reported to diagnostics. Non-nil even when
@@ -218,6 +227,8 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		InflightEstimate: cfg.Policy.InflightEstimate,
 		Clock:            clock,
 		Logger:           logger,
+		Breaker:          breakerOptions(cfg.Policy.Breaker),
+		MaxInflight:      policy.AccountCaps(cfg.CoreRoutes()),
 	})
 	lim, err := connlim.New(cfg.Limits.MaxConcurrent, cfg.Limits.MaxConcurrentPerClient)
 	if err != nil {
@@ -233,6 +244,10 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 			Shutdown: cfg.Timeouts.Shutdown.D(),
 		},
 		TLSCertFile: cfg.TLSCertFile, TLSKeyFile: cfg.TLSKeyFile, Logger: logger,
+		Discovery: discovery.New(creds, discovery.Options{Clock: clock, Logger: logger}),
+	}
+	if iv := cfg.ModelCheckInterval(); iv > 0 {
+		a.ModelCheck = modelcheck.NewChecker(creds, a.Discovery, iv, logger, modelcheck.Options{Clock: clock})
 	}
 	a.serving.Store(true)
 	a.reloadBase = cfg
@@ -251,7 +266,12 @@ func Build(cfg *config.Config, logger *slog.Logger, ov Overrides) (*App, error) 
 		_ = led.Close()
 		return nil, err
 	}
+	generation.policy.Activate()
 	a.current.Store(generation)
+	a.Discovery.SetTargets(acctMap, generation.routes)
+	if a.ModelCheck != nil {
+		a.ModelCheck.SetTargets(acctMap, generation.routes)
+	}
 	a.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		g := a.current.Load()
 		g.handler.ServeHTTP(w, r)
@@ -301,9 +321,14 @@ func selfHosts(listen string) []string {
 	return out
 }
 
-// Start begins background quota polling until ctx is cancelled.
+// Start begins background quota polling and model discovery until ctx is
+// cancelled. Neither blocks on a first fetch.
 func (a *App) Start(ctx context.Context) {
 	a.Quota.Start(ctx)
+	a.Discovery.Start(ctx)
+	if a.ModelCheck != nil {
+		a.ModelCheck.Start(ctx)
+	}
 	if a.ClaudeLog != nil {
 		a.ClaudeLog.Start(ctx)
 	}
@@ -398,6 +423,12 @@ func (a *App) Close() error {
 	a.stopped = true
 	a.srvMu.Unlock()
 	a.closeBudget()
+	if a.Discovery != nil {
+		a.Discovery.Close()
+	}
+	if a.ModelCheck != nil {
+		a.ModelCheck.Close()
+	}
 	if a.Ledger == nil {
 		return nil
 	}

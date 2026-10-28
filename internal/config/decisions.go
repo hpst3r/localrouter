@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"net/url"
-	"sort"
 	"strings"
 
 	"github.com/hpst3r/localrouter/internal/core"
@@ -205,13 +204,4 @@ func decisionsBaseURLOK(base string) bool {
 		return false
 	}
 	return u.Path == "/v1" || strings.HasSuffix(u.Path, "/v1")
-}
-
-func sortedKeys(m map[string]UpstreamSpec) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out) // deterministic error order
-	return out
 }

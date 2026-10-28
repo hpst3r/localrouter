@@ -74,8 +74,38 @@ type Deps struct {
 	// the generation. Like ReloadStatus it is consulted per request, so a
 	// reload publishes a fresh source without restarting the server.
 	Budgets BudgetSource
+	// Discovery resolves discovered model ids for findRoute (check_admission)
+	// with the proxy's rules, minus the on-demand refresh, and supplies the
+	// diagnostics "discovery" block. Nil when no route discovers: findRoute
+	// and the diagnostics document are then exactly the static-only ones.
+	Discovery Discovery
+	// ModelCheck supplies the diagnostics "model_check" block. Nil when the
+	// backend model check is disabled: the block is then omitted.
+	ModelCheck ModelCheck
 	// Clock defaults to core.SystemClock.
 	Clock core.Clock
+}
+
+// Discovery is the control server's view of route-level model discovery. It
+// is satisfied by *internal/discovery.Resolver.
+type Discovery interface {
+	// Resolve returns the discovering route serving model, with its candidate
+	// lists narrowed to the accounts that list it (either may be empty).
+	// ambiguous reports that more than one discovering route claims model,
+	// so none serves it. Static models never resolve here; findRoute checks
+	// them first.
+	Resolve(model string) (route core.Route, ok, ambiguous bool)
+	// Diagnostics returns the JSON-encodable "discovery" block. It must carry
+	// no URLs, keys or upstream bodies.
+	Diagnostics() any
+}
+
+// ModelCheck is the control server's view of the backend model check. It is
+// satisfied by *internal/modelcheck.Checker.
+type ModelCheck interface {
+	// Diagnostics returns the JSON-encodable "model_check" block. It must
+	// carry no URLs, keys or upstream bodies.
+	Diagnostics() any
 }
 
 // Options tune the control server.
@@ -206,6 +236,43 @@ type accountStatus struct {
 	// freshness. Provider figures, independent of ledger cost estimates.
 	Credits *creditsStatus `json:"credits,omitempty"`
 	Key     *keyStatus     `json:"key,omitempty"`
+	// Breaker is the account's reachability breaker; present only when
+	// policy.breaker is enabled.
+	Breaker *breakerStatus `json:"breaker,omitempty"`
+}
+
+// breakerStatus is one account's reachability breaker. State is "closed",
+// "open" or "half_open"; OpenUntil (the end of the open period, after which
+// one probe may be admitted) is omitted when closed.
+type breakerStatus struct {
+	State               string     `json:"state"`
+	ConsecutiveFailures int        `json:"consecutive_failures"`
+	OpenUntil           *time.Time `json:"open_until,omitempty"`
+}
+
+// breakerSource is implemented by policies with a reachability breaker
+// (internal/policy.Policy); enabled is false when the breaker is disabled.
+type breakerSource interface {
+	Breaker(accountID string) (state string, consecutiveFailures int, openUntil time.Time, enabled bool)
+}
+
+// breakerView reports the account's breaker, or nil when the policy has no
+// enabled breaker.
+func (s *Server) breakerView(id string) *breakerStatus {
+	bs, ok := s.deps.Policy.(breakerSource)
+	if !ok {
+		return nil
+	}
+	state, fails, until, enabled := bs.Breaker(id)
+	if !enabled {
+		return nil
+	}
+	out := &breakerStatus{State: state, ConsecutiveFailures: fails}
+	if !until.IsZero() {
+		t := until.UTC()
+		out.OpenUntil = &t
+	}
+	return out
 }
 
 // creditsStatus is the account-level prepaid balance. Amounts are null while
@@ -323,7 +390,8 @@ func (s *Server) accountStatus(a core.Account, now time.Time) accountStatus {
 	if a.Provider == core.ProviderOpenRouter {
 		st.Credits, st.Key = s.creditsView(snap.Credits, now), s.keyView(snap.Key, now)
 	}
-	st.Healthy = !coolingDown && st.Error == nil
+	st.Breaker = s.breakerView(a.ID)
+	st.Healthy = !coolingDown && st.Error == nil && (st.Breaker == nil || st.Breaker.State == "closed")
 	return st
 }
 
@@ -672,6 +740,7 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var candidates []string
+	var pooled *core.Route
 	if req.Account != "" {
 		if !slices.ContainsFunc(s.deps.Accounts, func(a core.Account) bool { return a.ID == req.Account }) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("unknown account %q", req.Account))
@@ -679,7 +748,11 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 		}
 		candidates = []string{req.Account}
 	} else {
-		route, ok := s.findRoute(req.Model)
+		route, ok, ambiguous := s.findRoute(req.Model, class)
+		if ambiguous {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("model %q is claimed by more than one discovering route", req.Model))
+			return
+		}
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("no route for model %q", req.Model))
 			return
@@ -699,12 +772,13 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		candidates = filtered
+		pooled = &route
 	}
 	if s.deps.Policy == nil {
 		writeError(w, http.StatusServiceUnavailable, "policy unavailable")
 		return
 	}
-	d := s.deps.Policy.DryRun(class, candidates)
+	d := s.dryRun(r, class, candidates, pooled)
 	resp := admitResponse{Decision: "deny", AccountID: d.AccountID, Reason: d.Reason}
 	if resp.AccountID == "" {
 		resp.AccountID = req.Account
@@ -719,16 +793,27 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) findRoute(model string) (core.Route, bool) {
+// findRoute resolves model for class with the proxy's rules, minus the
+// on-demand refresh: a static entry first, then discovery. A discovered model
+// that only the other class's accounts list is no route for class.
+func (s *Server) findRoute(model string, class core.Class) (route core.Route, ok, ambiguous bool) {
 	if model == "" {
-		return core.Route{}, false
+		return core.Route{}, false, false
 	}
 	for _, rt := range s.deps.Routes {
 		if slices.Contains(rt.Models, model) {
-			return rt, true
+			return rt, true, false
 		}
 	}
-	return core.Route{}, false
+	if s.deps.Discovery == nil {
+		return core.Route{}, false, false
+	}
+	route, ok, ambiguous = s.deps.Discovery.Resolve(model)
+	if ok && len(route.Interactive) == 0 && class == core.ClassInteractive ||
+		ok && len(route.Background) == 0 && class == core.ClassBackground {
+		return core.Route{}, false, false
+	}
+	return route, ok, ambiguous
 }
 
 // writeJSON encodes v before writing the header, so a value json cannot

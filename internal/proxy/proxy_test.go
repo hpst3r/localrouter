@@ -549,9 +549,16 @@ func TestClassDowngradeOnly(t *testing.T) {
 			t.Fatalf("case %d: class %s want %s", i, got[i], c.want)
 		}
 	}
-	rows := h.waitRows(3)
-	if rows[1].Class != core.ClassBackground {
-		t.Fatalf("row class %s", rows[1].Class)
+	// Rows are recorded concurrently with the next request, so compare the
+	// class multiset rather than the arrival order.
+	bg := 0
+	for _, r := range h.waitRows(3) {
+		if r.Class == core.ClassBackground {
+			bg++
+		}
+	}
+	if bg != 2 {
+		t.Fatalf("background rows = %d, want 2", bg)
 	}
 }
 

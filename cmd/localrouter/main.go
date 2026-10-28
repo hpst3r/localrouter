@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -30,8 +31,11 @@ Usage:
   localrouter keygen  <output-file>
   localrouter pricing import [-config PATH] <litellm-prices.json>
   localrouter pricing reprice [-config PATH]
-  localrouter check   [-config PATH]
+  localrouter check   [-config PATH] [-probe [-strict] [-json]]
+                      -probe: exit 1 when a route's backend model id is missing
   localrouter ledger relabel-host [--from ""] --to NAME [-config PATH]
+  localrouter hermeslog backfill-self --model M [--model M ...] --account ID
+                      --before RFC3339 [--apply] [-config PATH]
   localrouter admit   [--class background] (--account ID | --model NAME) [--url URL] [--json]
                       exit 0 = allow, 1 = deny, 2 = error
   localrouter agent   [-config ~/.config/localrouter/agent.yaml] [--once]
@@ -57,6 +61,8 @@ func main() {
 		err = cmdPricing(os.Args[2:])
 	case "ledger":
 		err = cmdLedger(os.Args[2:])
+	case "hermeslog":
+		err = cmdHermeslog(os.Args[2:])
 	case "check":
 		err = cmdCheck(os.Args[2:])
 	case "admit":
@@ -109,11 +115,19 @@ func checkFiles(fs *flag.FlagSet, cfg *config.Config) error {
 	return nil
 }
 
-func cmdCheck(args []string) error {
+func cmdCheck(args []string) error { return runCheck(args, os.Stdout) }
+
+func runCheck(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("check", flag.ExitOnError)
+	probe := fs.Bool("probe", false, "also fetch each eligible account's /models listing and check every static route's backend model id")
+	strict := fs.Bool("strict", false, "with -probe: exit non-zero when a verdict is unchecked")
+	asJSON := fs.Bool("json", false, "with -probe: print the structured result as JSON")
 	cfg, err := loadConfig(fs, args)
 	if err != nil {
 		return err
+	}
+	if !*probe && (*strict || *asJSON) {
+		return exitError{code: 2, msg: "check: -strict and -json require -probe"}
 	}
 	if err := checkFiles(fs, cfg); err != nil {
 		return err
@@ -125,9 +139,31 @@ func cmdCheck(args []string) error {
 	if _, err := auth.LoadClientKeyFiles(keyFiles); err != nil {
 		return fmt.Errorf("client keys: %w", err)
 	}
-	fmt.Printf("config OK: %d clients, %d accounts, %d routes; data_dir=%s\n",
-		len(cfg.Clients), len(cfg.Accounts), len(cfg.Routes), cfg.DataDir)
-	return nil
+	if !*probe {
+		fmt.Fprintf(out, "config OK: %d clients, %d accounts, %d routes; data_dir=%s\n",
+			len(cfg.Clients), len(cfg.Accounts), len(cfg.Routes), cfg.DataDir)
+		for _, line := range poolInfo(cfg) {
+			fmt.Fprintln(out, line)
+		}
+		return nil
+	}
+	return probeModels(cfg, out, *strict, *asJSON)
+}
+
+// poolInfo returns one informational line per pooled route with more members
+// than a request can try (policy.max_failovers + 1 attempts). It never fails
+// the check: such a pool is valid, it just cannot fail over to every member.
+func poolInfo(cfg *config.Config) []string {
+	var out []string
+	attempts := cfg.Policy.MaxFailovers + 1
+	for _, r := range cfg.Routes {
+		if r.Balance == nil || len(r.Balance.Members) <= attempts {
+			continue
+		}
+		out = append(out, fmt.Sprintf("info: route %s pool has %d members but at most %d attempts per request (policy.max_failovers)",
+			r.Name, len(r.Balance.Members), attempts))
+	}
+	return out
 }
 
 func cmdKeygen(args []string) error {

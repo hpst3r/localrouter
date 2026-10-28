@@ -65,6 +65,35 @@ All identifiers are **existing** ledger identifiers. No new correlation IDs are
 invented; `request_id`/`attempt_id`/`failover_of` are exactly the values already
 present on `core.RequestRecord`.
 
+### Pooled routes (`routes[].balance`)
+
+An attempt on a pooled route (see SPEC.md "Pooled backends") adds three
+attributes after the ones above; an attempt on an unpooled route carries none
+of them, so with no `balance` block anywhere the event is unchanged.
+
+| attribute         | source | notes |
+|-------------------|--------|-------|
+| `pool_pick`       | how the policy chose the member: `least_inflight` or `sticky` (a live `X-LocalRouter-Session` binding) | the session label itself is never emitted |
+| `member_inflight` | the member's open leases at pick time, **including** this attempt's | the policy's shared counter, so leases from every route and reload generation count |
+| `member_cap`      | the member's `max_inflight`; `0` = uncapped | a per-account cap (it applies on every route that lists the account) |
+
+`account` remains the member's account ID; the route name, the pool
+`identity` and the session label are not emitted. The closed-key contract test
+covers a pooled route too (`TestRoutingObservabilityPooledEventContract`).
+
+### Policy denials
+
+A denial is not an attempt and emits no completion event; it logs one
+`policy denied` line with `client`, `class`, `model` and `reason`. Two denials
+add a `denial` attribute:
+
+| `denial`         | when | response |
+|------------------|------|----------|
+| `breaker_open`   | every candidate is held open by the reachability breaker | 503 `upstream_unavailable` |
+| `pool_saturated` | every candidate is at its `max_inflight` cap, or at its cap or breaker-open with at least one at its cap; on a pooled route or an unpooled route listing a capped account | 429 `pool_saturated`, `Retry-After: 1` |
+
+Any other denial has no `denial` attribute and answers 429 `quota_reserve`.
+
 ### `failover_eligible` (eligibility) vs an actual failover (occurrence)
 
 `failover_eligible` reports only that failover was **permitted** for this

@@ -136,6 +136,14 @@ func (a *App) Shutdown(ctx context.Context) error {
 	srv := a.srv
 	a.stopped = true
 	a.srvMu.Unlock()
+	// Model discovery stops once the drain ends (or immediately when nothing
+	// is serving), so a draining request may still finish its refresh wait.
+	if a.Discovery != nil {
+		defer a.Discovery.Close()
+	}
+	if a.ModelCheck != nil {
+		defer a.ModelCheck.Close()
+	}
 	if srv == nil {
 		return nil
 	}
