@@ -251,6 +251,9 @@ func (p *Proxy) attempt(w http.ResponseWriter, r *http.Request, req *request, le
 		status := resp.StatusCode
 
 		scoped, final, idledOut := p.classify(account, status, resp, cancelUp)
+		if isDecisionEndpoint(req.endpoint) && !idledOut && decisionFinal(status) {
+			scoped, final = true, true
+		}
 		if !scoped {
 			markReached(lease)
 		}
@@ -491,6 +494,9 @@ func (p *Proxy) noResponse(w http.ResponseWriter, canFailover bool, msg string) 
 // injection or Codex normalisation can leak between attempts.
 func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cred core.Credential) (*http.Response, error) {
 	u := strings.TrimRight(account.BaseURL, "/") + req.endpoint
+	if req.endpoint == endpointDecisions {
+		u = decisionsURL(account.BaseURL)
+	}
 	// Only an actual override rewrites the body: a resolved model equal to the
 	// client model is semantically the same request, so it is left byte-identical
 	// (the legacy no-rewrite fast path). The rewrite target is the leased
@@ -517,6 +523,9 @@ func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cr
 		} else if v, ok := req.header[h]; ok {
 			up.Header[h] = append([]string(nil), v...)
 		}
+	}
+	if isDecisionEndpoint(req.endpoint) {
+		forwardDecisionHeaders(up.Header, req.header)
 	}
 	if up.Header.Get("Content-Type") == "" {
 		up.Header.Set("Content-Type", "application/json")

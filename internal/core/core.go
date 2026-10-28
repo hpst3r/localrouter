@@ -450,6 +450,14 @@ type UpstreamSpec struct {
 	// Stream reports whether the candidate supports streaming. false =
 	// unsupported.
 	Stream bool
+	// QuestionTypes is, on a typed-decision descriptor (Protocols is exactly
+	// ["systemone"] or ["decisions"]), the non-empty subset of {"noul",
+	// "choice", "score"} the candidate answers. nil on every other descriptor.
+	QuestionTypes []string
+	// AllowAlias, on a typed-decision descriptor, accepts a moving model alias
+	// (e.g. "~typesafe/jev-latest") as UpstreamModel. Config requires it on
+	// every candidate of the route when the shared model is an alias.
+	AllowAlias bool
 }
 
 // Route maps a model name to ordered candidate accounts per class, the

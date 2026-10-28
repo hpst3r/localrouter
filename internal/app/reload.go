@@ -60,6 +60,7 @@ func restartFields(base, candidate *config.Config) []string {
 		c.Routes = nil
 		c.Limits = config.LimitsConfig{}
 		c.Policy = config.PolicyConfig{}
+		c.Decisions = config.DecisionsConfig{} // per-generation classifier bounds
 		for i := range c.Accounts {
 			c.Accounts[i].Reserve = nil
 		}
@@ -273,7 +274,7 @@ func (a *App) makeGeneration(c *config.Config, number uint64) (*runtimeGeneratio
 	if resolver != nil {
 		pdeps.Discovery = resolver
 	}
-	px := proxy.New(pdeps, proxy.Options{MaxFailovers: c.Policy.MaxFailovers})
+	px := proxy.New(pdeps, proxy.Options{MaxFailovers: c.Policy.MaxFailovers, DecisionBounds: decisionBounds(c.Decisions)})
 	g := &runtimeGeneration{routes: routes, pricing: priceView, policy: pol, status: core.ReloadStatus{Generation: number, OK: true, At: a.reloadClock.Now()}}
 	deps := control.Deps{Accounts: accounts, Quota: a.Quota, Policy: pol, Ledger: priceView, Routes: routes, Authenticate: authenticate, Clock: a.reloadClock, Storage: a.Ledger, Inflight: viewInflight{lim}, Ready: a.Serving, ReloadStatus: func() core.ReloadStatus { return a.generationStatus(g) }, Budgets: a.budgetSource(c.Budgets)}
 	for _, cl := range c.Clients {

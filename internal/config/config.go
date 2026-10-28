@@ -48,6 +48,10 @@ type Config struct {
 	// ModelCheck is the optional backend model drift check. Nil (absent) or a
 	// zero interval disables it, leaving startup and diagnostics unchanged.
 	ModelCheck *ModelCheckConfig `yaml:"model_check"`
+	// Decisions bounds typed-decision request bodies (/v1/systemone,
+	// /v1/decisions). It is read only by decision routes; zero values take
+	// the defaults (see DecisionsConfig).
+	Decisions DecisionsConfig `yaml:"decisions"`
 }
 
 // ModelCheckConfig enables the periodic backend model check (docs/SPEC.md,
@@ -70,6 +74,17 @@ func (c *Config) ModelCheckInterval() time.Duration {
 		return 0
 	}
 	return c.ModelCheck.Interval.D()
+}
+
+// DecisionsConfig bounds the strict typed-decision classifier. A zero field
+// takes its default; negative values are rejected. The body size limit stays
+// the global proxy limit.
+type DecisionsConfig struct {
+	MaxQuestions         int `yaml:"max_questions"`           // default 64
+	MaxQuestionNameBytes int `yaml:"max_question_name_bytes"` // default 128
+	MaxChoiceOptions     int `yaml:"max_choice_options"`      // default 255
+	MaxScoreLevels       int `yaml:"max_score_levels"`        // default 10
+	MaxNesting           int `yaml:"max_nesting"`             // default 64
 }
 
 // ClaudeLogsConfig controls ingestion of Claude Code transcript token usage.
@@ -441,6 +456,13 @@ type UpstreamSpec struct {
 	Tools      bool `yaml:"tools"`
 	JSONSchema bool `yaml:"json_schema"`
 	Stream     bool `yaml:"stream"`
+	// QuestionTypes is required on a typed-decision descriptor (protocols
+	// [systemone] or [decisions]): a non-empty subset of {noul, choice,
+	// score}. It is rejected on every other descriptor.
+	QuestionTypes []string `yaml:"question_types"`
+	// AllowAlias accepts a moving model alias (~…, *-latest, *-preview) as the
+	// route's pinned decision model. Every candidate must set it.
+	AllowAlias bool `yaml:"allow_alias"`
 }
 
 // Duration parses Go duration strings in YAML.
@@ -565,6 +587,7 @@ func (c *Config) applyDefaults(baseDir string) {
 	if c.HermesLogs.ScanInterval == 0 {
 		c.HermesLogs.ScanInterval = Duration(time.Minute)
 	}
+	c.Decisions.applyDefaults()
 	for i := range c.Accounts {
 		a := &c.Accounts[i]
 		a.APIKeyFile = expand(a.APIKeyFile, baseDir)
@@ -786,6 +809,11 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("account %s: cost_basis must be api_equivalent or metered", a.ID))
 		}
 	}
+	errs = append(errs, c.Decisions.validate()...)
+	baseURL := map[string]string{}
+	for _, a := range c.Accounts {
+		baseURL[a.ID] = a.BaseURL
+	}
 	models := map[string]string{}
 	for _, r := range c.Routes {
 		if r.Name == "" || len(r.Models) == 0 && !r.DiscoverModels {
@@ -807,7 +835,11 @@ func (c *Config) Validate() error {
 				errs = append(errs, fmt.Errorf("route %s: account %q is a quota-only claude account and cannot serve inference", r.Name, id))
 			}
 		}
-		errs = append(errs, validateUpstreams(r, provider)...)
+		if decisionRoute(r) {
+			errs = append(errs, validateDecisionRoute(r, provider, baseURL)...)
+		} else {
+			errs = append(errs, validateUpstreams(r, provider)...)
+		}
 		errs = append(errs, validateDiscovery(r, provider)...)
 		errs = append(errs, validateBalance(r, c.Accounts)...)
 	}
@@ -874,6 +906,9 @@ func validateUpstreams(r RouteConfig, provider map[string]string) []error {
 		}
 	}
 	for id, spec := range r.Upstreams {
+		if len(spec.QuestionTypes) > 0 || spec.AllowAlias {
+			errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: question_types and allow_alias apply only to decision descriptors (protocols [systemone] or [decisions])", r.Name, id))
+		}
 		if len(spec.Protocols) == 0 {
 			errs = append(errs, fmt.Errorf("route %s: upstreams[%s]: protocols must be a non-empty subset of chat,responses", r.Name, id))
 		} else {
@@ -1063,13 +1098,15 @@ func (c *Config) CoreRoutes() []core.Route {
 					Tools:           s.Tools,
 					JSONSchema:      s.JSONSchema,
 					Stream:          s.Stream,
+					QuestionTypes:   copyTrimmed(s.QuestionTypes),
+					AllowAlias:      s.AllowAlias,
 				}
 			}
 		}
 		cr := core.Route{
 			Name:          r.Name,
 			Models:        append([]string(nil), r.Models...),
-			UpstreamModel: r.UpstreamModel,
+			UpstreamModel: decisionRouteUpstreamModel(r),
 			Interactive:   append([]string(nil), r.Interactive...),
 			Background:    append([]string(nil), bg...),
 			Upstreams:     ups,

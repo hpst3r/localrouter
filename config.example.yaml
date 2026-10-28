@@ -65,6 +65,10 @@ accounts:
     provider: ollama
     api_key_file: keys/ollama.key
     reserve: { 5h: 0.10, weekly: 0.10 }
+  # Typed decisions (Jev) go through OpenRouter (prepaid; no reserve).
+  # - id: openrouter-main
+  #   provider: openrouter
+  #   api_key_file: keys/openrouter.key   # base_url defaults to https://openrouter.ai/api/v1
 
 routes:
   - name: gpt
@@ -113,6 +117,42 @@ routes:
   #     members:
   #       lab-6800xt: {weight: 2, max_inflight: 4}   # max_inflight = llama-server -np; 0 = uncapped; per ACCOUNT, enforced on every route
   #       lab-p100:   {weight: 1, max_inflight: 2}
+  # Typed decisions are opt-in; without a route like these, /v1/systemone and
+  # /v1/decisions answer 404. A decision route is single-family, OpenRouter
+  # only, text-only, and every candidate shares one pinned upstream_model
+  # (moving aliases such as ~typesafe/jev-latest need allow_alias: true on
+  # every candidate). See docs/SPEC.md "Typed decisions".
+  #
+  # System One shape (TypeSafe SDK with base URL http://127.0.0.1:8787):
+  # POST /v1/systemone -> https://openrouter.ai/api/v1/systemone
+  # - name: jev-systemone
+  #   models: [jev-1.13]
+  #   interactive: [openrouter-main]
+  #   upstreams:
+  #     openrouter-main:
+  #       upstream_model: typesafe/jev-1.13
+  #       protocols: [systemone]
+  #       input_modalities: [text]
+  #       question_types: [noul, choice, score]
+  #
+  # OpenRouter Decisions API shape (any OpenRouter decision model):
+  # POST /v1/decisions -> https://openrouter.ai/api/alpha/decisions
+  # - name: jev-decisions
+  #   models: [jev]
+  #   interactive: [openrouter-main]
+  #   upstreams:
+  #     openrouter-main:
+  #       upstream_model: typesafe/jev-1.14
+  #       protocols: [decisions]
+  #       input_modalities: [text]
+  #       question_types: [noul, choice, score]
+
+# decisions:                  # optional bounds for decision routes (defaults shown)
+#   max_questions: 64
+#   max_question_name_bytes: 128
+#   max_choice_options: 255
+#   max_score_levels: 10
+#   max_nesting: 64
 
 claude_logs:                  # ingest Claude Code token usage from local transcripts
   enabled: true
