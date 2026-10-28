@@ -1250,7 +1250,11 @@ One table `requests` (no prompt/response content, ever):
 account_id, upstream_identity, status, failover_of, input_tokens,
 cached_input_tokens, output_tokens, reasoning_tokens, usage_known,
 cost_usd, cost_basis, latency_ms, bytes_out, session, task, agent, error,
-upstream_model, pricing_model`.
+upstream_model, pricing_model, ttft_ms, streamed, first_token_reasoning`.
+
+Migration 5 adds `ttft_ms INTEGER` (nullable), `streamed INTEGER NOT NULL
+DEFAULT 0` and `first_token_reasoning INTEGER NOT NULL DEFAULT 0` (see
+"Performance metrics"). Existing rows are not backfilled.
 
 Migration 4 adds nullable `upstream_model` and `pricing_model` columns. Historical
 rows retain NULL values and client-model pricing. New proxied attempts record
@@ -1324,6 +1328,8 @@ responses stay JSON-encodable.
   released. An already observed provider cost is retained alongside the
   transport/request error, independently of token knowledge; for an interrupted
   stream it is not a guarantee of the final billed amount.
+- First-token timing (TTFT) is captured by the same incremental SSE parser;
+  see "Performance metrics" for which events count.
 - Parser must handle multi-line `data:` fields and `\r\n`, and must not
   buffer the entire stream (scan incrementally; keep ≤ 4 MiB per event).
   Non-stream JSON capture is bounded to 16 MiB; oversized bodies are still
@@ -2020,7 +2026,7 @@ and wide (browser). Sections:
    tokens instead from an hourly host-grouped query).
 - Accessibility: buttons are real <button>s, focus styles, chart has
   aria-label summary and the table is the accessible equivalent.
-- Performance: at most 5 fetches per refresh (status, view, host totals, host 24h, client 24h); auto-refresh every 30s only
+- Performance: at most 6 fetches per refresh (status, view, host totals, host 24h, client 24h, performance view); auto-refresh every 30s only
   when the tab is visible; never re-render the chart while hovering (defer).
 - Security: all text via textContent; no innerHTML with data; key in
   localStorage as today.
@@ -2376,6 +2382,196 @@ another branch); a local decision backend; images/box/multipart; OpenAI
   half-open probe are neutral.
 - R2.6 (FIN-L4): `usageCapture.Completed` has an explicit decision-endpoint
   case: complete iff the answer is a JSON body (no SSE terminal rule).
+
+## Performance metrics (TTFT, decode speed, latency)
+
+Per-attempt timing is recorded by the proxy and aggregated into percentile
+time series. Everything here is additive: existing endpoints, JSON shapes and
+widget sections are unchanged except where stated.
+
+### Capture (`internal/proxy`)
+
+- `RequestRecord.Streamed` = the upstream response was relayed through the
+  stream path with an SSE Content-Type (`text/event-stream`, the same test
+  `newUsageCapture` uses). Non-SSE bodies: `Streamed=false`, `TTFTMS=nil`.
+- **First output event.** While no first output has been seen, every
+  dispatched SSE event is inspected (cheap pre-filter: the data contains
+  `delta`; then a minimal JSON decode). An event is a first-output event if:
+  - Responses API: its type (JSON `type`, else the SSE `event:` name) starts
+    with `response.` and ends with `.delta`, and its `delta` field is present
+    and not empty (`""`, `null`, `[]`, `{}` don't count). It is a
+    **reasoning** event iff the type contains `reasoning` (e.g.
+    `response.reasoning_summary_text.delta`, `response.reasoning_text.delta`).
+    Examples that count: `response.output_text.delta`,
+    `response.refusal.delta`, `response.function_call_arguments.delta`.
+    `response.created`, `response.in_progress`, `response.output_item.added`,
+    `response.content_part.added` never count.
+  - Chat completions: any `choices[i].delta` has a non-empty string
+    `content`, `refusal`, `reasoning_content` or `reasoning`, or a non-empty
+    `tool_calls` array, or a non-null `function_call`. A role-only chunk
+    (`{"role":"assistant","content":""}`) does not count. It is a
+    **reasoning** event iff the only non-empty fields across its choices are
+    `reasoning_content`/`reasoning`.
+  - Usage-only chunks, `[DONE]`, comments and terminal events never count.
+- `TTFTMS` = `clock.Now() - StartedAt` in whole ms (clamped to ≥ 0), taken in
+  the stream loop right after the `capture.Write` call whose bytes completed
+  the first-output event, before relaying those bytes to the client. It is
+  set at most once per attempt and kept even if the stream later fails (the
+  row is then not perf-eligible anyway). If no first-output event arrives,
+  `TTFTMS=nil`. `FirstTokenReasoning` = that event was a reasoning event.
+- Because `LatencyMS` is computed later from the same clock, `TTFTMS ≤
+  LatencyMS` always holds for proxied rows.
+- The per-request `request` log line adds `streamed` and, when known,
+  `ttft_ms`. The `routing_attempt_completed` event is unchanged.
+- Never record or log event content; only timing and the two flags.
+
+### Ingest (`POST /control/v1/ingest`)
+
+Records may carry `ttft_ms`, `streamed`, `first_token_reasoning` (all
+optional). `ttft_ms`, when present, must satisfy `0 ≤ ttft_ms ≤ latency_ms`;
+otherwise the request is rejected like other record validation errors
+(`records[i]: ttft_ms must be between 0 and latency_ms`).
+
+### Eligibility and formulas (ledger)
+
+A row is **perf-eligible** iff `latency_ms > 0 AND status BETWEEN 200 AND 299
+AND error = ''`. (Imported Claude/Hermes rows have `latency_ms = 0` and are
+excluded; failed/failover attempts carry an error and are excluded.) Samples:
+
+| Metric | Sample set (all perf-eligible) | Value |
+|---|---|---|
+| `latency_ms` | every eligible row | `latency_ms` |
+| `ttft_ms` | `ttft_ms IS NOT NULL` | `ttft_ms` |
+| `e2e_tps` | `usage_known = 1 AND output_tokens > 0` | `output_tokens * 1000 / latency_ms` |
+| `decode_tps` | `streamed = 1 AND ttft_ms IS NOT NULL AND usage_known = 1 AND D ≥ 2 AND G ≥ 50` | `(D - 1) * 1000 / G` |
+
+where `G = latency_ms - ttft_ms` (decode window, ms) and `D` (decode tokens)
+= `output_tokens` if `first_token_reasoning = 1`, else `output_tokens -
+reasoning_tokens` (hidden reasoning finished before the first visible token,
+so it is not part of the decode window). The first token arrives at TTFT, so
+the rate counts the `D - 1` tokens after it.
+
+Weighted rates: `decode_tps_weighted = Σ(D - 1) * 1000 / ΣG` over the decode
+samples; `e2e_tps_weighted = Σoutput_tokens * 1000 / Σlatency_ms` over the
+e2e samples. nil when the sample set is empty.
+
+`core.Dist`: N, mean, min, p01, p05, p10, p50, p90, p95, p99, max over the
+samples, percentiles by linear interpolation between closest ranks (see
+`core.Dist`). Example: samples 1..100 → p50 = 50.5, p90 = 90.1, p99 = 99.01,
+p01 = 1.99. Empty sample set → nil (JSON `null`), never zeros. Every value is
+finite.
+
+### Ledger: `Performance(ctx, core.AnalyticsQuery) (core.PerfResult, error)`
+
+- Validation, windowing (`From <= started_at < To`), bucket starts (UTC hours
+  / local days, DST-correct), filters, TopN default/max, and the breakdown
+  cap (`core.AnalyticsMaxBreakdown`, with `breakdown_omitted`) are exactly as
+  `Analytics`; reuse its helpers. Errors start with `analytics: `.
+- Rank keys by eligible `Requests` desc, then key asc. Series = top N, then
+  `__other__` (omitted if no other keys). Every series has exactly
+  `len(BucketStarts)` points; a point with no eligible rows has
+  `requests = 0` and all distributions nil. **Percentiles are always computed
+  from the pooled raw samples** of the set they describe (a point, a key's
+  total, `__other__`, Totals) — never by averaging percentiles.
+- Breakdown rows are key totals (not per bucket). Totals cover every eligible
+  row in range.
+- Bounded work: count eligible rows first; if more than 2,000,000, return
+  `analytics: too many requests in range for performance stats (N); narrow
+  the range or add filters`. Target: 1M eligible rows over 30 days answered
+  in under 2 s on a laptop (bench).
+- `schema_version` 1.
+
+### HTTP
+
+- `GET /control/v1/analytics/performance` — same query parameters, defaults
+  (range=7d, bucket by span, group=host, top=8), validation messages and auth
+  as `GET /control/v1/analytics`. 400 on invalid input (including the row-cap
+  error), 503 `performance analytics unavailable` if the ledger does not
+  implement `core.PerfLedger`. Response = `core.PerfResult`; arrays/maps are
+  never null (`bucket_starts`, `filters`, `breakdown`, `series`, `points`).
+
+### Widget: Performance section
+
+A **Performance** section between Breakdown and Machines, driven by the same
+range, group-by and filters as Usage (one extra fetch per refresh: the
+performance view with the main view's group, filters and `top=8`).
+
+1. Section controls: metric picker **TTFT | Decode speed | Latency | E2E
+   speed** and statistic picker **Median | p90 | p99**. For the speed metrics
+   (higher is better) the same buttons select the *slow tail* — p50, p10,
+   p01 — and are labelled accordingly (e.g. "Median | slowest 10% | slowest
+   1%"). State in the URL hash as `pm=` (ttft|decode|latency|e2e) and `ps=`
+   (p50|p90|p99), omitted when default (ttft, p50).
+2. KPI strip from Totals: median TTFT, median decode speed (weighted rate as
+   secondary text), median and p95 latency, measured requests (and streamed
+   share).
+3. Line chart (hand-written SVG): one line per series in the same colors as
+   the Usage chart for the same key; buckets without samples are gaps (the
+   line breaks; isolated points render as dots). Y axis with nice ticks and
+   human units (`850 ms`, `1.2 s`, `42 tok/s`). Hover/focus a bucket →
+   tooltip with the bucket label and every visible series' value and sample
+   count `n`. Legend chips toggle series. Never re-render while hovering.
+4. Table of Breakdown: key, requests, streamed %, TTFT p50 / p95, decode
+   tok/s p50 and weighted, E2E tok/s p50, latency p50 / p95 / p99. `null`
+   shows `—`. Sortable; row click drills down exactly like the usage table.
+5. Empty/partial states: no eligible rows → "No proxied requests in range".
+   Latency present but no TTFT samples → a note that TTFT and decode speed
+   are recorded only for streamed requests proxied since this feature.
+6. A short legend/footnote defines each metric (TTFT, decode speed, E2E
+   speed, latency) in plain words.
+7. Demo mode (`#demo=1`) serves deterministic synthetic performance data for
+   the new endpoint (plausible per-model TTFT/decode distributions).
+- Same constraints as the rest of the widget: single file, no external
+  loads, CSP unchanged, text only via `textContent`, light/dark, narrow
+  (~420 px) and wide.
+
+### Amendment 1 (post-review decisions)
+
+| # | Finding | Decision |
+|---|---|---|
+| A1 | Upstreams that buffer a whole stream into one read make G a few ms and rates ~1e5 tok/s | Decode samples require **G ≥ 50 ms** (table above). Faster/shorter decodes are too noisy to rate. |
+| A2 | `response.reasoning_summary_text.delta` counted as reasoning makes D include hidden reasoning produced before TTFT | **Keep** it as a reasoning event. Summaries stream while hidden reasoning continues, so counting reasoning tokens in D is closer to the true rate than subtracting them (which would divide visible tokens by a window mostly spent reasoning). The residual bias is the hidden reasoning before the first summary delta; documented, not corrected. |
+| A3 | Performance holds ~3 copies of every sample (529 MB/op at 1M rows) | Peak sample memory ≤ 2× one copy: compute per-point distributions first (sorting owned slices in place), then build each series total by concatenating its points' samples, and Totals from the series totals, releasing each level once used. Report B/op before/after. |
+| A4 | Ranking keeps every distinct key in maps (unbounded for group=task) | Rank like `Analytics` (bounded merge + heap; only the top `AnalyticsMaxBreakdown` keys get breakdown rows, the rest only count toward Totals/`__other__`). |
+| A5 | Perf errors log/return the analytics wording | Log `control: performance analytics failed`; 500 body `performance analytics failed`. |
+| W1 | `pm=toString` etc. passes validation (prototype keys) and breaks rendering | Validate hash values against explicit lists/own properties; same for `ps`. |
+| W2 | Union color assignment can give two perf lines the same color | Usage series keep today's colors. Perf-only keys take palette slots the usage view left free; they collide only if the perf chart itself needs more than 10. The usage table/legend keep the usage-only mapping (a usage "Other" row stays grey). |
+| W3 | Stale perf doc rendered after group/filter change when the fetch fails | Keep the last doc only if its group and filters equal the current view; otherwise show "Performance unavailable". |
+| W4 | Deferred tooltip mixes new bucket labels with old geometry | Tooltip reads bucket starts and values from the same rendered doc. |
+| W5 | Perf chart clears before the size check, leaving it blank during hover | Check size before clearing (perf chart only; the usage chart is unchanged in this feature). |
+| W6 | "Recorded only since <date>" can make a false claim | Use neutral wording without a date: shown when some buckets have eligible requests but no TTFT samples ("TTFT and decode speed exist only for streamed requests recorded since performance tracking was added; other requests show latency and E2E speed only."). |
+| W7 | `fmtMs(999.6)` → "1000 ms" | Round first, then choose the unit. |
+
+### Acceptance tests (performance)
+
+- P1 chat SSE: role-only first chunk does not set TTFT; the first content
+  delta does, at the fake clock time of the read that completed it.
+- P2 Responses SSE: created/in_progress/output_item.added don't count;
+  `response.output_text.delta` does; a reasoning-summary delta first sets
+  `FirstTokenReasoning`.
+- P3 chat `reasoning_content` first → reasoning; `content` first → not;
+  `tool_calls` first → counts, not reasoning.
+- P4 non-SSE JSON → `Streamed=false`, `TTFTMS=nil`; SSE with no output →
+  `Streamed=true`, `TTFTMS=nil`.
+- P5 an event split across reads is detected when it completes;
+  `TTFTMS ≤ LatencyMS`.
+- P6 ledger round trip of all three fields (NULL when nil); migration v4→v5
+  keeps existing rows with `ttft_ms` NULL and flags 0.
+- P7 eligibility: imported (latency 0), non-2xx and error rows excluded.
+- P8 exact percentiles (1..100 example), nil for empty sets.
+- P9 decode formula incl. hidden-reasoning subtraction, `D < 2` and
+  `G < 1` exclusion, usage-unknown rows counted in latency/TTFT only;
+  weighted formulas.
+- P10 grouping/filters/top/`__other__` pooled percentiles (a case where
+  pooled ≠ averaged), breakdown cap, ranking by requests, bucket alignment
+  identical to Analytics for the same query.
+- P11 validation errors identical to Analytics; row cap → 400.
+- P12 HTTP: defaults, 400s, 503, auth, nulls for empty distributions, no
+  null arrays.
+- P13 ingest accepts valid timing fields and rejects `ttft_ms > latency_ms`
+  or negative.
+- P14 widget self-contained test passes and references the new endpoint;
+  demo mode renders the section with no JS errors (light, dark, 420 px).
 
 ## Engineering constraints
 

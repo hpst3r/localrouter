@@ -332,7 +332,8 @@ func TestStackAliasIncompleteStreamChargesAtLeastTheHold(t *testing.T) {
 			h.startBudget(gate)
 
 			row := cancelAfterFirstEvent(t, h, 0, done)
-			rows, evs := settle(t, h, clk, 1, 2)
+			// 2 reads per attempt plus 1 for TTFT at the first output delta.
+			rows, evs := settle(t, h, clk, 1, 3)
 			if rows[0].ID != row.ID || row.PricingModel != stackBackendA || row.UsageKnown {
 				t.Fatalf("row = %+v, want aliased row with unknown usage", row)
 			}

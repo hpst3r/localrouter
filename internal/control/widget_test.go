@@ -42,7 +42,8 @@ func TestWidgetSelfContained(t *testing.T) {
 		t.Errorf("want exactly one inline <script>, got %d", n)
 	}
 	// Key behaviour carried over from the previous widget.
-	for _, want := range []string{"localrouter.controlKey", "/control/v1/status", "/control/v1/analytics", "demo"} {
+	for _, want := range []string{"localrouter.controlKey", "/control/v1/status", "/control/v1/analytics",
+		"/control/v1/analytics/performance", "demo"} {
 		if !strings.Contains(html, want) {
 			t.Errorf("widget missing %q", want)
 		}
@@ -70,5 +71,31 @@ func TestWidgetBreakdownOmitted(t *testing.T) {
 	}
 	if out, err := exec.Command(node, "--check", path).CombinedOutput(); err != nil {
 		t.Fatalf("widget script does not parse: %v\n%s", err, out)
+	}
+}
+
+// TestWidgetFmtMs: durations round before the unit is chosen (999.6 ms is
+// "1 s", never "1000 ms").
+func TestWidgetFmtMs(t *testing.T) {
+	html := string(indexHTML)
+	fn := regexp.MustCompile(`(?s)\n  function fmtMs\(v\) \{.*?\n  \}\n`).FindString(html)
+	if fn == "" {
+		t.Fatal("fmtMs not found in widget")
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	script := fn + `
+const cases = [[999.4, "999 ms"], [999.5, "1 s"], [999.6, "1 s"], [0, "0 ms"], [1234, "1.23 s"], [9996, "10 s"], [130000, "2.2 min"]];
+const bad = cases.filter(([v, want]) => fmtMs(v) !== want).map(([v, want]) => v + ": got " + fmtMs(v) + ", want " + want);
+if (bad.length) { console.log(bad.join("\n")); process.exit(1); }
+`
+	path := filepath.Join(t.TempDir(), "fmtms.js")
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command(node, path).CombinedOutput(); err != nil {
+		t.Fatalf("fmtMs: %v\n%s", err, out)
 	}
 }

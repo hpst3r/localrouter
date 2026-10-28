@@ -562,6 +562,17 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 
 	copyHeaders(w.Header(), resp.Header)
 	capture := newUsageCapture(resp.Header.Get("Content-Type"))
+	// markFirstOutput takes TTFT, at most once, as soon as the capture has
+	// seen the first output event — before those bytes reach the client.
+	markFirstOutput := func() {
+		if rec.TTFTMS != nil {
+			return
+		}
+		if seen, reasoning := capture.FirstOutput(); seen {
+			ms := max(p.clock.Now().Sub(rec.StartedAt).Milliseconds(), 0)
+			rec.TTFTMS, rec.FirstTokenReasoning = &ms, reasoning
+		}
+	}
 
 	// An upstream without a Content-Type (the Codex backend's streams) has its
 	// body sniffed by the capture. The status line waits for that decision so
@@ -623,6 +634,7 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 		}
 		if n > 0 {
 			_, _ = capture.Write(buf[:n])
+			markFirstOutput()
 			if !relay(buf[:n]) {
 				aborted = true
 				break
@@ -654,6 +666,12 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	}
 
 	usage, known := capture.Result()
+	// Result settled any undecided sniff, so the mode is final only now: an
+	// untyped (Codex) body may have been identified as SSE during the loop.
+	rec.Streamed = capture.sse
+	// Result flushed any final event not terminated by a blank line; it may
+	// be the first output.
+	markFirstOutput()
 	// A clean EOF is not proof the response finished: a successful event
 	// stream must also have delivered its protocol's terminal. Finality is
 	// never inferred from usage or cost, which an intermediate record can
@@ -757,13 +775,18 @@ func (p *Proxy) record(ctx context.Context, rec core.RequestRecord) core.Request
 	rec.Error = core.TruncateError(rec.Error)
 	rec.FinishedAt = p.clock.Now()
 	rec.LatencyMS = rec.FinishedAt.Sub(rec.StartedAt).Milliseconds()
-	p.log.Info("request",
+	attrs := []any{
 		"id", rec.ID, "client", rec.Client, "class", rec.Class, "model", rec.Model,
 		"account", rec.AccountID, "status", rec.Status, "latency_ms", rec.LatencyMS,
 		"usage_known", rec.UsageKnown, "input_tokens", rec.Usage.InputTokens,
 		"cached_input_tokens", rec.Usage.CachedInputTokens, "output_tokens", rec.Usage.OutputTokens,
 		"reasoning_tokens", rec.Usage.ReasoningTokens, "bytes_out", rec.BytesOut,
-		"failover_of", rec.FailoverOf, "error", rec.Error)
+		"failover_of", rec.FailoverOf, "error", rec.Error, "streamed", rec.Streamed,
+	}
+	if rec.TTFTMS != nil {
+		attrs = append(attrs, "ttft_ms", *rec.TTFTMS)
+	}
+	p.log.Info("request", attrs...)
 	if p.deps.Ledger == nil {
 		return rec
 	}

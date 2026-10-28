@@ -176,6 +176,89 @@ type usageCapture struct {
 	// object. See Completed.
 	sawDone        bool
 	sawResponseEnd bool
+
+	// First-output detection for TTFT (SSE only). Once firstSeen is set no
+	// further event is decoded for it. firstDecodes counts those decodes.
+	firstSeen      bool
+	firstReasoning bool
+	firstDecodes   int
+}
+
+// firstOutputJSON is the minimal shape decoded to detect a first-output
+// event: a Responses event's type and delta, or chat choices' deltas.
+type firstOutputJSON struct {
+	Type    string          `json:"type"`
+	Delta   json.RawMessage `json:"delta"`
+	Choices []struct {
+		Delta struct {
+			Content          json.RawMessage `json:"content"`
+			Refusal          json.RawMessage `json:"refusal"`
+			ReasoningContent json.RawMessage `json:"reasoning_content"`
+			Reasoning        json.RawMessage `json:"reasoning"`
+			ToolCalls        json.RawMessage `json:"tool_calls"`
+			FunctionCall     json.RawMessage `json:"function_call"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
+
+// detectFirstOutput reports whether the event is a first-output event and
+// whether it is a reasoning event (SPEC "Performance metrics → Capture").
+func detectFirstOutput(event string, data []byte) (output, reasoning bool) {
+	var ev firstOutputJSON
+	if json.Unmarshal(data, &ev) != nil {
+		return false, false
+	}
+	typ := ev.Type
+	if typ == "" {
+		typ = event
+	}
+	if strings.HasPrefix(typ, "response.") && strings.HasSuffix(typ, ".delta") {
+		if !jsonNonEmpty(ev.Delta) {
+			return false, false
+		}
+		return true, strings.Contains(typ, "reasoning")
+	}
+	var visible, thinking bool
+	for _, ch := range ev.Choices {
+		d := ch.Delta
+		visible = visible || jsonNonEmptyString(d.Content) || jsonNonEmptyString(d.Refusal) ||
+			jsonNonEmptyArray(d.ToolCalls) || jsonNonNull(d.FunctionCall)
+		thinking = thinking || jsonNonEmptyString(d.ReasoningContent) || jsonNonEmptyString(d.Reasoning)
+	}
+	return visible || thinking, thinking && !visible
+}
+
+// jsonNonNull reports whether raw is present and not null.
+func jsonNonNull(raw json.RawMessage) bool {
+	raw = bytes.TrimSpace(raw)
+	return len(raw) > 0 && !bytes.Equal(raw, []byte("null"))
+}
+
+// jsonNonEmpty reports whether raw is present and none of null, "", [] or {}.
+func jsonNonEmpty(raw json.RawMessage) bool {
+	raw = bytes.TrimSpace(raw)
+	if !jsonNonNull(raw) {
+		return false
+	}
+	switch raw[0] {
+	case '"':
+		return len(raw) > 2
+	case '[', '{':
+		return len(bytes.TrimSpace(raw[1:len(raw)-1])) > 0
+	}
+	return true
+}
+
+// jsonNonEmptyString reports whether raw is a non-empty JSON string.
+func jsonNonEmptyString(raw json.RawMessage) bool {
+	raw = bytes.TrimSpace(raw)
+	return len(raw) > 2 && raw[0] == '"'
+}
+
+// jsonNonEmptyArray reports whether raw is a non-empty JSON array.
+func jsonNonEmptyArray(raw json.RawMessage) bool {
+	raw = bytes.TrimSpace(raw)
+	return len(raw) > 0 && raw[0] == '[' && jsonNonEmpty(raw)
 }
 
 // doneSentinel is the chat completions stream terminal's data payload.
@@ -363,6 +446,10 @@ func (c *usageCapture) dispatch() {
 		c.sawDone = true
 		return
 	}
+	if !c.firstSeen && bytes.Contains(data, []byte("delta")) {
+		c.firstDecodes++
+		c.firstSeen, c.firstReasoning = detectFirstOutput(event, data)
+	}
 	if !bytes.Contains(data, []byte(`"usage"`)) && !mayEndResponse(event, data) {
 		return
 	}
@@ -458,6 +545,14 @@ func (c *usageCapture) Result() (core.Usage, bool) {
 // a cost-only usage object still yields a value. Call it after Result so any
 // final event buffered without a trailing blank line has been flushed.
 func (c *usageCapture) ReportedCost() *float64 { return c.reportedCost }
+
+// FirstOutput reports whether a first-output event (the first content,
+// refusal, reasoning or tool-call delta) has been dispatched so far, and
+// whether that event was a reasoning event. A non-SSE capture always returns
+// false. It does not flush a final unterminated event; Result does.
+func (c *usageCapture) FirstOutput() (seen bool, reasoning bool) {
+	return c.firstSeen, c.firstReasoning
+}
 
 // Completed reports whether the response reached its protocol's own terminal,
 // independently of any usage or cost it carried. Call it after the body was

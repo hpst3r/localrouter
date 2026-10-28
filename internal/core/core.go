@@ -301,6 +301,23 @@ type RequestRecord struct {
 	ReportedCostUSD *float64 `json:"reported_cost_usd,omitempty"`
 	// CostUSD/CostBasis are resolved by the ledger: valid OpenRouter reported
 	// costs take precedence; otherwise known token usage uses local pricing.
+
+	// TTFTMS is the time to first token: milliseconds from StartedAt until
+	// the proxy read the first upstream SSE event carrying generated output
+	// (a text, refusal, tool-call or reasoning delta; see SPEC "Performance
+	// metrics"). nil = unknown: non-streamed responses, streams that ended
+	// before any output, attempts that never streamed, and imported rows.
+	// When set, 0 <= *TTFTMS <= LatencyMS.
+	TTFTMS *int64 `json:"ttft_ms,omitempty"`
+	// Streamed is true when the upstream response was an SSE stream
+	// (Content-Type text/event-stream) that the proxy relayed.
+	Streamed bool `json:"streamed,omitempty"`
+	// FirstTokenReasoning is true when the first output event observed was
+	// a reasoning delta (reasoning/thinking text or a reasoning summary). It
+	// tells the decode-rate computation whether reasoning tokens were
+	// produced inside the measured decode window. Only meaningful when
+	// TTFTMS is set.
+	FirstTokenReasoning bool `json:"first_token_reasoning,omitempty"`
 }
 
 // UsageRow is one aggregate row.
@@ -402,6 +419,84 @@ type AnalyticsResult struct {
 // AnalyticsLedger is implemented by ledgers that support time-series analytics.
 type AnalyticsLedger interface {
 	Analytics(ctx context.Context, q AnalyticsQuery) (AnalyticsResult, error)
+}
+
+// Dist summarizes one sample distribution. Percentiles interpolate linearly
+// between closest ranks: for sorted samples x[0..n-1] and p in [0,1],
+// h = (n-1)*p, value = x[floor h] + (h - floor h)*(x[ceil h] - x[floor h]).
+// A Dist is only ever produced with N >= 1 (empty distributions are nil).
+type Dist struct {
+	N    int64   `json:"n"`
+	Mean float64 `json:"mean"`
+	Min  float64 `json:"min"`
+	P01  float64 `json:"p01"`
+	P05  float64 `json:"p05"`
+	P10  float64 `json:"p10"`
+	P50  float64 `json:"p50"`
+	P90  float64 `json:"p90"`
+	P95  float64 `json:"p95"`
+	P99  float64 `json:"p99"`
+	Max  float64 `json:"max"`
+}
+
+// PerfRow is one performance aggregate (a group key's total, a time-series
+// point, or the overall totals). Eligibility and formulas: SPEC
+// "Performance metrics". Every *Dist / *float64 is nil when it has no
+// samples, so JSON shows null rather than a misleading 0.
+type PerfRow struct {
+	Key string `json:"key"`
+	// Requests counts perf-eligible rows (proxied, 2xx, no error).
+	Requests int64 `json:"requests"`
+	// StreamedRequests counts eligible rows with Streamed = true.
+	StreamedRequests int64 `json:"streamed_requests"`
+	// LatencyMS: end-to-end attempt latency over every eligible row.
+	LatencyMS *Dist `json:"latency_ms"`
+	// TTFTMS: time to first token over eligible rows with ttft_ms set.
+	TTFTMS *Dist `json:"ttft_ms"`
+	// DecodeTPS: per-request decode rate in tokens/s after the first token.
+	DecodeTPS *Dist `json:"decode_tps"`
+	// E2ETPS: per-request output tokens / end-to-end latency, tokens/s.
+	E2ETPS *Dist `json:"e2e_tps"`
+	// DecodeTPSWeighted = sum(decode tokens - 1) / sum(decode seconds) over
+	// the DecodeTPS samples (a token-weighted aggregate rate).
+	DecodeTPSWeighted *float64 `json:"decode_tps_weighted"`
+	// E2ETPSWeighted = sum(output tokens) / sum(latency seconds) over the
+	// E2ETPS samples.
+	E2ETPSWeighted *float64 `json:"e2e_tps_weighted"`
+}
+
+// PerfSeries is one group's performance time series aligned with
+// BucketStarts.
+type PerfSeries struct {
+	Key    string    `json:"key"`
+	Total  PerfRow   `json:"total"`
+	Points []PerfRow `json:"points"` // len == len(BucketStarts); Key empty
+}
+
+// PerfResult answers a performance query. Ranking ("top") is by eligible
+// Requests desc, ties by key asc. Same windowing, bucketing, filters and
+// breakdown cap as AnalyticsResult.
+type PerfResult struct {
+	SchemaVersion    int               `json:"schema_version"`
+	From             time.Time         `json:"from"`
+	To               time.Time         `json:"to"`
+	Bucket           string            `json:"bucket"`
+	BucketStarts     []time.Time       `json:"bucket_starts"`
+	Group            string            `json:"group"`
+	Filters          map[string]string `json:"filters"`
+	Totals           PerfRow           `json:"totals"`
+	Breakdown        []PerfRow         `json:"breakdown"`
+	BreakdownOmitted int               `json:"breakdown_omitted"`
+	// Series has the top N keys in rank order, then AnalyticsOtherKey if
+	// any. Percentiles of "other" are computed over the pooled samples of
+	// every non-top key (never averaged percentiles).
+	Series []PerfSeries `json:"series"`
+}
+
+// PerfLedger is implemented by ledgers that answer performance analytics.
+// q is validated exactly like AnalyticsLedger.Analytics (same errors).
+type PerfLedger interface {
+	Performance(ctx context.Context, q AnalyticsQuery) (PerfResult, error)
 }
 
 // Ledger persists request records and answers summaries.

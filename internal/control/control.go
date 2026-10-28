@@ -144,6 +144,7 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /control/v1/usage", s.auth(http.HandlerFunc(s.usage)))
 	mux.Handle("GET /control/v1/analytics", s.auth(http.HandlerFunc(s.analytics)))
 	mux.Handle("GET /control/v1/analytics/dimensions", s.auth(http.HandlerFunc(s.analyticsDimensions)))
+	mux.Handle("GET /control/v1/analytics/performance", s.auth(http.HandlerFunc(s.analyticsPerformance)))
 	mux.Handle("GET /control/v1/diagnostics", s.auth(http.HandlerFunc(s.diagnostics)))
 	mux.Handle("GET /control/v1/budgets", s.auth(http.HandlerFunc(s.budgets)))
 	mux.Handle("POST /control/v1/admit", s.auth(http.HandlerFunc(s.admit)))
