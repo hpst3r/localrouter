@@ -385,19 +385,33 @@ responses stay JSON-encodable.
   Non-stream JSON capture is bounded to 16 MiB; oversized bodies are still
   relayed, but their usage and cost are left unknown.
 - Mode: an upstream `Content-Type` starting with `text/event-stream` is SSE and
-  any other present value is JSON; the body never overrides it. A response
-  with NO `Content-Type` (the Codex backend sends none on its streams) is
-  sniffed: after leading whitespace, `{` means JSON and an SSE field or
-  comment start (`event:`, `data:`, `id:`, `retry:`, `:`) means SSE. The
-  sniff buffers at most 64 KiB; a body still undecided past that, or at end
-  of body, is JSON (unless its bytes already identify SSE).
-- Relay header rule: when the upstream sent no `Content-Type` and the sniff
-  decided SSE, the client response carries `Content-Type: text/event-stream`.
-  The status line is held until the sniff decides (bounded by the 64 KiB cap
-  and by the stream idle timeout; end of body or a read error also decides),
-  and the bytes read meanwhile are then relayed unchanged. A sniffed JSON body
-  is relayed byte-for-byte with no `Content-Type` added. An upstream
-  `Content-Type` that is present is never overridden.
+  any other non-empty value is JSON; the body never overrides it. A response
+  with NO `Content-Type` (absent, or present but empty; the Codex backend
+  sends none on its streams) is sniffed: after an optional leading UTF-8 BOM
+  and leading whitespace, `{` means JSON and an SSE field or comment start
+  (`event:`, `data:`, `id:`, `retry:`, `:`) means SSE. The sniff buffers up
+  to 64 KiB plus at most one read chunk; a body still undecided past that, or
+  at end of body, is JSON (unless its bytes already identify SSE).
+- Relay header rule: when the upstream sent no `Content-Type` (absent or
+  empty) and the sniff decided SSE, the client response carries
+  `Content-Type: text/event-stream`. The status line is held until the sniff
+  decides (bounded by the sniff cap above and by the stream idle timeout; end
+  of body or a read error also decides), and the bytes read meanwhile are
+  then relayed unchanged. A sniffed JSON body is relayed byte-for-byte with no
+  `Content-Type` added. A non-empty upstream `Content-Type` is never
+  overridden.
+- Amendment R2 (final-review findings FCX-1..FCX-4):
+  - R2.1 A leading UTF-8 BOM (`EF BB BF`, allowed by the SSE spec) is skipped
+    by the sniff and by the SSE usage parser; the relayed bytes keep it.
+  - R2.2 An empty `Content-Type` header is treated exactly like an absent one
+    (sniffed, and relayed as `text/event-stream` when SSE).
+  - R2.3 The sniff holds up to 64 KiB plus at most one read chunk (≤ 32 KiB)
+    before it gives up and decides JSON.
+  - R2.4 Intended behavior change: sniffing applies to an untyped response
+    from ANY provider, not only Codex. An untyped body sniffed as SSE is held
+    to its protocol's SSE terminal rule (e.g. `[DONE]` or `response.completed`),
+    so such a stream without its terminal is now recorded as unterminated,
+    where before it counted as complete JSON with unknown usage.
 - Codex prompt-cache affinity: the Codex backend reuses its prompt cache only
   for requests carrying a `session_id` header. For a Codex attempt whose
   client sent no `session_id` (any case), LocalRouter sends `session_id` (that
@@ -745,8 +759,9 @@ JSON object; assistant entries carry `message.usage` and `message.model`,
     activity lies inside [after, before): `session_model_usage.first_seen`
     ≥ after (Hermes sets `first_seen` once when it inserts the row and never
     updates it; `last_seen` is updated on every call) and `last_seen` <
-    before. A row without `first_seen` (NULL, or an older schema without the
-    column) whose `last_seen` is in [after, before) is listed under `review`
+    before. A row without `first_seen` (NULL, an older schema without the
+    column, or a `first_seen` later than `last_seen`, which is inconsistent and
+    treated as unknown; Amendment R2, FCX-5) whose `last_seen` is in [after, before) is listed under `review`
     with a warning that calls in the same session before `--after` are
     included; `--apply` records review rows only with
     `--accept-partial-sessions`. Rows with no `last_seen`, `last_seen` ≥

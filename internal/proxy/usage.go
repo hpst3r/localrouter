@@ -215,11 +215,18 @@ func newUsageCapture(contentType string) *usageCapture {
 	return &usageCapture{sse: strings.HasPrefix(ct, "text/event-stream"), sniffing: ct == ""}
 }
 
+// utf8BOM is the byte order mark the SSE spec allows before a stream.
+var utf8BOM = []byte("\xEF\xBB\xBF")
+
 // sniffSSE decides the mode of an untyped body from its first non-whitespace
-// bytes: an SSE field or comment start means SSE, anything else (including
-// "{") JSON. decided is false while b could still become either.
+// bytes after any leading UTF-8 BOM: an SSE field or comment start means SSE,
+// anything else (including "{") JSON. decided is false while b could still
+// become either.
 func sniffSSE(b []byte) (sse, decided bool) {
-	rest := bytes.TrimLeft(b, " \t\r\n")
+	if len(b) < len(utf8BOM) && bytes.HasPrefix(utf8BOM, b) {
+		return false, false
+	}
+	rest := bytes.TrimLeft(bytes.TrimPrefix(b, utf8BOM), " \t\r\n")
 	if len(rest) == 0 {
 		return false, false
 	}
@@ -238,11 +245,15 @@ func sniffSSE(b []byte) (sse, decided bool) {
 	return false, !partial
 }
 
-// decide ends sniffing in the given mode and replays the buffered bytes.
+// decide ends sniffing in the given mode and replays the buffered bytes, less
+// a leading BOM when SSE (the relayed bytes are not affected).
 func (c *usageCapture) decide(sse bool) {
 	c.sniffing, c.sse = false, sse
 	pending := c.pending
 	c.pending = nil
+	if sse {
+		pending = bytes.TrimPrefix(pending, utf8BOM)
+	}
 	_, _ = c.Write(pending)
 }
 

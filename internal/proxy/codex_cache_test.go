@@ -270,6 +270,41 @@ func TestUsageCapturedFromSSEWithoutContentType(t *testing.T) {
 	}
 }
 
+// A leading UTF-8 BOM (allowed by the SSE spec) does not hide an untyped
+// stream: it is still sniffed as SSE, its usage parses, and the relayed bytes
+// keep the BOM.
+func TestUsageCapturedFromSSEWithBOM(t *testing.T) {
+	stream := "\xEF\xBB\xBF" + codexLiveStream()
+	for _, step := range []int{1, 2, 4096} {
+		h := newHarness(t)
+		h.upstream("a", core.ProviderCodex, func(w http.ResponseWriter, _ *http.Request) {
+			noContentType(w)
+			f := w.(http.Flusher)
+			for i := 0; i < len(stream); i += step {
+				_, _ = io.WriteString(w, stream[i:min(i+step, len(stream))])
+				if i < 8 {
+					f.Flush()
+				}
+			}
+		})
+		singleRoute(h, "a")
+		h.start()
+		resp := h.post("/v1/responses", clientKey, `{"model":"gpt-x","input":"hi","stream":true}`, nil)
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(body) != stream {
+			t.Fatalf("step %d: relayed body differs (len %d vs %d)", step, len(body), len(stream))
+		}
+		if ct := resp.Header.Values("Content-Type"); len(ct) != 1 || ct[0] != "text/event-stream" {
+			t.Fatalf("step %d: client got Content-Type %q", step, ct)
+		}
+		row := h.waitRows(1)[0]
+		if !row.UsageKnown || row.Usage.InputTokens != 3521 || row.Error != "" {
+			t.Fatalf("step %d: row usage %+v known=%v err=%q", step, row.Usage, row.UsageKnown, row.Error)
+		}
+	}
+}
+
 func TestUsageCapturedFromJSONWithoutContentType(t *testing.T) {
 	const payload = "\n  {\"id\":\"r1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":3,\"input_tokens_details\":{\"cached_tokens\":4},\"output_tokens_details\":{\"reasoning_tokens\":1}}}"
 	h := newHarness(t)
@@ -312,6 +347,14 @@ func TestUsageCaptureSniffing(t *testing.T) {
 			if c.sse != tc.sse {
 				t.Fatalf("%s step %d: sse=%v", name, step, c.sse)
 			}
+		}
+	}
+	// A leading BOM is skipped, also when split across writes.
+	for _, step := range []int{1, 2, 3, 1 << 20} {
+		c := newUsageCapture("")
+		feed(c, "\xEF\xBB\xBF"+sse, step)
+		if u, ok := c.Result(); !ok || u != want || !c.sse {
+			t.Fatalf("bom step %d: %+v %v sse=%v", step, u, ok, c.sse)
 		}
 	}
 	for _, prefix := range []string{"event: x\n", "data: x\n", "id: 1\n", "retry: 5\n", ": c\n"} {
