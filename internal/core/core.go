@@ -466,6 +466,15 @@ type Route struct {
 	// background, and unknown keys are rejected. A nil/empty map means the
 	// route is unconstrained (legacy permissive behaviour).
 	Upstreams map[string]UpstreamSpec
+	// DiscoverModels opts the route into serving model ids discovered from its
+	// candidates' GET {base_url}/models listings (see docs/SPEC.md, "Model
+	// discovery"). false keeps the static-only legacy behaviour.
+	DiscoverModels bool
+	// DiscoverInterval is the polling interval for this route's candidates;
+	// set (default 5m) only when DiscoverModels is true.
+	DiscoverInterval time.Duration
+	// DiscoverMatch are path.Match globs a discovered id must pass; nil = all.
+	DiscoverMatch []string
 	// BalanceStrategy, when non-empty, turns the route's candidates into a
 	// pool of equal peers (routes[].balance): every candidate is a member and
 	// the policy picks among them by strategy instead of first-admissible.

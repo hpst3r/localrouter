@@ -74,8 +74,38 @@ type Deps struct {
 	// the generation. Like ReloadStatus it is consulted per request, so a
 	// reload publishes a fresh source without restarting the server.
 	Budgets BudgetSource
+	// Discovery resolves discovered model ids for findRoute (check_admission)
+	// with the proxy's rules, minus the on-demand refresh, and supplies the
+	// diagnostics "discovery" block. Nil when no route discovers: findRoute
+	// and the diagnostics document are then exactly the static-only ones.
+	Discovery Discovery
+	// ModelCheck supplies the diagnostics "model_check" block. Nil when the
+	// backend model check is disabled: the block is then omitted.
+	ModelCheck ModelCheck
 	// Clock defaults to core.SystemClock.
 	Clock core.Clock
+}
+
+// Discovery is the control server's view of route-level model discovery. It
+// is satisfied by *internal/discovery.Resolver.
+type Discovery interface {
+	// Resolve returns the discovering route serving model, with its candidate
+	// lists narrowed to the accounts that list it (either may be empty).
+	// ambiguous reports that more than one discovering route claims model,
+	// so none serves it. Static models never resolve here; findRoute checks
+	// them first.
+	Resolve(model string) (route core.Route, ok, ambiguous bool)
+	// Diagnostics returns the JSON-encodable "discovery" block. It must carry
+	// no URLs, keys or upstream bodies.
+	Diagnostics() any
+}
+
+// ModelCheck is the control server's view of the backend model check. It is
+// satisfied by *internal/modelcheck.Checker.
+type ModelCheck interface {
+	// Diagnostics returns the JSON-encodable "model_check" block. It must
+	// carry no URLs, keys or upstream bodies.
+	Diagnostics() any
 }
 
 // Options tune the control server.
@@ -718,7 +748,11 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 		}
 		candidates = []string{req.Account}
 	} else {
-		route, ok := s.findRoute(req.Model)
+		route, ok, ambiguous := s.findRoute(req.Model, class)
+		if ambiguous {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("model %q is claimed by more than one discovering route", req.Model))
+			return
+		}
 		if !ok {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("no route for model %q", req.Model))
 			return
@@ -759,16 +793,27 @@ func (s *Server) admit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) findRoute(model string) (core.Route, bool) {
+// findRoute resolves model for class with the proxy's rules, minus the
+// on-demand refresh: a static entry first, then discovery. A discovered model
+// that only the other class's accounts list is no route for class.
+func (s *Server) findRoute(model string, class core.Class) (route core.Route, ok, ambiguous bool) {
 	if model == "" {
-		return core.Route{}, false
+		return core.Route{}, false, false
 	}
 	for _, rt := range s.deps.Routes {
 		if slices.Contains(rt.Models, model) {
-			return rt, true
+			return rt, true, false
 		}
 	}
-	return core.Route{}, false
+	if s.deps.Discovery == nil {
+		return core.Route{}, false, false
+	}
+	route, ok, ambiguous = s.deps.Discovery.Resolve(model)
+	if ok && len(route.Interactive) == 0 && class == core.ClassInteractive ||
+		ok && len(route.Background) == 0 && class == core.ClassBackground {
+		return core.Route{}, false, false
+	}
+	return route, ok, ambiguous
 }
 
 // writeJSON encodes v before writing the header, so a value json cannot

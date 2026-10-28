@@ -27,7 +27,7 @@ const (
 )
 
 // forwardedHeaders are the only client request headers sent upstream.
-var forwardedHeaders = []string{"Content-Type", "Accept", "OpenAI-Beta", "session_id", "conversation_id", "x-request-id"}
+var forwardedHeaders = []string{"Content-Type", "Accept", "OpenAI-Beta", "session_id", "conversation_id", "x-request-id", "X-Codex-Turn-State"}
 
 // hopHeaders are stripped from upstream responses.
 var hopHeaders = []string{
@@ -503,8 +503,9 @@ func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cr
 	if err != nil {
 		return nil, err
 	}
+	var sessionID string // Codex only; see sessionIDFromCacheKey
 	if account.Provider == core.ProviderCodex {
-		body = codexBody(body)
+		body, sessionID = codexBody(body)
 	}
 	up, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
@@ -519,6 +520,11 @@ func (p *Proxy) send(ctx context.Context, req *request, account core.Account, cr
 	}
 	if up.Header.Get("Content-Type") == "" {
 		up.Header.Set("Content-Type", "application/json")
+	}
+	// A client-supplied session_id always wins. The key is set directly so it
+	// goes out with the literal lowercase name the Codex backend uses.
+	if sessionID != "" && !hasHeaderFold(req.header, "session_id") {
+		up.Header["session_id"] = []string{sessionID}
 	}
 	for k, v := range cred.Headers {
 		up.Header[k] = append([]string(nil), v...)
@@ -546,10 +552,28 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 	}
 
 	copyHeaders(w.Header(), resp.Header)
-	w.WriteHeader(resp.StatusCode)
-	_ = rc.Flush()
-
 	capture := newUsageCapture(resp.Header.Get("Content-Type"))
+
+	// An upstream without a Content-Type (the Codex backend's streams) has its
+	// body sniffed by the capture. The status line waits for that decision so
+	// an event stream is relayed as text/event-stream; the bytes read meanwhile
+	// (bounded by maxSniffBytes plus one chunk, and in time by the idle
+	// timeout) are held and then relayed unchanged. An upstream Content-Type
+	// is never overridden.
+	var held []byte
+	headerSent := false
+	sendHeader := func() {
+		headerSent = true
+		if capture.sse && resp.Header.Get("Content-Type") == "" {
+			w.Header().Set("Content-Type", "text/event-stream")
+		}
+		w.WriteHeader(resp.StatusCode)
+		_ = rc.Flush()
+	}
+	if capture.Decided() {
+		sendHeader()
+	}
+
 	buf := make([]byte, streamChunkSize)
 	var (
 		written  int64
@@ -557,6 +581,29 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 		idledOut bool
 		readErr  error
 	)
+	// relay writes b to the client, sending the held status line and bytes
+	// first once the capture has decided (or end decides for it). It reports
+	// false if the client write failed.
+	relay := func(b []byte) bool {
+		if !headerSent {
+			if !capture.Decided() {
+				held = append(held, b...)
+				return true
+			}
+			sendHeader()
+			b, held = append(held, b...), nil
+		}
+		if len(b) == 0 {
+			return true
+		}
+		wn, werr := w.Write(b)
+		written += int64(wn)
+		if werr != nil {
+			return false
+		}
+		_ = rc.Flush()
+		return true
+	}
 	for {
 		if timer != nil {
 			timer.Reset(p.opts.StreamIdleTimeout)
@@ -567,13 +614,19 @@ func (p *Proxy) stream(w http.ResponseWriter, r *http.Request, req *request, res
 		}
 		if n > 0 {
 			_, _ = capture.Write(buf[:n])
-			wn, werr := w.Write(buf[:n])
-			written += int64(wn)
-			if werr != nil {
+			if !relay(buf[:n]) {
 				aborted = true
 				break
 			}
-			_ = rc.Flush()
+		}
+		if err != nil && !headerSent {
+			// The body ended (or failed) while still undecided: settle the
+			// mode from what arrived and relay it.
+			capture.settle()
+			if !relay(nil) {
+				aborted = true
+				break
+			}
 		}
 		if err == io.EOF {
 			break
@@ -795,6 +848,17 @@ func relayFailure(w http.ResponseWriter, f *failure) {
 	copyHeaders(w.Header(), f.header)
 	w.WriteHeader(f.status)
 	_, _ = w.Write(f.body)
+}
+
+// hasHeaderFold reports whether h has a key equal to name ignoring case,
+// canonical or not.
+func hasHeaderFold(h http.Header, name string) bool {
+	for k := range h {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func copyHeaders(dst, src http.Header) {

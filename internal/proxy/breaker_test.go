@@ -369,6 +369,44 @@ func TestB10ClassifiesTransportErrors(t *testing.T) {
 	}
 }
 
+// FBR-3 (R2.3): a *url.Error from before the request reached the network (a
+// malformed URL, an unsupported scheme, a request the client refuses to
+// build) is a configuration error, not unreachability.
+func TestFBR3PreTransportURLErrorsDoNotCount(t *testing.T) {
+	_, parseErr := http.NewRequest(http.MethodPost, "http://[::1/v1", nil)
+	var dials atomic.Int64
+	c := deadClient(&dials)
+	do := func(target string, hdr http.Header) error {
+		req, err := http.NewRequest(http.MethodPost, target, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", target, err)
+		}
+		for k, v := range hdr {
+			req.Header[k] = v
+		}
+		resp, err := c.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			t.Fatalf("%s: unexpected response", target)
+		}
+		return err
+	}
+	for name, err := range map[string]error{
+		"malformed url":      parseErr,
+		"unsupported scheme": do("ftp://"+deadHost+"/", nil),
+		"no scheme":          do(deadHost+"/v1", nil),
+		"no host":            do("http:///v1", nil),
+		"invalid header":     do("http://"+deadHost+"/", http.Header{"Bad\nName": {"x"}}),
+	} {
+		if got := unreachableClass(err); got != "" {
+			t.Errorf("%s (%v) classified %q, want not counted", name, err, got)
+		}
+	}
+	if n := dials.Load(); n != 0 {
+		t.Errorf("%d dials for requests that never reached the network", n)
+	}
+}
+
 // TestB14DeadUpstreamRequestCount drives 60 s of continuous client traffic
 // (one request every 100 ms) at a dead single-candidate upstream with
 // threshold 3, base 5s, max 60s, and counts upstream attempts: 3 to open,

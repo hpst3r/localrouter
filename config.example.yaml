@@ -75,6 +75,27 @@ routes:
     models: [deepseek-v4.1-flash, kimi-k3]
     interactive: [ollama-cloud]
     background:  [ollama-cloud]
+  # Model discovery (optional): serve whatever ids the candidates' GET
+  # {base_url}/models lists, instead of listing models by hand. Candidates must
+  # be openai_compat or ollama accounts, and upstream_model must stay empty.
+  # discover_match globs use Go path.Match, so "*" does not cross "/": write
+  # "unsloth/*" or "*/*", not "*". An id two discovering routes would both
+  # serve is refused (404) until discover_match or a static entry settles it.
+  # - name: llama-lab
+  #   discover_models: true
+  #   discover_interval: 5m          # default 5m; within [30s, 24h]
+  #   discover_match: ["unsloth/*"]  # optional path.Match globs; absent = all ids
+  #   interactive: [llama-lab]
+  #   background:  [llama-lab]
+
+# Backend model check (optional, restart-only): every interval, compare each
+# static route's backend model id with its openai_compat/ollama candidates'
+# GET {base_url}/models listings and report drift in diagnostics and the log
+# (it never changes routing). Absent or 0 = disabled. One-shot equivalent:
+# `localrouter check -probe`.
+# model_check:
+#   interval: 5m                 # within [30s, 24h]
+
   # Pooled self-hosted replicas (routes[].balance): spread one alias over
   # equal llama-server boxes by weighted least in-flight instead of "first
   # admissible wins". Members must equal interactive ∪ background, share one

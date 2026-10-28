@@ -57,6 +57,9 @@ type poolScan struct {
 	denial   string
 	accounts []string // breaker or saturated members, per denial
 	retryAt  time.Time
+	// br is the breaker-knob snapshot used for both selection and the lease
+	// (breaker Amendment R2.1).
+	br BreakerOptions
 }
 
 // AcquireBalanced selects a member of a pooled route (route.BalanceStrategy
@@ -91,7 +94,7 @@ func (p *Policy) AcquireBalanced(class core.Class, candidates []string, exclude 
 	if s.key != "" {
 		p.aff.put(s.key, s.id, s.now.Add(route.BalanceStickyTTL))
 	}
-	base := p.leaseLocked(s.id)
+	base := p.leaseLocked(s.id, s.br)
 	return &PoolLease{lease: base, pick: s.pick, inflight: p.state[s.id].inflight, cap: s.cap}, s.dec, "", nil, 0
 }
 
@@ -116,7 +119,7 @@ func (p *Policy) AffinityEntries(route string) int {
 // scanPoolLocked is the pooled selection pass. It mutates nothing but what
 // admitLocked may (clearing an expired cooldown). p.mu must be held.
 func (p *Policy) scanPoolLocked(c *cfg, class core.Class, candidates []string, exclude map[string]bool, route core.Route, session string) poolScan {
-	s := poolScan{now: c.opts.Clock.Now()}
+	s := poolScan{now: c.opts.Clock.Now(), br: p.breakerOpts()}
 	type member struct {
 		id                 string
 		inflight, w, limit int
@@ -140,7 +143,7 @@ func (p *Policy) scanPoolLocked(c *cfg, class core.Class, candidates []string, e
 			continue
 		}
 		st := p.state[id]
-		if blocked, why, at := breakerBlocks(p.breakerOpts(), &st.br, s.now); blocked {
+		if blocked, why, at := breakerBlocks(s.br, &st.br, s.now); blocked {
 			reasons = append(reasons, id+": "+why)
 			unreachable = append(unreachable, id)
 			if s.retryAt.IsZero() || at.Before(s.retryAt) {

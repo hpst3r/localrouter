@@ -7,7 +7,7 @@ import (
 
 func TestCodexBodyStripsRejectedFieldsAndForcesStoreFalse(t *testing.T) {
 	in := []byte(`{"model":"m","input":[{"role":"user","content":"<b>&"}],"max_output_tokens":10,"metadata":{"a":1},"store":true,"stream":true}`)
-	out := codexBody(in)
+	out, _ := codexBody(in)
 	var m map[string]json.RawMessage
 	if err := json.Unmarshal(out, &m); err != nil {
 		t.Fatal(err)
@@ -30,14 +30,14 @@ func TestCodexBodyStripsRejectedFieldsAndForcesStoreFalse(t *testing.T) {
 
 func TestCodexBodyUnchangedWhenAlreadyClean(t *testing.T) {
 	in := []byte(`{"model":"m","store":false}`)
-	if got := codexBody(in); string(got) != string(in) {
+	if got, _ := codexBody(in); string(got) != string(in) {
 		t.Fatalf("clean body rewritten: %s", got)
 	}
 }
 
 func TestCodexBodyNonObjectPassthrough(t *testing.T) {
 	in := []byte(`[1,2]`)
-	if got := codexBody(in); string(got) != string(in) {
+	if got, _ := codexBody(in); string(got) != string(in) {
 		t.Fatalf("non-object altered: %s", got)
 	}
 }

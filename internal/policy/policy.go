@@ -164,17 +164,18 @@ func (p *Policy) Acquire(class core.Class, candidates []string, exclude map[stri
 		c.opts.Logger.Info("policy denied", "class", class, "reason", sel.dec.Reason)
 		return nil, sel.dec
 	}
-	return p.leaseLocked(sel.id), sel.dec
+	return p.leaseLocked(sel.id, sel.br), sel.dec
 }
 
 // leaseLocked creates the lease on an admitted account. Admitting a half-open
 // account makes this lease its single breaker probe for the current epoch,
-// atomically with the admission decision. p.mu must be held.
-func (p *Policy) leaseLocked(id string) *lease {
+// atomically with the admission decision. br is the knob snapshot the
+// selection used. p.mu must be held.
+func (p *Policy) leaseLocked(id string, br BreakerOptions) *lease {
 	st := p.state[id]
 	st.inflight++
 	l := &lease{p: p, id: id, epoch: st.br.epoch}
-	if p.breakerOpts().enabled() && st.br.tripped {
+	if br.enabled() && st.br.tripped {
 		st.br.probe, l.probe = true, true
 	}
 	return l
@@ -228,6 +229,9 @@ type selection struct {
 	id  string
 	dec core.Decision
 	now time.Time
+	// br is the breaker knob snapshot loaded once (under p.mu) for the
+	// whole call: selection and lease creation must agree on it.
+	br BreakerOptions
 	// unreachable lists the candidates the reachability breaker refused and
 	// retryAt the earliest of their half-open times; others counts every
 	// other rejection.
@@ -250,7 +254,7 @@ func (s selection) onlySaturated() bool {
 }
 
 func (p *Policy) selectLocked(c *cfg, class core.Class, candidates []string, exclude map[string]bool) selection {
-	sel := selection{now: c.opts.Clock.Now()}
+	sel := selection{now: c.opts.Clock.Now(), br: p.breakerOpts()}
 	var reasons []string
 	for _, id := range candidates {
 		if exclude[id] {
@@ -264,7 +268,7 @@ func (p *Policy) selectLocked(c *cfg, class core.Class, candidates []string, exc
 			sel.others++
 			continue
 		}
-		if blocked, why, at := breakerBlocks(p.breakerOpts(), &p.state[id].br, sel.now); blocked {
+		if blocked, why, at := breakerBlocks(sel.br, &p.state[id].br, sel.now); blocked {
 			reasons = append(reasons, id+": "+why)
 			sel.unreachable = append(sel.unreachable, id)
 			if sel.retryAt.IsZero() || at.Before(sel.retryAt) {

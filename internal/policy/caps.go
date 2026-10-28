@@ -64,7 +64,7 @@ func (p *Policy) AcquireCapped(class core.Class, candidates []string, exclude ma
 	defer p.mu.Unlock()
 	sel := p.selectLocked(c, class, candidates, exclude)
 	if sel.dec.Allow {
-		return p.leaseLocked(sel.id), sel.dec, "", nil, 0
+		return p.leaseLocked(sel.id, sel.br), sel.dec, "", nil, 0
 	}
 	c.opts.Logger.Info("policy denied", "class", class, "reason", sel.dec.Reason)
 	switch {

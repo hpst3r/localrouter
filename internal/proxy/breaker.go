@@ -69,10 +69,11 @@ func writeUnreachable(w http.ResponseWriter, accounts []string, retryIn time.Dur
 // unreachableClass classifies a send error (client cancellation already
 // excluded) for core.Outcome.Unreachable. Errors from before the request
 // reached the transport (body rewrite) return "": they say nothing about the
-// account. Every transport failure got no response headers, so it counts.
+// account. Neither do *url.Error values from before the network (see
+// preNetwork). Every transport failure got no response headers, so it counts.
 func unreachableClass(err error) string {
 	var ue *url.Error
-	if !errors.As(err, &ue) {
+	if !errors.As(err, &ue) || preNetwork(ue) {
 		return ""
 	}
 	var (
@@ -98,4 +99,19 @@ func unreachableClass(err error) string {
 	default:
 		return "transport"
 	}
+}
+
+// preNetwork reports a *url.Error raised before any network operation: a
+// malformed URL (url.Parse, Op "parse"), a URL net/http will not send (scheme
+// other than http/https, no host), or a request it refuses to build (invalid
+// method or header). These are configuration errors, not unreachability.
+func preNetwork(ue *url.Error) bool {
+	if ue.Op == "parse" {
+		return true
+	}
+	u, err := url.Parse(ue.URL)
+	if err != nil || u.Host == "" || u.Scheme != "http" && u.Scheme != "https" {
+		return true
+	}
+	return ue.Err != nil && strings.HasPrefix(ue.Err.Error(), "net/http: invalid ")
 }
