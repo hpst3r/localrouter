@@ -88,6 +88,14 @@ routes:
   #   interactive: [llama-lab]
   #   background:  [llama-lab]
 
+# Backend model check (optional, restart-only): every interval, compare each
+# static route's backend model id with its openai_compat/ollama candidates'
+# GET {base_url}/models listings and report drift in diagnostics and the log
+# (it never changes routing). Absent or 0 = disabled. One-shot equivalent:
+# `localrouter check -probe`.
+# model_check:
+#   interval: 5m                 # within [30s, 24h]
+
 claude_logs:                  # ingest Claude Code token usage from local transcripts
   enabled: true
   account: claude-max

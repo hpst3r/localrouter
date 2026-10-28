@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -30,7 +31,8 @@ Usage:
   localrouter keygen  <output-file>
   localrouter pricing import [-config PATH] <litellm-prices.json>
   localrouter pricing reprice [-config PATH]
-  localrouter check   [-config PATH]
+  localrouter check   [-config PATH] [-probe [-strict] [-json]]
+                      -probe: exit 1 when a route's backend model id is missing
   localrouter ledger relabel-host [--from ""] --to NAME [-config PATH]
   localrouter hermeslog backfill-self --model M [--model M ...] --account ID
                       --before RFC3339 [--apply] [-config PATH]
@@ -113,11 +115,19 @@ func checkFiles(fs *flag.FlagSet, cfg *config.Config) error {
 	return nil
 }
 
-func cmdCheck(args []string) error {
+func cmdCheck(args []string) error { return runCheck(args, os.Stdout) }
+
+func runCheck(args []string, out io.Writer) error {
 	fs := flag.NewFlagSet("check", flag.ExitOnError)
+	probe := fs.Bool("probe", false, "also fetch each eligible account's /models listing and check every static route's backend model id")
+	strict := fs.Bool("strict", false, "with -probe: exit non-zero when a verdict is unchecked")
+	asJSON := fs.Bool("json", false, "with -probe: print the structured result as JSON")
 	cfg, err := loadConfig(fs, args)
 	if err != nil {
 		return err
+	}
+	if !*probe && (*strict || *asJSON) {
+		return exitError{code: 2, msg: "check: -strict and -json require -probe"}
 	}
 	if err := checkFiles(fs, cfg); err != nil {
 		return err
@@ -129,9 +139,12 @@ func cmdCheck(args []string) error {
 	if _, err := auth.LoadClientKeyFiles(keyFiles); err != nil {
 		return fmt.Errorf("client keys: %w", err)
 	}
-	fmt.Printf("config OK: %d clients, %d accounts, %d routes; data_dir=%s\n",
-		len(cfg.Clients), len(cfg.Accounts), len(cfg.Routes), cfg.DataDir)
-	return nil
+	if !*probe {
+		fmt.Fprintf(out, "config OK: %d clients, %d accounts, %d routes; data_dir=%s\n",
+			len(cfg.Clients), len(cfg.Accounts), len(cfg.Routes), cfg.DataDir)
+		return nil
+	}
+	return probeModels(cfg, out, *strict, *asJSON)
 }
 
 func cmdKeygen(args []string) error {

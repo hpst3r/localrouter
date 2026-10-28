@@ -110,16 +110,25 @@ func (e *entry) delay() time.Duration {
 	return min(d, e.interval)
 }
 
-// New builds a Manager. creds supplies the same bearer the proxy sends.
-func New(creds core.CredentialSource, opts Options) *Manager {
+// NewHTTPClient returns the client discovery uses when Options.HTTPClient is
+// nil: it never follows redirects (a redirect is then a non-2xx "status"
+// failure), dials within DefaultTimeout, and reads at most
+// DefaultMaxHeaderBytes of response headers (an overflow is a "transport"
+// failure).
+func NewHTTPClient() *http.Client {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = (&net.Dialer{Timeout: DefaultTimeout, KeepAlive: 30 * time.Second}).DialContext
+	tr.MaxResponseHeaderBytes = DefaultMaxHeaderBytes
+	return &http.Client{
+		Transport:     tr,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
+// withDefaults returns opts with every zero value replaced by its default.
+func (opts Options) withDefaults() Options {
 	if opts.HTTPClient == nil {
-		tr := http.DefaultTransport.(*http.Transport).Clone()
-		tr.DialContext = (&net.Dialer{Timeout: DefaultTimeout, KeepAlive: 30 * time.Second}).DialContext
-		tr.MaxResponseHeaderBytes = DefaultMaxHeaderBytes
-		opts.HTTPClient = &http.Client{
-			Transport:     tr,
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		}
+		opts.HTTPClient = NewHTTPClient()
 	}
 	if opts.Timeout <= 0 {
 		opts.Timeout = DefaultTimeout
@@ -139,6 +148,12 @@ func New(creds core.CredentialSource, opts Options) *Manager {
 	if opts.Tick <= 0 {
 		opts.Tick = DefaultTick
 	}
+	return opts
+}
+
+// New builds a Manager. creds supplies the same bearer the proxy sends.
+func New(creds core.CredentialSource, opts Options) *Manager {
+	opts = opts.withDefaults()
 	m := &Manager{creds: creds, opts: opts, clock: opts.Clock, log: opts.Logger,
 		wake: make(chan struct{}, 1), targets: map[string]*entry{}, polled: make(chan struct{})}
 	if m.clock == nil {
@@ -442,6 +457,22 @@ func (m *Manager) Refresh(ctx context.Context, done func() bool) {
 		case <-polled:
 		}
 	}
+}
+
+// Listing returns the shared listing held for accountID: its sorted ids (from
+// the last successful poll; the slice must not be modified) and that poll's
+// dropped count (invalid ids plus ids over the cap), the time and error class
+// of the last poll attempt (zero and "" before the first one), and whether the
+// account is a current polling target at all. Other packages use it to read an
+// account discovery already polls instead of fetching it again.
+func (m *Manager) Listing(accountID string) (ids []string, dropped int, attemptAt time.Time, errClass string, targeted bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	e := m.targets[accountID]
+	if e == nil {
+		return nil, 0, time.Time{}, "", false
+	}
+	return e.sorted, e.dropped, e.lastAttempt, e.errClass, true
 }
 
 // candidates is interactive ∪ background in first-seen order.

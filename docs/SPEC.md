@@ -467,6 +467,225 @@ These supersede the sections above where they differ.
    on-demand refresh on the old targets). This is accepted: resolution only narrows a route's own
    candidate lists, so no traffic is sent outside the route's configured accounts. No code change.
 
+## Backend model check (`model_check`, `check -probe`)
+
+A static route rewrites a client model to a backend id (or forwards it unchanged).
+Nothing checks that the backend still serves that id. Two real incidents:
+
+1. A llama.cpp server in router mode lists ids **with** the quant suffix
+   (`unsloth/Qwen3.5-9B-GGUF:Q4_K_M`). A route whose `upstream_model` is the bare repo id
+   (`unsloth/Qwen3.5-9B-GGUF`) gets `upstream 400` on every request.
+2. A single-model llama-server ignores the requested model name. After the operator swaps
+   the loaded model, the old route keeps answering 200 with the new model, and the
+   backend's `/v1/models` lists only the new alias.
+
+Both show up in the backend's `GET {base_url}/models` listing. The backend model check
+compares that listing with what each static route sends. It only reports. It never
+changes routing, candidates, rewriting or admission.
+
+### Rules
+
+- **Expected ids.** The check covers every route without `discover_models: true`, and each
+  candidate account in `interactive ∪ background` (deduplicated, first-seen order). For each
+  one, the expected backend id is `upstreams[account].upstream_model`, else the route
+  `upstream_model`. When both are empty, every id in the route's `models` list is expected
+  verbatim.
+- **Eligibility.** Only accounts whose provider discovery may poll (`openai_compat`, `ollama`;
+  `discovery.Eligible`) are fetched. Other providers (codex, openrouter) get the verdict
+  `ineligible` and are never fetched.
+- **Listing.** The check uses discovery's own request and parse (`discovery.Fetch`): the
+  same credential headers, no redirects, a 5 s timeout, a 1 MiB body cap, 64 KiB headers,
+  1,000 ids, and the same id validation. Each account is fetched at most once per check, with
+  at most 4 fetches at a time.
+- **Verdict** per (route, account, expected id):
+  - `ok`: the listing contains the expected id exactly.
+  - `missing`: the listing does not contain it. `suggestions` lists at most 3 listed ids.
+    First come the ids equal to the expected id after a trailing `:<suffix>` (after the last
+    `/`) is stripped from either side. Next come the ids whose stripped form equals the
+    expected id's stripped form case-insensitively. Each group is sorted. When the listing
+    has exactly one id, `single_model: true` and `loaded: <that id>` are added (the swapped
+    single-model case).
+  - `unchecked`: the fetch failed, with discovery's error class (`transport`, `status`,
+    `too_large`, `malformed`, `credential`), or `pending` when the account is read from
+    discovery and discovery has not polled it yet. An unchecked verdict is never reported
+    as ok.
+  - `ineligible`: the provider has no listing; `provider` names it.
+
+### CLI: `localrouter check -config PATH -probe [-strict] [-json]`
+
+- Plain `check` (no `-probe`) is unchanged and offline. `-strict` or `-json` without
+  `-probe` is a usage error (exit 2).
+- With `-probe`, the command validates exactly as plain `check` does. It then loads
+  credentials the same way `serve` does (`app.NewAuth`), fetches each eligible account's
+  listing once, and prints:
+
+  ```
+  config OK: 1 clients, 4 accounts, 4 routes; data_dir=...
+  missing    route=qwen account=lab expected=unsloth/Qwen3.5-9B-GGUF suggestions=unsloth/Qwen3.5-9B-GGUF:Q4_K_M
+  missing    route=old account=single expected=qwen3-32b single_model=true loaded=gemma-3-27b
+  unchecked  route=down account=broken expected=m error_class=status
+  ineligible route=gpt account=cx expected=gpt-5 provider=codex
+  model check: 1 ok, 2 missing (1 single_model), 1 unchecked, 1 ineligible; 3 accounts probed
+  ```
+
+  That is one line per non-ok verdict, in route, candidate and models order, then the
+  summary. A value that is empty or contains a space, `"`, `=` or a non-graphic rune is
+  printed Go-quoted. `suggestions` is comma-joined.
+- `-json` prints only the structured `Result` (indented JSON):
+  `{checked_at, accounts: [{account, source, fetched_at, model_count, error_class?}],
+  verdicts: [{route, account, expected, status, error_class?, provider?, suggestions?,
+  single_model?, loaded?}], summary: {ok, missing, single_model, unchecked, ineligible}}`.
+  The `ok` verdicts are included.
+- Exit status: 1 when any verdict is `missing`. With `-strict`, also 1 when any verdict is
+  `unchecked`. Otherwise 0. `unchecked` alone still exits 0, but its lines are printed.
+- Neither the output nor the log ever carries credentials, URLs or response bodies.
+
+### Runtime: `model_check: {interval: <duration>}`
+
+```yaml
+model_check:
+  interval: 5m        # absent, null or 0 = disabled (default); else within [30s, 24h]
+```
+
+- When the key is absent, null or `0`, the check is disabled. No checker is built and no
+  goroutine is started. The diagnostics document has no `model_check` block, so startup and
+  diagnostics are byte-identical to a build without this feature. Unknown keys inside the
+  block are rejected. The block is **restart-only**: a reload that changes it fails with
+  `restart required` (`restart_only: ["model_check"]`).
+- When enabled, the App builds one `modelcheck.Checker` with the same lifetime as the
+  discovery manager. `App.Start` starts it (non-blocking). It stops on `App.Close` and at
+  the end of `App.Shutdown`. It is re-targeted with the published routes and accounts at
+  startup and on every accepted reload.
+- **Schedule.** The checker runs a check at start, then every `interval`, refetching its own
+  accounts. A re-target (reload) re-checks at once. That re-check reuses the checker's own
+  listing for an account whose `base_url` is unchanged, and fetches only new accounts.
+  While a listing read from discovery is still `pending`, the checker re-checks every 10 s
+  without fetching.
+- **Sharing.** An account that discovery currently polls (a discovering route lists it) is
+  never fetched by the checker. It reads discovery's listing instead
+  (`discovery.Manager.Listing`): the last good ids, or `unchecked` with the last attempt's
+  error class, or `pending` before the first attempt. No account is fetched twice per
+  interval.
+- **Diagnostics.** `GET /control/v1/diagnostics` gains a `model_check` block only when
+  enabled: `{interval, checked_at, accounts, verdicts, summary}`, the same shapes as the CLI
+  `-json` result. Every verdict is included. Before the first check, `checked_at` is `null`
+  and the lists are empty. In `accounts`, `source` is `fetch` or `discovery`, and
+  `fetched_at` is the time of the listing used (for discovery, the last attempt).
+- **Logging.** The checker logs one warn line per verdict change into `missing`
+  (`backend model missing`: route, account, expected, suggestions). It logs one warn line
+  per change into `single_model` (`backend serves a different single model`: route,
+  account, expected, loaded). It logs one info line when the verdict returns to `ok`
+  (`backend model check ok`). Verdicts that stay the same are not logged again. `unchecked`
+  and `ineligible` keep the last known state, so an outage does not repeat or clear the
+  warning. State is tracked per (route, account) when that pair expects a single id, so a
+  reload that fixes `upstream_model` logs the return to `ok`. Otherwise it is tracked per
+  expected id (see R2.2). A cancelled check (shutdown) is neither published nor logged.
+
+### Acceptance tests (backend model check)
+
+- MC1 Flags-off: without `model_check`, the App builds no checker, the diagnostics document
+  has no `model_check` block (control: only when `Deps.ModelCheck` is wired), the D1 goldens
+  are unchanged, and plain `check` prints exactly the previous line and makes no upstream
+  call. (`TestMC1FlagsOffNoModelCheck`, `TestMC1DiagnosticsModelCheckBlockOnlyWhenWired`,
+  `TestMC9CheckProbeCLI`)
+- MC2 Config: absent, null and `0` disable the check. 30 s and 24 h are accepted. Negative,
+  <30 s, >24 h, non-duration values and unknown keys are rejected. The block is
+  restart-only on reload. (`TestMC2ModelCheckConfig`, end of `TestMC10AppModelCheckE2E`)
+- MC3 Expected ids: per-account `upstream_model` beats the route `upstream_model`, which
+  beats `models`. Discovering routes are skipped. Candidates are deduplicated. Codex is
+  `ineligible` and never fetched. (`TestMC3Expectations`)
+- MC4 Incident 1, against an httptest llama.cpp router-mode listing: the bare repo id is
+  `missing` with the `:Q4_K_M` id suggested, and the exact suffixed id is `ok`. The listing
+  is fetched once with the account bearer. (`TestMC4LlamaRouterBareRepoID`)
+- MC5 Incident 2, against an httptest single-model listing: the old route's id is `missing`
+  with `single_model: true` and `loaded` naming the new alias, and the new alias's route is
+  `ok`. (`TestMC5SingleModelSwap`)
+- MC6 Suggestion rules: a suffix stripped on either side, a case-insensitive repo path, at
+  most 3, in deterministic order. An Ollama `name:tag` listing suggests `qwen3:8b` for
+  `qwen3`. (`TestMC6Suggestions`)
+- MC7 Fetch failures (`status`, `malformed`, `credential`, `transport`) are `unchecked` with
+  the class, never `ok`. The result JSON has no key, URL or body.
+  (`TestMC7UncheckedNeverOK`)
+- MC8 Probe fetches each account once, however many routes use it, with at most 4 fetches
+  in flight. (`TestMC8ProbeFetchesOncePerAccountBounded`)
+- MC9 CLI: the `-probe` text output (both incidents, `ineligible`, summary) and exit 1;
+  `-json`; `unchecked` alone exits 0 and `-strict` exits 1; `-json` without `-probe` exits
+  2; no key, URL or body in the output. (`TestMC9CheckProbeCLI`,
+  `TestMC9CheckProbeUncheckedStrict`)
+- MC10 App E2E: with `model_check` enabled, diagnostics report both incidents. The account
+  a discovering route polls is read from discovery (one `/models` call in total), and a
+  reload re-check does not re-fetch. A `missing` route is still served with its rewrite. A
+  reload that fixes `upstream_model` turns the verdict `ok` and logs one info line, after
+  exactly one warn line per incident. Diagnostics and logs carry no key or URL.
+  (`TestMC10AppModelCheckE2E`)
+- MC11 Logging transitions: warn on a change into `single_model` or `missing`, info on the
+  return to `ok`, nothing while unchanged, and `unchecked` keeps the state.
+  (`TestMC11CheckerLogsVerdictChanges`)
+- MC12 Sharing: a discovery-polled account is never fetched by the checker. It is
+  `pending` before discovery's first poll, and `unchecked` with discovery's class after a
+  failed poll. (`TestMC12CheckerSharesDiscoveryListing`)
+- MC13 Re-target and lifetime: a re-target after Start re-checks at once and fetches only
+  the new account. `Close` is idempotent and leaves no goroutine.
+  (`TestMC13CheckerRetargetAndClose`)
+
+### Implementation notes (backend model check)
+
+- Package `internal/modelcheck`: `Expectations`, `Evaluate`, `Suggest`, `Probe` (CLI), and
+  `NewChecker(creds, shared, interval, logger, Options)` with `SetTargets`, `Start`,
+  `Close`, `Check`, `Snapshot` and `Diagnostics() any` (runtime). It imports only core and
+  discovery.
+- `internal/discovery` exports, without changing behavior: `Eligible(provider)`,
+  `Fetch(ctx, creds, account, Options) (ids, dropped, errClass)` (the poll's fetch,
+  extracted), `NewHTTPClient()` (the default poll client), and `(*Manager).Listing(id)`.
+- `control.Deps.ModelCheck` is a consumer-defined interface (`Diagnostics() any`),
+  satisfied by `*modelcheck.Checker`. The app sets it only when the check is enabled.
+  `App.ModelCheck` is nil when disabled.
+
+### Amendment R1 (post-review decisions)
+
+These override the rules above where they differ.
+
+- R1.1 Truncated listings (MC-1). A listing records how many ids discovery's parse dropped
+  (invalid ids plus ids over the 1,000-id cap): `discovery.Fetch` returns it, and
+  `(*Manager).Listing(id)` returns `(ids, dropped, attemptAt, errClass, targeted)`. When an
+  expected id is absent from a listing whose dropped count is > 0, the verdict is
+  `unchecked` with `error_class: "truncated"`, never `missing` (no suggestions, no
+  `single_model`). An id that is listed is still `ok`. Discovery's own behavior and goldens
+  are byte-identical. (`TestMCFixMC1TruncatedListingUnchecked`)
+- R1.2 Disabled forms are one value (MC-2). Before the restart-only comparison, a
+  `model_check` block whose effective interval is 0 (absent, null, `{}` or `interval: 0`)
+  is normalized to absent, so a reload that switches among those forms is accepted without
+  `restart required`. Changing to or from an enabled interval, or between two enabled
+  intervals, stays restart-only. (`TestMCFixMC2DisabledModelCheckFormsNotRestartOnly`)
+
+### Amendment R2 (final-review decisions)
+
+These override the rules above where they differ.
+
+- R2.1 Ollama `:latest`. For provider `ollama`, which resolves an untagged name to
+  `name:latest`, an expected bare id `name` (no `:` after the last `/`) is `ok` when the
+  listing has `name:latest`, and an expected `name:latest` is `ok` when it has `name`. Any
+  other tag still needs an exact match (`qwen3` against `qwen3:8b` stays `missing` with the
+  suggestion). Other providers are unchanged. (`TestMCFixR21OllamaLatestTag`)
+- R2.2 Log state across key-form changes. Logging state is kept per (route, account,
+  expected id). When a reload switches a pair from several expected ids to one, the single
+  verdict inherits the pair's previous `missing`/`single_model` state. When the pair expected
+  a single id before and none of its current ids has state, the first verdict inherits it.
+  A fix that also changes the key form therefore still logs the return to `ok`, exactly once.
+  (`TestMCFixR22LogStateSurvivesKeyFormChange`)
+- R2.3 `discovery.Fetch` with a nil `Options.HTTPClient` builds a `NewHTTPClient` and closes
+  its idle connections before returning, so no keep-alive connection outlives the call.
+  `modelcheck.Probe` likewise closes the idle connections of a default client it builds
+  (one client for all of its fetches); the checker closes its client on `Close`.
+  (`TestFetchNilClientClosesIdleConnections`, `TestMCFixR23ProbeClosesIdleConnections`)
+
+### Phase 2 (not implemented)
+
+For `openai_compat` candidates, the proxy would compare the response's `model` field per
+request with the resolved backend id. That catches a swapped single-model server between
+checks, and in requests whose id the listing check never sees. It is not part of this
+phase.
+
 ## Workload classes
 
 `interactive` and `background`. Each client key maps to one class.

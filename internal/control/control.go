@@ -79,6 +79,9 @@ type Deps struct {
 	// diagnostics "discovery" block. Nil when no route discovers: findRoute
 	// and the diagnostics document are then exactly the static-only ones.
 	Discovery Discovery
+	// ModelCheck supplies the diagnostics "model_check" block. Nil when the
+	// backend model check is disabled: the block is then omitted.
+	ModelCheck ModelCheck
 	// Clock defaults to core.SystemClock.
 	Clock core.Clock
 }
@@ -94,6 +97,14 @@ type Discovery interface {
 	Resolve(model string) (route core.Route, ok, ambiguous bool)
 	// Diagnostics returns the JSON-encodable "discovery" block. It must carry
 	// no URLs, keys or upstream bodies.
+	Diagnostics() any
+}
+
+// ModelCheck is the control server's view of the backend model check. It is
+// satisfied by *internal/modelcheck.Checker.
+type ModelCheck interface {
+	// Diagnostics returns the JSON-encodable "model_check" block. It must
+	// carry no URLs, keys or upstream bodies.
 	Diagnostics() any
 }
 

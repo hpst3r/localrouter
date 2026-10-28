@@ -91,6 +91,9 @@ type diagnosticsDoc struct {
 	// Discovery is the model-discovery block, present only when a route
 	// discovers (Deps.Discovery non-nil).
 	Discovery any `json:"discovery,omitempty"`
+	// ModelCheck is the backend model check block, present only when the
+	// check is enabled (Deps.ModelCheck non-nil).
+	ModelCheck any `json:"model_check,omitempty"`
 }
 
 type storageHealth struct {
@@ -139,6 +142,9 @@ func (s *Server) diagnostics(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.deps.Discovery != nil {
 		doc.Discovery = s.deps.Discovery.Diagnostics()
+	}
+	if s.deps.ModelCheck != nil {
+		doc.ModelCheck = s.deps.ModelCheck.Diagnostics()
 	}
 	writeJSON(w, http.StatusOK, doc)
 }

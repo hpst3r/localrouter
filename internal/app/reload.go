@@ -64,6 +64,10 @@ func restartFields(base, candidate *config.Config) []string {
 			c.Accounts[i].Reserve = nil
 		}
 		c.Budgets = budgetPresence(c.Budgets)
+		if c.ModelCheckInterval() == 0 {
+			// Absent, null, {} and interval 0 are the same disabled value.
+			c.ModelCheck = nil
+		}
 	}
 	l := reflect.ValueOf(*left)
 	r := reflect.ValueOf(*right)
@@ -207,6 +211,9 @@ func (a *App) reloadConfigLocked(c *config.Config) (core.ReloadStatus, error) {
 		accts[acct.ID] = acct
 	}
 	a.Discovery.SetTargets(accts, g.routes)
+	if a.ModelCheck != nil {
+		a.ModelCheck.SetTargets(accts, g.routes)
+	}
 	return a.generationStatus(g), nil
 }
 
@@ -274,6 +281,11 @@ func (a *App) makeGeneration(c *config.Config, number uint64) (*runtimeGeneratio
 	}
 	if resolver != nil {
 		deps.Discovery = resolver
+	}
+	// Set only when enabled, so a disabled check never becomes a typed-nil
+	// interface and the diagnostics document stays unchanged.
+	if a.ModelCheck != nil {
+		deps.ModelCheck = a.ModelCheck
 	}
 	deps.Ingester = a.Quota
 	deps.IsSnapshotStale = func(err error) bool { return errors.Is(err, quota.ErrSnapshotStale) }
