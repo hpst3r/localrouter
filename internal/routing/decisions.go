@@ -114,10 +114,10 @@ var (
 // (ProtocolSystemOne or ProtocolDecisions). Members are read by exact name; a
 // duplicate or case variant of a member it reads is ErrMalformed, as are
 // duplicate or case-fold-variant question and choice option names. Unknown
-// members (top level and inside questions) are forwarded untouched; unknown
-// top-level members are still scanned like state. A non-text part
-// (nonTextTypes) in state, instructions, criteria or any other top-level
-// member, assets, box questions, stream:true and an input member (with or
+// members (top level and inside questions) are forwarded untouched but still
+// scanned like state. A non-text part
+// (nonTextTypes) in state, instructions, criteria or any other top-level or
+// question member, assets, box questions, stream:true and an input member (with or
 // without state) are ErrDecisionUnsupported; exceeding b is ErrDecisionBounds.
 // Returned error text never quotes body content.
 func InferDecision(protocol string, body []byte, b DecisionBounds) (DecisionRequirements, error) {
@@ -155,7 +155,7 @@ func InferDecision(protocol string, body []byte, b DecisionBounds) (DecisionRequ
 	}
 	// Every top-level member but questions (checked per question below),
 	// including unknown passthrough members, is scanned exactly like state.
-	if err := scanTopLevel(body, members, b.MaxNesting); err != nil {
+	if err := scanMembers("request body", body, members, []string{"questions"}, "a top-level member", b.MaxNesting); err != nil {
 		return reqs, err
 	}
 
@@ -194,6 +194,11 @@ func question(raw json.RawMessage, b DecisionBounds) (string, error) {
 	var typ string
 	if !ok || json.Unmarshal(t, &typ) != nil || typ == "" {
 		return "", malformed("question type must be a non-empty string")
+	}
+	// Unknown question members are forwarded untouched but scanned like
+	// instructions.
+	if err := scanMembers("question", raw, nil, questionMembers, "a question member", b.MaxNesting); err != nil {
+		return "", err
 	}
 	if ins, ok := q["instructions"]; ok {
 		if err := textOnly("instructions", ins, b.MaxNesting); err != nil {
@@ -320,14 +325,21 @@ func foldKey(s string) string {
 
 // nonTextTypes are the content-part type values that carry non-text input on a
 // text-only decision route: the chat/responses image, audio and file part
-// types plus audio_url and the video spellings. Only an exact "type" member
-// value counts; strings elsewhere are text and never inspected.
+// types plus audio_url, the video spellings, and the Anthropic-style and
+// assistants-style image, audio and document types. Only an exact "type"
+// member value counts; strings elsewhere are text and never inspected. An
+// object with an image_url member (nonTextMember) is non-text even without a
+// type.
 var nonTextTypes = map[string]bool{
-	"image_url": true, "input_image": true,
-	"input_audio": true, "audio_url": true,
-	"file": true, "input_file": true,
-	"video_url": true, "video": true,
+	"image_url": true, "input_image": true, "image": true, "image_file": true,
+	"input_audio": true, "audio_url": true, "audio": true,
+	"file": true, "input_file": true, "document": true, "input_document": true,
+	"video_url": true, "video": true, "input_video": true,
 }
+
+// nonTextMember is the member name that marks an object as an image part
+// whatever its value or type.
+const nonTextMember = "image_url"
 
 // textOnly scans raw (bounded by maxDepth) and fails with
 // ErrDecisionUnsupported when it holds a non-text part.
@@ -342,28 +354,28 @@ func textOnly(what string, raw []byte, maxDepth int) error {
 	return nil
 }
 
-// scanTopLevel applies textOnly to every member of the request object body
-// except questions. A member outside known is labelled generically so error
-// text never quotes a body-supplied name. object has already validated body.
-func scanTopLevel(body []byte, known []string, maxDepth int) error {
-	dec := json.NewDecoder(bytes.NewReader(body))
+// scanMembers applies textOnly to every member of the JSON object raw except
+// those named in skip. A member outside known is labelled generic so error
+// text never quotes a body-supplied name. object has already validated raw.
+func scanMembers(what string, raw []byte, known, skip []string, generic string, maxDepth int) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	if _, err := dec.Token(); err != nil {
-		return malformed("request body must be a JSON object")
+		return malformed("%s must be a JSON object", what)
 	}
 	for dec.More() {
 		tok, err := dec.Token()
 		if err != nil {
-			return malformed("request body must be a JSON object")
+			return malformed("%s must be a JSON object", what)
 		}
 		name, _ := tok.(string)
 		var v json.RawMessage
 		if err := dec.Decode(&v); err != nil {
-			return malformed("request body must be a JSON object")
+			return malformed("%s must be a JSON object", what)
 		}
-		if name == "questions" {
+		if contains(skip, name) {
 			continue
 		}
-		what := "a top-level member"
+		what := generic
 		if contains(known, name) {
 			what = name
 		}
@@ -376,7 +388,8 @@ func scanTopLevel(body []byte, known []string, maxDepth int) error {
 
 // scanValue walks one JSON value without recursion. It fails with
 // ErrDecisionBounds when the value nests deeper than maxDepth, and reports
-// whether any object in it has a "type" member naming a non-text part.
+// whether any object in it has a "type" member naming a non-text part or an
+// image_url member.
 func scanValue(what string, raw []byte, maxDepth int) (nonText bool, err error) {
 	type frame struct {
 		obj, wantKey bool
@@ -405,6 +418,9 @@ func scanValue(what string, raw []byte, maxDepth int) (nonText bool, err error) 
 			}
 			stack[n-1].key, _ = tok.(string)
 			stack[n-1].wantKey = false
+			if stack[n-1].key == nonTextMember {
+				nonText = true
+			}
 			continue
 		}
 		switch v := tok.(type) {

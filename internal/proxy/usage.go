@@ -388,8 +388,13 @@ func (c *usageCapture) ReportedCost() *float64 { return c.reportedCost }
 // response object for Responses (which never sends [DONE]). A chat chunk with
 // finish_reason is not a terminal, and neither protocol accepts the other's.
 // endpoint is the upstream path, "/chat/completions" or "/responses"; a
-// stream on any other endpoint is never complete.
+// stream on any other endpoint is never complete. A decision endpoint
+// ("/systemone", "/decisions") has no stream terminal: it is complete exactly
+// when the answer is a non-stream (JSON) body, with or without a Content-Type.
 func (c *usageCapture) Completed(endpoint string) bool {
+	if isDecisionEndpoint(endpoint) {
+		return !c.sse
+	}
 	if !c.sse {
 		return true
 	}

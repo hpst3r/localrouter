@@ -1192,12 +1192,16 @@ Validation (load and reload; a failure does not advance the generation):
   `noul, choice, score`. `question_types` and `allow_alias` are rejected on
   non-decision descriptors.
 - Pinning: every candidate resolves (descriptor `upstream_model`, else the
-  route's) to the same non-empty model. A moving alias - an id starting with
-  `~` (e.g. `~typesafe/jev-latest`) or ending in `-latest`/`-preview`
-  (case-insensitive; bare `jev-latest` included) - is rejected unless every
-  candidate sets `allow_alias: true`. `typesafe/jev-1.14` and bare `jev-1.13`
-  are pins. Failover therefore only runs between openrouter accounts serving
-  the same pin.
+  route's) to the same non-empty model; a decision route's route-level
+  `upstream_model` is compared and forwarded trimmed. A moving alias - an id
+  starting with `~` (e.g. `~typesafe/jev-latest`), an OpenRouter router id
+  starting with `openrouter/` (e.g. `openrouter/auto`), or an id ending in
+  `-latest`/`-preview` once a trailing `:variant` after the last `/` is
+  stripped (e.g. `typesafe/jev-latest:nitro`) (case-insensitive; bare
+  `jev-latest` included) - is rejected unless every candidate sets
+  `allow_alias: true`. `typesafe/jev-1.14`, bare `jev-1.13` and
+  `typesafe/jev-1.13:nitro` are pins. Failover therefore only runs between
+  openrouter accounts serving the same pin.
 - `core.UpstreamSpec` gains `QuestionTypes []string` and `AllowAlias bool`
   (appended). The `decisions:` block is per generation and hot-reloadable.
 
@@ -1227,7 +1231,7 @@ Strict decoding and bounds:
 - Question names: 1..`max_question_name_bytes` bytes; duplicates and case-fold
   variants (Unicode simple folding, as `strings.EqualFold`) are 400
   `invalid_request_error`; same for choice option names. Unknown question
-  members are passed through untouched. Unknown question types, missing or
+  members are passed through untouched (but scanned, below). Unknown question types, missing or
   wrongly typed `criteria`, empty `questions`, and missing/non-container
   `state` are 400 `invalid_request_error`.
 - `stream: true`, any `assets` member (even null), a `box` question, and a
@@ -1235,18 +1239,21 @@ Strict decoding and bounds:
   `decision_unsupported`. `stream: false`/`null` is accepted.
 - Text only (descriptors are `input_modalities: [text]`): a non-text part is
   an object, at any depth within `max_nesting`, whose exact `type` member is
-  one of `image_url`, `input_image`, `input_audio`, `audio_url`, `file`,
-  `input_file`, `video_url`, `video`. One in `state`, in any question's
-  `instructions` or `criteria`, or in any other top-level member except
-  `questions` (named or unknown passthrough members are scanned exactly like
-  `state`) is 400 `decision_unsupported` before egress. Strings are never
-  inspected: a string `"image_url"`, a key named `image_url`, or a
+  one of `image_url`, `input_image`, `image`, `image_file`, `input_audio`,
+  `audio_url`, `audio`, `file`, `input_file`, `document`, `input_document`,
+  `video_url`, `video`, `input_video`, or any object with an `image_url`
+  member (whatever its value, with or without `type`). One in `state`, in any
+  question's `instructions`, `criteria` or unknown members, or in any other
+  top-level member except `questions` (named or unknown passthrough members
+  are scanned exactly like `state`) is 400 `decision_unsupported` before
+  egress. Strings are never inspected: a string `"image_url"` or a
   `type`-like key under another name is text. (The chat/responses classifier
   is unchanged.)
 - More than `max_questions` questions, more than `max_choice_options` options,
   more than `max_score_levels` levels, a name over `max_question_name_bytes`,
   or `state`/`instructions`/`criteria` (or any other top-level member except
-  `questions`) nesting deeper than `max_nesting` (a scalar is depth 0,
+  `questions`, or any unknown question member) nesting deeper than
+  `max_nesting` (a scalar is depth 0,
   `{}`/`[]` depth 1) is 400 `decision_bounds_exceeded`.
   Values exactly at a bound are accepted. Messages name fields and bounds, never
   body content.
@@ -1272,6 +1279,19 @@ LocalRouter-originated errors keep their own `type`s (`decision_unsupported`,
 `budget_exceeded`, `quota_reserve`, `concurrency_limit_exceeded`).
 `retry-after-ms` is not parsed.
 
+404 is final by design, including OpenRouter's 404 when no endpoint matches
+the account's data or privacy policy: that 404 is account-specific, so a
+backup key with different settings is not tried. A decision-final status
+(400/404/413/422/529) answered to a half-open breaker probe is a neutral
+release: request-scoped, it never feeds the breaker, so the breaker stays
+half-open and the next request becomes the probe.
+
+The `/v1/decisions` `provider` member (OpenRouter provider preferences such as
+`only`, `order`, `data_collection`, `max_price`) is passed through untouched,
+so callers can steer which inference providers serve a request, within the
+account's OpenRouter settings. Operators who must constrain providers do so in
+those account settings.
+
 ### Accounting
 
 Spend controls, admission/quota, concurrency limits and ledger rows (one per
@@ -1280,7 +1300,9 @@ apply unchanged. `usageCapture` reads `usage.input_tokens/output_tokens` from
 the JSON body; `usage.cost` is the provider-reported cost exactly as for other
 OpenRouter rows (`ReportedCostUSD`, cost basis `provider_reported`). Missing,
 non-numeric or out-of-range usage is unknown (cost NULL, budget charged at the
-hold), never zero. An upstream `text/event-stream` answer on a decision path is
+hold), never zero. A decision answer is complete exactly when it is a
+non-stream (JSON) body, with or without a `Content-Type`; there is no stream
+terminal rule. An upstream `text/event-stream` answer on a decision path is
 never complete (usage unknown, `SettleIncomplete`). Nothing from request or
 response bodies is logged; the resolved model stays in the relayed response.
 **Deferred:** a ledger `response_model` column (needs migration v5, owned by
@@ -1309,6 +1331,29 @@ another branch); a local decision backend; images/box/multipart; OpenAI
 | T14 upstream SSE is incomplete | `proxy.TestT14UpstreamSSEIsIncomplete` |
 | T15 hot reload adds/removes the paths; bounds reload without restart | `app.TestT1T15T16DecisionsEndToEnd` |
 | T16 end-to-end ledger cost = OpenRouter `usage.cost` | `app.TestT1T15T16DecisionsEndToEnd` |
+| R2.1 widened non-text types and typeless `image_url` objects → `decision_unsupported` | `routing.TestR21WidenedNonTextParts`, `routing.TestT8UnsupportedFeatures` |
+| R2.2 unknown question members: non-text scan and `max_nesting` | `routing.TestR22UnknownQuestionMembersScanned` |
+| R2.3 `:variant`-suffixed and `openrouter/` ids are moving aliases | `config.TestR23MovingAliasVariantAndRouter` |
+| R2.4 decision route-level `upstream_model` projected trimmed; other routes verbatim | `config.TestR24DecisionRouteUpstreamModelTrimmed` |
+| R2.6 decision answer complete iff JSON body (untyped JSON 200 included) | `proxy.TestR26DecisionCompletedIsJSONFramed`, `proxy.TestR26UntypedJSONDecisionAnswer`, `proxy.TestT14UpstreamSSEIsIncomplete` |
+
+### Amendment R2 (final review, PR #24)
+
+- R2.1 (FDC-L1): the non-text type set adds `image`, `image_file`,
+  `input_video`, `audio`, `document`, `input_document`; an object with an
+  `image_url` member is non-text even without `type`.
+- R2.2 (FDC-L2): unknown question members get the same non-text scan and
+  `max_nesting` bound; errors label them generically.
+- R2.3 (FDC-L3): a trailing `:variant` is stripped before the
+  `-latest`/`-preview` test; `openrouter/` ids (e.g. `openrouter/auto`) are
+  moving aliases needing `allow_alias`.
+- R2.4 (FDC-L5): a decision route's route-level `upstream_model` is compared
+  and forwarded trimmed; non-decision routes are unchanged.
+- R2.5 (FDC-L4, FDC-L6, FIN-L3): documented above: 404 final including
+  data-policy 404s; `provider` pass-through; decision-final answers to a
+  half-open probe are neutral.
+- R2.6 (FIN-L4): `usageCapture.Completed` has an explicit decision-endpoint
+  case: complete iff the answer is a JSON body (no SSE terminal rule).
 
 ## Engineering constraints
 

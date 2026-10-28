@@ -86,11 +86,29 @@ func decisionRoute(r RouteConfig) bool {
 }
 
 // isMovingAlias reports whether a decision model id is a moving alias rather
-// than a pin: an OpenRouter "~" alias, or an id ending in -latest or -preview
-// (case-insensitive). typesafe/jev-1.14 and jev-1.13 are pins.
+// than a pin: an OpenRouter "~" alias, an OpenRouter router id (openrouter/...,
+// such as openrouter/auto), or an id ending in -latest or -preview once a
+// trailing :variant (after the last '/') is stripped; all case-insensitive.
+// typesafe/jev-1.14, jev-1.13 and typesafe/jev-1.13:nitro are pins.
 func isMovingAlias(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
-	return strings.HasPrefix(m, "~") || strings.HasSuffix(m, "-latest") || strings.HasSuffix(m, "-preview")
+	if strings.HasPrefix(m, "~") || strings.HasPrefix(m, "openrouter/") {
+		return true
+	}
+	if i := strings.LastIndexByte(m, ':'); i > strings.LastIndexByte(m, '/') {
+		m = m[:i]
+	}
+	return strings.HasSuffix(m, "-latest") || strings.HasSuffix(m, "-preview")
+}
+
+// decisionRouteUpstreamModel returns the route-level upstream_model to
+// project: trimmed on a decision route, so the forwarded pin is the one
+// validateDecisionRoute compared, and verbatim on any other route.
+func decisionRouteUpstreamModel(r RouteConfig) string {
+	if decisionRoute(r) {
+		return strings.TrimSpace(r.UpstreamModel)
+	}
+	return r.UpstreamModel
 }
 
 // validateDecisionRoute enforces the typed-decision route contract: the route

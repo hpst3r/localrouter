@@ -201,9 +201,9 @@ func TestT8UnsupportedFeatures(t *testing.T) {
 			t.Errorf("input error must name state: %v", err)
 		}
 	}
-	// A "type":"image_url" string that is a value under another key, or an
-	// object key named image_url, is not an image part.
-	for _, st := range []string{`{"kind":"image_url"}`, `{"image_url":"x"}`, `["type","image_url"]`} {
+	// A "type":"image_url" string that is a value under another key is not an
+	// image part. (An object key named image_url is, since Amendment R2.1.)
+	for _, st := range []string{`{"kind":"image_url"}`, `["type","image_url"]`} {
 		body := `{"model":"m","state":` + st + `,` + noul + `}`
 		if _, err := InferDecision(ProtocolSystemOne, []byte(body), DecisionBounds{}); err != nil {
 			t.Errorf("state %s: %v", st, err)

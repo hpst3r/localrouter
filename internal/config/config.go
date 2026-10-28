@@ -909,7 +909,7 @@ func (c *Config) CoreRoutes() []core.Route {
 		out = append(out, core.Route{
 			Name:          r.Name,
 			Models:        append([]string(nil), r.Models...),
-			UpstreamModel: r.UpstreamModel,
+			UpstreamModel: decisionRouteUpstreamModel(r),
 			Interactive:   append([]string(nil), r.Interactive...),
 			Background:    append([]string(nil), bg...),
 			Upstreams:     ups,
